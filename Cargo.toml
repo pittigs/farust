@@ -1,0 +1,12 @@
+[package]
+name = "farust"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bytemuck = { version = "1", features = ["derive"] }
+png = "0.17"
+pollster = "0.4"
+wgpu = "24"
+winit = "0.30"
+zip = "2"
