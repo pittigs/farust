@@ -1,29 +1,23 @@
-//! Phase 6 scripted opponent.
+//! Phases 6 & 8 scripted opponent.
 //!
-//! A deterministic, rule-based AI that drives one army purely through
-//! [`Command`]s (exactly the interface a human player uses). It reads the
-//! world read-only once per second of game time and never touches sim state
-//! directly, so AI armies replay bit-identically.
-//!
-//! Behaviour:
-//! - Commander: fixed opening (2 mex, factory, power), then keeps adding
-//!   mex/power/factories up to a cap, placing structures on a deterministic
-//!   lattice around its start position.
-//! - Factories: rally toward the enemy and loop production (2:1 mix of the
-//!   faction's two land units).
-//! - Army: idle units gather at home; once a wave is big enough everything
-//!   attack-moves at the enemy commander; waves grow over time. Units near
-//!   home react to intruders.
+//! Deterministic rule-based AI operating strictly through [`Command`]s:
+//! - Commander: builds initial extractors, Land Factory, Power Generators, and assists.
+//! - Factories: produce Engineers (up to 3), Tanks, Light Bots, and Mobile Artillery
+//!   while setting forward rally points.
+//! - Engineers: expand to outer mass points, construct Point Defense near base
+//!   chokes + Radar coverage, and reclaim nearby wrecks.
+//! - Army: stages waves at home, defends intruders, and attack-moves enemy commander.
 
 use crate::skirmish::{ArmyId, Command, Role, Skirmish, UnitId};
 use crate::sim::SCALE;
 
-/// Ticks between decisions (1 s of game time).
 pub const THINK_INTERVAL: u64 = 10;
 const HOME_RADIUS: i64 = 80 * SCALE;
-const DEFEND_RADIUS: i64 = 70 * SCALE;
+const DEFEND_RADIUS: i64 = 75 * SCALE;
 const MAX_FACTORIES: usize = 4;
 const MAX_GENERATORS: usize = 10;
+const MAX_ENGINEERS: usize = 3;
+const MAX_POINT_DEFENSE: usize = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScriptedAi {
@@ -49,7 +43,6 @@ impl ScriptedAi {
         }
     }
 
-    /// The first undefeated enemy army (lowest id).
     fn enemy(&self, w: &Skirmish) -> Option<ArmyId> {
         w.armies()
             .iter()
@@ -57,7 +50,6 @@ impl ScriptedAi {
             .map(|a| a.id)
     }
 
-    /// Issue this tick's commands into `w`. Cheap no-op between decisions.
     pub fn think(&mut self, w: &mut Skirmish) {
         let cmds = self.decide(w);
         for c in cmds {
@@ -65,13 +57,9 @@ impl ScriptedAi {
         }
     }
 
-    /// Pure decision function: world snapshot in, commands out.
     pub fn decide(&mut self, w: &Skirmish) -> Vec<Command> {
         let mut out = Vec::new();
-        // Stagger armies so they do not all think on the same tick.
-        if w.result().is_some()
-            || (w.tick() + self.army as u64) % THINK_INTERVAL != 0
-        {
+        if w.result().is_some() || (w.tick() + self.army as u64) % THINK_INTERVAL != 0 {
             return out;
         }
         let Some(me) = w.army(self.army) else {
@@ -92,8 +80,27 @@ impl ScriptedAi {
             .or(enemy_start);
 
         self.plan_commander(w, &faction, start, &mut out);
+        self.plan_engineers(w, &faction, start, enemy_start, &mut out);
 
-        // Factories: rally + production loop.
+        // Factories: rally + Engineers / Tanks / Bots / Artillery loop.
+        let n_eng = w
+            .units()
+            .filter(|u| u.army == self.army && u.role == Role::Engineer)
+            .count();
+        let queued_eng: usize = w
+            .units()
+            .filter(|u| u.army == self.army && u.role == Role::Factory)
+            .map(|f| {
+                f.production.iter().filter(|id| **id == faction.engineer).count()
+                    + usize::from(
+                        f.build
+                            .as_ref()
+                            .is_some_and(|j| j.unit_type == faction.engineer),
+                    )
+            })
+            .sum();
+        let mut eng_needed = MAX_ENGINEERS.saturating_sub(n_eng + queued_eng);
+
         for f in w.units().filter(|u| u.army == self.army && u.role == Role::Factory) {
             if f.rally.is_none()
                 && let Some(t) = enemy_start
@@ -109,13 +116,27 @@ impl ScriptedAi {
                 });
             }
             if f.production.is_empty() && f.build.is_none() && !faction.land_units.is_empty() {
-                let pick = if faction.land_units.len() > 1 && self.produced % 3 == 2 { 1 } else { 0 };
-                self.produced += 1;
-                out.push(Command::Produce {
-                    factory: f.id,
-                    unit_type: faction.land_units[pick].clone(),
-                    count: 1,
-                });
+                if eng_needed > 0 && w.catalog().get(&faction.engineer).is_some() {
+                    eng_needed -= 1;
+                    out.push(Command::Produce {
+                        factory: f.id,
+                        unit_type: faction.engineer.clone(),
+                        count: 1,
+                    });
+                } else {
+                    let n = faction.land_units.len();
+                    let pick = match self.produced % 5 {
+                        3 if n > 1 => 1,
+                        4 if n > 2 => 2,
+                        _ => 0,
+                    };
+                    self.produced += 1;
+                    out.push(Command::Produce {
+                        factory: f.id,
+                        unit_type: faction.land_units[pick].clone(),
+                        count: 1,
+                    });
+                }
             }
         }
 
@@ -137,7 +158,6 @@ impl ScriptedAi {
             .map(|(id, _, _)| *id)
             .collect();
 
-        // Defend against intruders first.
         let def_sq = (DEFEND_RADIUS as i128) * (DEFEND_RADIUS as i128);
         let intruder = w
             .units()
@@ -156,7 +176,6 @@ impl ScriptedAi {
             self.waves_sent += 1;
             self.wave_size = (self.wave_size + 4).min(40);
         }
-        // Survivors of a wave keep pushing toward the enemy commander.
         if !idle_away.is_empty()
             && let Some(t) = enemy_target
         {
@@ -209,8 +228,85 @@ impl ScriptedAi {
         }
     }
 
-    /// First free lattice point around `start`, ring by ring, in a fixed
-    /// order (deterministic placement).
+    fn plan_engineers(
+        &self,
+        w: &Skirmish,
+        faction: &crate::skirmish::Faction,
+        start: (i64, i64),
+        enemy_start: Option<(i64, i64)>,
+        out: &mut Vec<Command>,
+    ) {
+        let n_pd = w
+            .units()
+            .filter(|u| u.army == self.army && u.role == Role::PointDefense)
+            .count();
+        let n_rad = w
+            .units()
+            .filter(|u| u.army == self.army && u.role == Role::Radar)
+            .count();
+        let mut pd_planned = 0usize;
+        let mut rad_planned = 0usize;
+
+        let forward = if let Some(es) = enemy_start {
+            let dx = es.0 - start.0;
+            let dy = es.1 - start.1;
+            let d = crate::skirmish::isqrt((dx as i128) * (dx as i128) + (dy as i128) * (dy as i128)).max(1);
+            (start.0 + dx * 36 * SCALE / d, start.1 + dy * 36 * SCALE / d)
+        } else {
+            start
+        };
+
+        for eng in w
+            .units()
+            .filter(|u| u.army == self.army && u.role == Role::Engineer && u.orders.is_empty() && u.build.is_none())
+        {
+            if n_rad + rad_planned == 0
+                && let Some((rx, ry)) = Self::find_site(w, &faction.radar, start)
+            {
+                rad_planned += 1;
+                out.push(Command::Build {
+                    builder: eng.id,
+                    unit_type: faction.radar.clone(),
+                    x: rx,
+                    y: ry,
+                    queue: false,
+                });
+                continue;
+            }
+            if n_pd + pd_planned < MAX_POINT_DEFENSE
+                && let Some((px, py)) = Self::find_site(w, &faction.point_defense, forward)
+            {
+                pd_planned += 1;
+                out.push(Command::Build {
+                    builder: eng.id,
+                    unit_type: faction.point_defense.clone(),
+                    x: px,
+                    y: py,
+                    queue: false,
+                });
+                continue;
+            }
+            if let Some((_, wp)) = w.wreck_at((eng.pos.x, eng.pos.y), 90 * SCALE) {
+                out.push(Command::Reclaim {
+                    units: vec![eng.id],
+                    x: wp.0,
+                    y: wp.1,
+                    queue: false,
+                });
+                continue;
+            }
+            if let Some((_, mp)) = w.nearest_free_mass_point((eng.pos.x, eng.pos.y), 240 * SCALE) {
+                out.push(Command::Build {
+                    builder: eng.id,
+                    unit_type: faction.extractor.clone(),
+                    x: mp.0,
+                    y: mp.1,
+                    queue: false,
+                });
+            }
+        }
+    }
+
     fn find_site(w: &Skirmish, unit_type: &str, start: (i64, i64)) -> Option<(i64, i64)> {
         let spacing = if w.catalog().get(unit_type).map(|t| t.role) == Some(Role::Factory) {
             12 * SCALE

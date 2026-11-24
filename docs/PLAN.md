@@ -77,6 +77,33 @@ Game dir (default, override with `FA_PATH`):
 - Exit: start to finish on `SCMP_001` with built units fighting, deterministic
   replay hash, and GPU battle snapshot rendered. Done.
 
+### Phase 7 — Textured instancing, terrain strata & HUD (done)
+- `.scmap` terrain strata & blend-map parsing (`src/scmap.rs`) + parallel
+  multi-stratum terrain albedo baking (`src/scene.rs`).
+- Hardware-instanced `.scm` rendering with `_Albedo` + `_SpecTeam` team-color
+  alpha masks, strategic zoom icons, clickable minimap, resource bars, and 14-button
+  2D bitmap-font HUD (`src/viewer.rs`, `src/hud.rs`).
+
+### Phase 8 — Deeper FA gameplay mechanics (done)
+- T1 Engineers (`build`, `repair`, `assist`, `reclaim` wrecks), Point Defense,
+  Radar (`Vision`/`RadarBlip`/`Hidden` intel & `F2` Fog-of-War toggle), ballistic
+  AoE artillery shells, ACU Overcharge, and deterministic unit separation (`src/skirmish.rs`,
+  `src/skirmish_ai.rs`).
+
+### Phase 9 — Binary replays & TCP lockstep multiplayer (done)
+- Compact binary `.farust-replay` (`FARPL1`) codec covering all `Command` variants
+  with periodic checkpoint hashes (`src/replay.rs`: `skirmish --record`, `replay verify`,
+  `replay play`).
+- Length-prefixed `TcpStream` 2-player lockstep (`src/net.rs`: `host`, `join`) with
+  canonical `ArmyId` command ordering and per-turn hash desync verification.
+
+### Phase 10 — Persistent `WorkerPool`, `SpatialGrid` & 2,000+ unit scaling (done)
+- Zero-`unsafe` persistent `WorkerPool` (`src/jobs.rs`) driving batched A* routing in
+  `Skirmish` with exact `1t == Nt` parity and parallel `render_prep` (`src/pathfinding.rs`,
+  `src/render_prep.rs`), plus deterministic integer `SpatialGrid` (`src/spatial.rs`).
+- Verified 2,050-unit scale benchmark via `farust bench-scale SCMP_001 --units 2048 --ticks 200`
+  with exact `1t == 20t` state hashes.
+
 ## Risks / non-goals
 
 - Not a drop-in `ForgedAlliance.exe` replacement; no FAF network/replay

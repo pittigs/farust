@@ -10,6 +10,24 @@ pub struct WaterInfo {
     pub elevation_abyss: f32,
 }
 
+/// One terrain texture stratum (`path` + tile `scale`) from a `.scmap` file.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct TerrainStratum {
+    pub path: String,
+    pub scale: f32,
+}
+
+/// Terrain strata descriptors and embedded blend-map DDS textures parsed from a `.scmap` file.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct TerrainTextures {
+    pub strata_albedo: Vec<TerrainStratum>,
+    pub strata_normal: Vec<TerrainStratum>,
+    pub texturemap0_dds: Vec<u8>,
+    pub texturemap1_dds: Vec<u8>,
+}
+
 /// Parsed Supreme Commander `.scmap` map data (header, heightmap, environment paths, and water).
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -28,6 +46,7 @@ pub struct ScMap {
     pub sky_cubemap_path: String,
     pub cubemaps: Vec<(String, String)>,
     pub water: WaterInfo,
+    pub terrain_textures: Option<TerrainTextures>,
 }
 
 struct Reader<'a> {
@@ -109,6 +128,114 @@ fn decode_cstr_bytes(bytes: &[u8]) -> String {
         Ok(s) => s.to_owned(),
         Err(_) => bytes.iter().map(|&b| b as char).collect(),
     }
+}
+
+/// Parses the v2.60 post-water water/wave/contour/stratum/decal/blendmap sections.
+/// Returns `None` on short synthetic test tails where full strata/DDS payloads are absent.
+fn parse_terrain_textures(tail: &[u8]) -> Option<TerrainTextures> {
+    if tail.len() < 128 {
+        return None;
+    }
+    let mut r = Reader::new(tail);
+    // 20 f32 water shading parameters
+    r.skip(80).ok()?;
+    let _water_cubemap = r.read_cstr().ok()?;
+    let _water_ramp = r.read_cstr().ok()?;
+    // 4 wave normal repeats
+    r.skip(16).ok()?;
+    // 4 wave layers (vec2 movement + texture path)
+    for _ in 0..4 {
+        r.skip(8).ok()?;
+        let _ = r.read_cstr().ok()?;
+    }
+    let wave_gen_count = usize::try_from(r.read_u32().ok()?).ok()?;
+    if wave_gen_count > r.remaining() / 70 {
+        return None;
+    }
+    for _ in 0..wave_gen_count {
+        let _ = r.read_cstr().ok()?;
+        let _ = r.read_cstr().ok()?;
+        r.skip(68).ok()?;
+    }
+    // Contour colors & padding
+    r.skip(28).ok()?;
+
+    let mut strata_albedo = Vec::with_capacity(10);
+    for _ in 0..10 {
+        let path = r.read_cstr().ok()?;
+        let scale = r.read_f32().ok()?;
+        strata_albedo.push(TerrainStratum { path, scale });
+    }
+    let mut strata_normal = Vec::with_capacity(9);
+    for _ in 0..9 {
+        let path = r.read_cstr().ok()?;
+        let scale = r.read_f32().ok()?;
+        strata_normal.push(TerrainStratum { path, scale });
+    }
+
+    r.skip(8).ok()?;
+    let decal_count = usize::try_from(r.read_u32().ok()?).ok()?;
+    if decal_count > r.remaining() / 60 {
+        return None;
+    }
+    for _ in 0..decal_count {
+        r.skip(8).ok()?;
+        let ntex = usize::try_from(r.read_u32().ok()?).ok()?;
+        if ntex > 16 {
+            return None;
+        }
+        for _ in 0..ntex {
+            let tlen = usize::try_from(r.read_u32().ok()?).ok()?;
+            r.skip(tlen).ok()?;
+        }
+        r.skip(48).ok()?;
+    }
+
+    let group_count = usize::try_from(r.read_u32().ok()?).ok()?;
+    if group_count > r.remaining() / 8 {
+        return None;
+    }
+    for _ in 0..group_count {
+        r.skip(4).ok()?;
+        let _ = r.read_cstr().ok()?;
+        let nmem = usize::try_from(r.read_u32().ok()?).ok()?;
+        let byte_len = nmem.checked_mul(4)?;
+        r.skip(byte_len).ok()?;
+    }
+
+    r.skip(8).ok()?;
+    let norm_count = usize::try_from(r.read_u32().ok()?).ok()?;
+    if norm_count > 16 {
+        return None;
+    }
+    for _ in 0..norm_count {
+        let len = usize::try_from(r.read_u32().ok()?).ok()?;
+        r.skip(len).ok()?;
+    }
+
+    let tm0_len = usize::try_from(r.read_u32().ok()?).ok()?;
+    let texturemap0_dds = r.read_bytes(tm0_len).ok()?.to_vec();
+    if !texturemap0_dds.starts_with(b"DDS ") {
+        return None;
+    }
+
+    let texturemap1_dds = if r.remaining() >= 4 {
+        let tm1_len = usize::try_from(r.read_u32().ok()?).ok()?;
+        let dds = r.read_bytes(tm1_len).ok()?.to_vec();
+        if !dds.starts_with(b"DDS ") {
+            return None;
+        }
+        dds
+    } else {
+        Vec::new()
+    };
+
+    Some(TerrainTextures {
+        strata_albedo,
+        strata_normal,
+        texturemap0_dds,
+        texturemap1_dds,
+    })
 }
 
 impl ScMap {
@@ -198,6 +325,8 @@ impl ScMap {
         let elevation_deep = r.read_f32()?;
         let elevation_abyss = r.read_f32()?;
 
+        let terrain_textures = parse_terrain_textures(&data[r.pos..]);
+
         Ok(ScMap {
             version_major,
             version_minor,
@@ -218,6 +347,7 @@ impl ScMap {
                 elevation_deep,
                 elevation_abyss,
             },
+            terrain_textures,
         })
     }
 
@@ -587,6 +717,7 @@ mod tests {
                 elevation_deep: 0.0,
                 elevation_abyss: 0.0,
             },
+            terrain_textures: None,
         };
         assert_eq!(map.height_stats(), (0.0, 0.0, 0.0));
         assert_eq!(map.height_at(0, 0), None);

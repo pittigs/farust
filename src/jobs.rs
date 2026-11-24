@@ -1,7 +1,8 @@
 //! Phase 5 scoped worker pool (`std::thread::scope`) and parallel asset batch decoding.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::thread;
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::{self, JoinHandle};
 
 use crate::blueprint;
 use crate::dds_decode::decode_dds_rgba8;
@@ -85,7 +86,7 @@ where
     for batch in worker_batches {
         for (start, chunk_out) in batch {
             for (offset, val) in chunk_out.into_iter().enumerate() {
-                slots[start + offset] = Some(val);
+        slots[start + offset] = Some(val);
             }
         }
     }
@@ -94,6 +95,208 @@ where
         .into_iter()
         .map(|slot| slot.expect("all slots populated"))
         .collect()
+}
+
+struct ActiveJob {
+    len: usize,
+    chunk_size: usize,
+    next: AtomicUsize,
+    pending_workers: AtomicUsize,
+    done_mu: Mutex<()>,
+    done_cv: Condvar,
+    func: Arc<dyn Fn(usize, usize) + Send + Sync>,
+}
+
+struct PoolQueue {
+    seq: u64,
+    shutdown: bool,
+    job: Option<Arc<ActiveJob>>,
+}
+
+/// Phase 10 zero-`unsafe` persistent thread pool (`Mutex` + `Condvar`).
+/// Avoids OS thread creation overhead during per-tick pathfinding and per-frame render prep.
+pub struct WorkerPool {
+    threads: usize,
+    submit_lock: Mutex<()>,
+    queue: Arc<(Mutex<PoolQueue>, Condvar)>,
+    workers: Vec<JoinHandle<()>>,
+}
+
+impl std::fmt::Debug for WorkerPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkerPool")
+            .field("threads", &self.threads)
+            .finish()
+    }
+}
+
+impl WorkerPool {
+    pub fn new(threads: usize) -> Self {
+        let threads = threads.max(1);
+        let extra_workers = threads.saturating_sub(1);
+        let queue = Arc::new((
+            Mutex::new(PoolQueue {
+                seq: 0,
+                shutdown: false,
+                job: None,
+            }),
+            Condvar::new(),
+        ));
+        let mut workers = Vec::with_capacity(extra_workers);
+        for _ in 0..extra_workers {
+            let q = Arc::clone(&queue);
+            workers.push(thread::spawn(move || {
+                let mut last_seq = 0u64;
+                loop {
+                    let job = {
+                        let (lock, cv) = &*q;
+                        let mut guard = lock.lock().expect("pool mutex poisoned");
+                        while !guard.shutdown && guard.seq == last_seq {
+                            guard = cv.wait(guard).expect("pool condvar wait failed");
+                        }
+                        if guard.shutdown {
+                            return;
+                        }
+                        last_seq = guard.seq;
+                        guard.job.clone()
+                    };
+                    if let Some(job) = job {
+                        Self::run_job_chunks(&job);
+                        if job.pending_workers.fetch_sub(1, Ordering::AcqRel) == 1 {
+                            let _g = job.done_mu.lock().expect("done mutex poisoned");
+                            job.done_cv.notify_all();
+                        }
+                    }
+                }
+            }));
+        }
+        Self {
+            threads,
+            submit_lock: Mutex::new(()),
+            queue,
+            workers,
+        }
+    }
+
+    pub fn threads(&self) -> usize {
+        self.threads
+    }
+
+    fn run_job_chunks(job: &ActiveJob) {
+        loop {
+            let start = job.next.fetch_add(job.chunk_size, Ordering::Relaxed);
+            if start >= job.len {
+                break;
+            }
+            let end = (start + job.chunk_size).min(job.len);
+            (job.func)(start, end);
+        }
+    }
+
+    /// Executes `f(start, end)` across `[0, len)` in contiguous chunks, utilizing the
+    /// persistent worker threads plus the caller thread. Blocks until complete.
+    pub fn par_for_chunks(
+        &self,
+        len: usize,
+        min_chunk: usize,
+        f: Arc<dyn Fn(usize, usize) + Send + Sync>,
+    ) {
+        if len == 0 {
+            return;
+        }
+        if self.workers.is_empty() || len <= min_chunk {
+            f(0, len);
+            return;
+        }
+        let _submit = self.submit_lock.lock().expect("submit mutex poisoned");
+        let chunk_size = (len / (self.threads * 4)).max(min_chunk).max(1);
+        let job = Arc::new(ActiveJob {
+            len,
+            chunk_size,
+            next: AtomicUsize::new(0),
+            pending_workers: AtomicUsize::new(self.workers.len()),
+            done_mu: Mutex::new(()),
+            done_cv: Condvar::new(),
+            func: f,
+        });
+        {
+            let (lock, cv) = &*self.queue;
+            let mut guard = lock.lock().expect("pool mutex poisoned");
+            guard.job = Some(Arc::clone(&job));
+            guard.seq += 1;
+            cv.notify_all();
+        }
+
+        // Caller helps execute chunks too so no core sits idle.
+        Self::run_job_chunks(&job);
+
+        let mut g = job.done_mu.lock().expect("done mutex poisoned");
+        while job.pending_workers.load(Ordering::Acquire) > 0 {
+            g = job.done_cv.wait(g).expect("done condvar wait failed");
+        }
+        drop(g);
+        let (lock, _) = &*self.queue;
+        let mut guard = lock.lock().expect("pool mutex poisoned");
+        guard.job = None;
+    }
+
+    /// Maps `items` across the persistent pool and returns results in exact `0..items.len()` order.
+    pub fn par_map_ordered_arc<T, R, F>(&self, items: Arc<Vec<T>>, f: Arc<F>) -> Vec<R>
+    where
+        T: Send + Sync + 'static,
+        R: Send + 'static,
+        F: Fn(usize, &T) -> R + Send + Sync + 'static,
+    {
+        let len = items.len();
+        if len == 0 {
+            return Vec::new();
+        }
+        if self.workers.is_empty() || len <= 1 {
+            return items
+                .iter()
+                .enumerate()
+                .map(|(i, item)| f(i, item))
+                .collect();
+        }
+        let out_chunks: Arc<Mutex<Vec<(usize, Vec<R>)>>> = Arc::new(Mutex::new(Vec::new()));
+        let items_ref = Arc::clone(&items);
+        let f_ref = Arc::clone(&f);
+        let out_ref = Arc::clone(&out_chunks);
+        self.par_for_chunks(
+            len,
+            1,
+            Arc::new(move |start, end| {
+                let mut local = Vec::with_capacity(end - start);
+                for idx in start..end {
+                    local.push(f_ref(idx, &items_ref[idx]));
+                }
+                out_ref.lock().expect("out mutex").push((start, local));
+            }),
+        );
+
+        let mut batches = std::mem::take(&mut *out_chunks.lock().expect("out mutex"));
+        batches.sort_by_key(|(start, _)| *start);
+        let mut results = Vec::with_capacity(len);
+        for (_, chunk) in batches {
+            results.extend(chunk);
+        }
+        results
+    }
+}
+
+impl Drop for WorkerPool {
+    fn drop(&mut self) {
+        {
+            let (lock, cv) = &*self.queue;
+            let mut guard = lock.lock().expect("pool mutex poisoned");
+            guard.shutdown = true;
+            guard.job = None;
+            cv.notify_all();
+        }
+        for w in self.workers.drain(..) {
+            let _ = w.join();
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

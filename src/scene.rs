@@ -7,6 +7,7 @@ use bytemuck::{Pod, Zeroable};
 use crate::blueprint::{self, Value};
 use crate::camera::OrbitCamera;
 use crate::dds_decode::{RgbaImage, decode_dds_rgba8};
+use crate::jobs;
 use crate::scd;
 use crate::scenario;
 use crate::scm::ScmMesh;
@@ -27,6 +28,10 @@ pub struct LoadedScene {
     pub title: String,
     pub vertices: Vec<GpuVertex>,
     pub indices: Vec<u32>,
+    /// Optional secondary geometry (water plane, map markers) drawn untextured
+    /// so baked terrain textures stay clean.
+    pub overlay_vertices: Vec<GpuVertex>,
+    pub overlay_indices: Vec<u32>,
     pub albedo: RgbaImage,
     pub initial_camera: OrbitCamera,
     pub clear_color: [f64; 4],
@@ -244,6 +249,8 @@ pub fn load_unit_scene(game_dir: &Path, unit_id: &str, aspect: f32) -> Result<Lo
         title,
         vertices,
         indices,
+        overlay_vertices: Vec::new(),
+        overlay_indices: Vec::new(),
         albedo,
         initial_camera,
         clear_color: [0.055, 0.070, 0.095, 1.0],
@@ -264,13 +271,16 @@ pub fn load_map_scene(game_dir: &Path, map_name: &str, aspect: f32) -> Result<Lo
         .ok_or_else(|| format!("Map '{}' has no .scmap file", map_files.id))?;
     let scmap = ScMap::parse_file(scmap_path)?;
 
-    let (vertices, indices) = build_terrain_mesh(&scmap, markers.as_ref());
+    let baked = bake_terrain_albedo(game_dir, &scmap, 2048);
+    let textured = baked.is_some();
+    let (vertices, indices, overlay_vertices, overlay_indices) =
+        build_terrain_and_overlay_meshes(&scmap, markers.as_ref(), textured);
 
-    let albedo = RgbaImage {
+    let albedo = baked.unwrap_or_else(|| RgbaImage {
         width: 1,
         height: 1,
         pixels: vec![255, 255, 255, 255],
-    };
+    });
 
     let (_, _, avg_h) = scmap.height_stats();
     let focus_y = if scmap.water.has_water {
@@ -290,20 +300,38 @@ pub fn load_map_scene(game_dir: &Path, map_name: &str, aspect: f32) -> Result<Lo
         title,
         vertices,
         indices,
+        overlay_vertices,
+        overlay_indices,
         albedo,
         initial_camera,
         clear_color: [0.42, 0.58, 0.78, 1.0],
     })
 }
 
+#[allow(dead_code)]
 pub fn build_terrain_mesh(
     scmap: &ScMap,
     markers: Option<&scenario::SaveMarkers>,
 ) -> (Vec<GpuVertex>, Vec<u32>) {
+    let (mut verts, mut idx, ov_v, ov_i) = build_terrain_and_overlay_meshes(scmap, markers, false);
+    let base = verts.len() as u32;
+    verts.extend(ov_v);
+    idx.extend(ov_i.into_iter().map(|i| base + i));
+    (verts, idx)
+}
+
+/// Builds `(terrain_vertices, terrain_indices, overlay_vertices, overlay_indices)` where
+/// water and beacons are placed in the overlay buffer so baked terrain strata textures
+/// do not color the water surface.
+pub fn build_terrain_and_overlay_meshes(
+    scmap: &ScMap,
+    markers: Option<&scenario::SaveMarkers>,
+    neutral_terrain_tint: bool,
+) -> (Vec<GpuVertex>, Vec<u32>, Vec<GpuVertex>, Vec<u32>) {
     let hm_w = scmap.heightmap_width;
     let hm_h = scmap.heightmap_height;
     if hm_w == 0 || hm_h == 0 {
-        return (Vec::new(), Vec::new());
+        return (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     }
 
     let max_dim = hm_w.max(hm_h);
@@ -340,8 +368,10 @@ pub fn build_terrain_mesh(
         min_h
     };
 
-    let mut vertices = Vec::with_capacity((nx * nz) as usize + 64);
-    let mut indices = Vec::with_capacity((cells_x * cells_z * 6) as usize + 64);
+    let mut vertices = Vec::with_capacity((nx * nz) as usize);
+    let mut indices = Vec::with_capacity((cells_x * cells_z * 6) as usize);
+    let mut ov_vertices = Vec::with_capacity(64);
+    let mut ov_indices = Vec::with_capacity(64);
 
     for iz in 0..nz {
         let z = (iz * step).min(hm_h);
@@ -368,15 +398,19 @@ pub fn build_terrain_mesh(
             let nz_v = h_up - h_down;
             let normal = normalize_or_up([nx_v, ny_v, nz_v]);
 
-            let color = terrain_vertex_color(
-                y,
-                normal,
-                scmap.water.has_water,
-                scmap.water.elevation,
-                deep_floor,
-                land_base,
-                max_h,
-            );
+            let color = if neutral_terrain_tint {
+                [1.0, 1.0, 1.0, 0.08]
+            } else {
+                terrain_vertex_color(
+                    y,
+                    normal,
+                    scmap.water.has_water,
+                    scmap.water.elevation,
+                    deep_floor,
+                    land_base,
+                    max_h,
+                )
+            };
 
             vertices.push(GpuVertex {
                 position: [wx, y, wz],
@@ -410,9 +444,9 @@ pub fn build_terrain_mesh(
         };
         let wy = scmap.water.elevation;
         let water_color = [0.09, 0.28, 0.46, 0.80];
-        let base_idx = vertices.len() as u32;
+        let base_idx = ov_vertices.len() as u32;
 
-        vertices.extend_from_slice(&[
+        ov_vertices.extend_from_slice(&[
             GpuVertex {
                 position: [0.0, wy, 0.0],
                 normal: [0.0, 1.0, 0.0],
@@ -438,7 +472,7 @@ pub fn build_terrain_mesh(
                 color: water_color,
             },
         ]);
-        indices.extend_from_slice(&[
+        ov_indices.extend_from_slice(&[
             base_idx,
             base_idx + 2,
             base_idx + 1,
@@ -464,8 +498,8 @@ pub fn build_terrain_mesh(
         for spot in &sm.start_spots {
             let base_y = spot.position[1].max(min_marker_y);
             append_pyramid(
-                &mut vertices,
-                &mut indices,
+                &mut ov_vertices,
+                &mut ov_indices,
                 [spot.position[0], base_y, spot.position[2]],
                 radius,
                 radius * 2.8,
@@ -478,8 +512,8 @@ pub fn build_terrain_mesh(
         for mass in &sm.mass_points {
             let base_y = mass.position[1].max(min_marker_y);
             append_pyramid(
-                &mut vertices,
-                &mut indices,
+                &mut ov_vertices,
+                &mut ov_indices,
                 [mass.position[0], base_y, mass.position[2]],
                 mass_radius,
                 mass_radius * 2.8,
@@ -488,7 +522,197 @@ pub fn build_terrain_mesh(
         }
     }
 
-    (vertices, indices)
+    (vertices, indices, ov_vertices, ov_indices)
+}
+
+#[inline]
+fn sample_rgba_bilinear(img: &RgbaImage, u: f32, v: f32) -> [f32; 4] {
+    let w = img.width as i32;
+    let h = img.height as i32;
+    if w <= 0 || h <= 0 || img.pixels.len() < 4 {
+        return [1.0, 1.0, 1.0, 1.0];
+    }
+    let fx = u.rem_euclid(1.0) * w as f32 - 0.5;
+    let fy = v.rem_euclid(1.0) * h as f32 - 0.5;
+    let x0 = (fx.floor() as i32).rem_euclid(w) as usize;
+    let y0 = (fy.floor() as i32).rem_euclid(h) as usize;
+    let x1 = (x0 + 1) % (w as usize);
+    let y1 = (y0 + 1) % (h as usize);
+    let tx = fx - fx.floor();
+    let ty = fy - fy.floor();
+
+    let at = |x: usize, y: usize| -> [f32; 4] {
+        let i = (y * (w as usize) + x) * 4;
+        [
+            img.pixels[i] as f32 / 255.0,
+            img.pixels[i + 1] as f32 / 255.0,
+            img.pixels[i + 2] as f32 / 255.0,
+            img.pixels[i + 3] as f32 / 255.0,
+        ]
+    };
+    let c00 = at(x0, y0);
+    let c10 = at(x1, y0);
+    let c01 = at(x0, y1);
+    let c11 = at(x1, y1);
+    let mut out = [0.0_f32; 4];
+    for c in 0..4 {
+        let a = c00[c] + (c10[c] - c00[c]) * tx;
+        let b = c01[c] + (c11[c] - c01[c]) * tx;
+        out[c] = a + (b - a) * ty;
+    }
+    out
+}
+
+/// Decodes and blends real Forged Alliance `.scmap` terrain strata (`env.scd`) with
+/// the embedded texture blend maps (`texturemap0` / `texturemap1`) into an `out_size x out_size` texture.
+pub fn bake_terrain_albedo(game_dir: &Path, scmap: &ScMap, out_size: u32) -> Option<RgbaImage> {
+    let tt = scmap.terrain_textures.as_ref()?;
+    let tm0 = decode_dds_rgba8(&tt.texturemap0_dds).ok()?;
+    let tm1 = (!tt.texturemap1_dds.is_empty())
+        .then(|| decode_dds_rgba8(&tt.texturemap1_dds).ok())
+        .flatten();
+
+    let gamedata = scd::gamedata_dir(game_dir);
+    let raw_layers: Vec<Option<Vec<u8>>> = tt
+        .strata_albedo
+        .iter()
+        .map(|s| {
+            let trimmed = s.path.trim().trim_start_matches('/').replace('\\', "/");
+            if trimmed.is_empty() {
+                None
+            } else {
+                find_asset_in_scds(&gamedata, &["env.scd", "textures.scd"], &[trimmed])
+            }
+        })
+        .collect();
+
+    let threads = jobs::default_thread_count();
+    let layers: Vec<Option<RgbaImage>> = jobs::par_map_ordered(&raw_layers, threads, |_, opt| {
+        opt.as_deref().and_then(|b| decode_dds_rgba8(b).ok())
+    });
+
+    if layers.first().and_then(|o| o.as_ref()).is_none() {
+        return None;
+    }
+
+    let size = out_size.max(64);
+    let map_span = scmap.map_width.max(scmap.map_height).max(256.0);
+    let tile_repeat = |idx: usize| -> f32 {
+        let raw = tt.strata_albedo.get(idx).map(|s| s.scale).unwrap_or(4.0);
+        if raw.is_finite() && raw > 0.05 {
+            (map_span / (raw.max(1.5) * 3.0)).clamp(16.0, 96.0)
+        } else {
+            32.0
+        }
+    };
+    let repeats: Vec<f32> = (0..10).map(tile_repeat).collect();
+    let row_indices: Vec<u32> = (0..size).collect();
+    let tm1_ref = tm1.as_ref();
+    let layers_ref = &layers;
+    let repeats_ref = &repeats;
+
+    let rows = jobs::par_map_ordered(&row_indices, threads, |_, &py| {
+        let mut row = Vec::with_capacity(size as usize * 4);
+        let v = (py as f32 + 0.5) / size as f32;
+        for px in 0..size {
+            let u = (px as f32 + 0.5) / size as f32;
+            let b0 = sample_rgba_bilinear(&tm0, u, v);
+            let b1 = tm1_ref.map(|t| sample_rgba_bilinear(t, u, v)).unwrap_or([0.0; 4]);
+
+            let mut rgb = [0.28_f32, 0.34, 0.22];
+            if let Some(ref base) = layers_ref[0] {
+                let s = sample_rgba_bilinear(base, u * repeats_ref[0], v * repeats_ref[0]);
+                rgb = [s[0], s[1], s[2]];
+            }
+            for ch in 0..4 {
+                if let Some(ref layer) = layers_ref[1 + ch] {
+                    let w = b0[ch];
+                    if w > 0.002 {
+                        let s = sample_rgba_bilinear(
+                            layer,
+                            u * repeats_ref[1 + ch],
+                            v * repeats_ref[1 + ch],
+                        );
+                        for k in 0..3 {
+                            rgb[k] = rgb[k] + (s[k] - rgb[k]) * w;
+                        }
+                    }
+                }
+            }
+            for ch in 0..4 {
+                if let Some(ref layer) = layers_ref[5 + ch] {
+                    let w = b1[ch];
+                    if w > 0.002 {
+                        let s = sample_rgba_bilinear(
+                            layer,
+                            u * repeats_ref[5 + ch],
+                            v * repeats_ref[5 + ch],
+                        );
+                        for k in 0..3 {
+                            rgb[k] = rgb[k] + (s[k] - rgb[k]) * w;
+                        }
+                    }
+                }
+            }
+            if let Some(ref mac) = layers_ref[9] {
+                let s = sample_rgba_bilinear(mac, u * 1.5, v * 1.5);
+                for k in 0..3 {
+                    rgb[k] = (rgb[k] * (0.78 + 0.44 * s[k])).clamp(0.0, 1.0);
+                }
+            }
+
+            row.push((rgb[0] * 255.0).round().clamp(0.0, 255.0) as u8);
+            row.push((rgb[1] * 255.0).round().clamp(0.0, 255.0) as u8);
+            row.push((rgb[2] * 255.0).round().clamp(0.0, 255.0) as u8);
+            row.push(255);
+        }
+        row
+    });
+
+    let mut pixels = Vec::with_capacity((size * size * 4) as usize);
+    for row in rows {
+        pixels.extend_from_slice(&row);
+    }
+    Some(RgbaImage {
+        width: size,
+        height: size,
+        pixels,
+    })
+}
+
+/// Loads `{unit_id}_Albedo.dds` + `{unit_id}_SpecTeam.dds` from `units.scd` and packs
+/// `(r, g, b, team_mask)` into one RGBA8 texture for hardware-instanced team-colored units.
+pub fn load_unit_albedo_and_team_mask(game_dir: &Path, unit_id: &str) -> Option<RgbaImage> {
+    let gamedata = scd::gamedata_dir(game_dir);
+    let albedo_paths = [
+        format!("units/{unit_id}/{unit_id}_Albedo.dds"),
+        format!("units/{unit_id}/{unit_id}_albedo.dds"),
+    ];
+    let mut albedo = decode_first_dds(&gamedata, &["units.scd", "textures.scd"], &albedo_paths)?;
+    let spec_paths = [
+        format!("units/{unit_id}/{unit_id}_SpecTeam.dds"),
+        format!("units/{unit_id}/{unit_id}_specteam.dds"),
+    ];
+    let spec = decode_first_dds(&gamedata, &["units.scd"], &spec_paths);
+    let n = (albedo.width as usize * albedo.height as usize).min(albedo.pixels.len() / 4);
+    if let Some(ref sp) = spec
+        && sp.width > 0
+        && sp.height > 0
+    {
+        for i in 0..n {
+            let x = i % albedo.width as usize;
+            let y = i / albedo.width as usize;
+            let sx = (x * sp.width as usize / albedo.width as usize).min(sp.width as usize - 1);
+            let sy = (y * sp.height as usize / albedo.height as usize).min(sp.height as usize - 1);
+            let si = (sy * sp.width as usize + sx) * 4;
+            albedo.pixels[i * 4 + 3] = sp.pixels[si + 3];
+        }
+    } else {
+        for i in 0..n {
+            albedo.pixels[i * 4 + 3] = 72;
+        }
+    }
+    Some(albedo)
 }
 
 fn terrain_vertex_color(

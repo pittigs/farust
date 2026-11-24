@@ -1,11 +1,13 @@
-//! Phase 6 playable skirmish viewer & interactive controller.
+//! Phases 6–10 playable skirmish viewer & interactive controller.
 //!
-//! Connects the deterministic [`Skirmish`] simulation and [`ScriptedAi`] to the
-//! GPU renderer (`wgpu` + `winit`): real `.scm` unit meshes loaded from
-//! `units.scd`, `.scmap` terrain with mass-point rings, selection & box-select,
-//! move / attack-move / attack / stop / rally orders, commander building
-//! placement with mass-point snapping, factory production hotkeys, 3D health &
-//! build-progress bars, laser fire tracers, and headless PNG snapshots.
+//! Features:
+//! - Baked real Forged Alliance `.scmap` terrain strata (`env.scd`) + water overlay
+//! - Hardware-instanced `.scm` unit meshes with `_Albedo` + `_SpecTeam` team-color masks
+//! - Strategic zoom crossfade (`distance > 340` switches to crisp FA role icons)
+//! - In-window 2D HUD (`src/hud.rs`): economy gauges, clickable build/produce palette, minimap
+//! - Full Phase 8 gameplay: Engineers, wrecks/reclaim, repair, assist, Overcharge, ballistic
+//!   artillery shells, Point Defense, Radar & Fog-of-War (`F2`)
+//! - Phase 9 replay playback (`PlaySession::new_replay`)
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -22,21 +24,25 @@ use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 use crate::camera::OrbitCamera;
-use crate::dds_decode::RgbaImage;
+use crate::dds_decode::{RgbaImage, decode_dds_rgba8};
+use crate::hud::{self, HudAction, HudLayout};
+use crate::replay::Replay;
 use crate::scd;
 use crate::scm::ScmMesh;
 use crate::scmap::ScMap;
 use crate::scene::{self, GpuVertex, LoadedScene};
 use crate::sim::{SCALE, TICK_HZ};
-use crate::skirmish::{ArmyId, Catalog, Command, GameResult, MapContext, Role, Skirmish, UnitId, UnitOrder};
+use crate::skirmish::{
+    ArmyId, Catalog, Command, GameResult, IntelVisibility, MapContext, Role, Skirmish, UnitId,
+    UnitOrder,
+};
 use crate::skirmish_ai::ScriptedAi;
-use crate::viewer::{self, DEPTH_FORMAT, GpuSceneResources, MSAA_SAMPLES};
+use crate::viewer::{self, DEPTH_FORMAT, GpuMeshTemplate, GpuSceneResources, GpuUnitInstance, MSAA_SAMPLES};
 
 // ---------------------------------------------------------------------------
 // Terrain sampling & mouse-ray picking
 // ---------------------------------------------------------------------------
 
-/// Bilinearly samples terrain height (clamped above water elevation if present).
 pub fn sample_terrain_y(scmap: &ScMap, wx: f32, wz: f32) -> f32 {
     let hm_w = scmap.heightmap_width;
     let hm_h = scmap.heightmap_height;
@@ -77,8 +83,6 @@ pub fn sample_terrain_y(scmap: &ScMap, wx: f32, wz: f32) -> f32 {
     }
 }
 
-/// Intersects a screen pixel `(px, py)` with the terrain surface using ray
-/// marching + binary refinement, falling back to the camera target plane.
 pub fn pick_terrain_point(
     camera: &OrbitCamera,
     scmap: &ScMap,
@@ -173,14 +177,16 @@ fn pick_radius_for_camera(camera: &OrbitCamera) -> i64 {
 }
 
 // ---------------------------------------------------------------------------
-// Real .scm mesh cache with procedural role fallbacks
+// Real .scm mesh + unit Albedo/SpecTeam texture cache
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
 pub struct NormalizedMesh {
     pub positions: Vec<[f32; 3]>,
     pub normals: Vec<[f32; 3]>,
+    pub uvs: Vec<[f32; 2]>,
     pub indices: Vec<u32>,
+    pub albedo: Option<RgbaImage>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -190,8 +196,7 @@ pub struct UnitMeshCache {
 }
 
 impl UnitMeshCache {
-    /// Loads normalized `.scm` meshes (LOD1 preferred, then LOD0) from `units.scd`,
-    /// falling back to clean role silhouettes when running headless tests without game files.
+    /// Loads normalized `.scm` meshes (`LOD1`/`LOD0`) and `_Albedo`+`_SpecTeam` textures from `units.scd`.
     pub fn load(game_dir: Option<&Path>, catalog: &Catalog) -> Self {
         let mut by_type = BTreeMap::new();
         let units_scd = game_dir.map(|d| scd::gamedata_dir(d).join("units.scd"));
@@ -207,8 +212,10 @@ impl UnitMeshCache {
                 for inner in &candidates {
                     if let Ok((_, bytes)) = scd::read_scd_file_ci(scd_path, inner)
                         && let Ok(scm) = ScmMesh::parse(&bytes)
-                        && let Some(norm) = normalize_scm(&scm, target_span)
+                        && let Some(mut norm) = normalize_scm(&scm, target_span)
                     {
+                        norm.albedo = game_dir
+                            .and_then(|d| scene::load_unit_albedo_and_team_mask(d, id));
                         loaded = Some(norm);
                         break;
                     }
@@ -226,6 +233,9 @@ impl UnitMeshCache {
             Role::Factory,
             Role::Extractor,
             Role::Generator,
+            Role::PointDefense,
+            Role::Radar,
+            Role::Engineer,
             Role::Mobile,
         ]
         .into_iter()
@@ -262,6 +272,7 @@ fn normalize_scm(scm: &ScmMesh, target_span: f32) -> Option<NormalizedMesh> {
 
     let mut positions = Vec::with_capacity(scm.vertices.len());
     let mut normals = Vec::with_capacity(scm.vertices.len());
+    let mut uvs = Vec::with_capacity(scm.vertices.len());
     for v in &scm.vertices {
         positions.push([
             (v.position[0] - cx) * s,
@@ -269,54 +280,74 @@ fn normalize_scm(scm: &ScmMesh, target_span: f32) -> Option<NormalizedMesh> {
             (v.position[2] - cz) * s,
         ]);
         normals.push(normalize_or_up(v.normal));
+        uvs.push(v.uv0);
     }
     let indices = scm.indices.iter().map(|&i| u32::from(i)).collect();
     Some(NormalizedMesh {
         positions,
         normals,
+        uvs,
         indices,
+        albedo: None,
     })
 }
 
 fn procedural_role_mesh(role: Role, span: f32) -> NormalizedMesh {
     let mut positions = Vec::new();
     let mut normals = Vec::new();
+    let mut uvs = Vec::new();
     let mut indices = Vec::new();
     let half = span * 0.5;
     match role {
         Role::Commander => {
-            append_local_box(&mut positions, &mut normals, &mut indices, [0.0, 0.0, 0.0], [half * 0.75, span * 0.85, half * 0.75]);
-            append_local_box(&mut positions, &mut normals, &mut indices, [0.0, span * 0.85, 0.0], [half * 0.9, span * 0.35, half * 0.65]);
-            append_local_box(&mut positions, &mut normals, &mut indices, [0.0, span * 1.2, 0.0], [half * 0.42, span * 0.35, half * 0.42]);
+            append_local_box(&mut positions, &mut normals, &mut uvs, &mut indices, [0.0, 0.0, 0.0], [half * 0.75, span * 0.85, half * 0.75]);
+            append_local_box(&mut positions, &mut normals, &mut uvs, &mut indices, [0.0, span * 0.85, 0.0], [half * 0.9, span * 0.35, half * 0.65]);
+            append_local_box(&mut positions, &mut normals, &mut uvs, &mut indices, [0.0, span * 1.2, 0.0], [half * 0.42, span * 0.35, half * 0.42]);
         }
         Role::Factory => {
-            append_local_box(&mut positions, &mut normals, &mut indices, [-half * 0.72, 0.0, 0.0], [half * 0.25, span * 0.45, half * 0.95]);
-            append_local_box(&mut positions, &mut normals, &mut indices, [half * 0.72, 0.0, 0.0], [half * 0.25, span * 0.45, half * 0.95]);
-            append_local_box(&mut positions, &mut normals, &mut indices, [0.0, 0.0, -half * 0.72], [half * 0.95, span * 0.38, half * 0.25]);
+            append_local_box(&mut positions, &mut normals, &mut uvs, &mut indices, [-half * 0.72, 0.0, 0.0], [half * 0.25, span * 0.45, half * 0.95]);
+            append_local_box(&mut positions, &mut normals, &mut uvs, &mut indices, [half * 0.72, 0.0, 0.0], [half * 0.25, span * 0.45, half * 0.95]);
+            append_local_box(&mut positions, &mut normals, &mut uvs, &mut indices, [0.0, 0.0, -half * 0.72], [half * 0.95, span * 0.38, half * 0.25]);
         }
         Role::Extractor => {
-            append_local_box(&mut positions, &mut normals, &mut indices, [0.0, 0.0, 0.0], [half * 0.8, span * 0.55, half * 0.8]);
-            append_local_box(&mut positions, &mut normals, &mut indices, [0.0, span * 0.55, 0.0], [half * 0.35, span * 0.85, half * 0.35]);
+            append_local_box(&mut positions, &mut normals, &mut uvs, &mut indices, [0.0, 0.0, 0.0], [half * 0.8, span * 0.55, half * 0.8]);
+            append_local_box(&mut positions, &mut normals, &mut uvs, &mut indices, [0.0, span * 0.55, 0.0], [half * 0.35, span * 0.85, half * 0.35]);
         }
         Role::Generator => {
-            append_local_box(&mut positions, &mut normals, &mut indices, [0.0, 0.0, 0.0], [half * 0.85, span * 0.45, half * 0.85]);
-            append_local_box(&mut positions, &mut normals, &mut indices, [0.0, span * 0.45, 0.0], [half * 0.55, span * 0.45, half * 0.55]);
+            append_local_box(&mut positions, &mut normals, &mut uvs, &mut indices, [0.0, 0.0, 0.0], [half * 0.85, span * 0.45, half * 0.85]);
+            append_local_box(&mut positions, &mut normals, &mut uvs, &mut indices, [0.0, span * 0.45, 0.0], [half * 0.55, span * 0.45, half * 0.55]);
+        }
+        Role::PointDefense => {
+            append_local_box(&mut positions, &mut normals, &mut uvs, &mut indices, [0.0, 0.0, 0.0], [half * 0.7, span * 0.65, half * 0.7]);
+            append_local_box(&mut positions, &mut normals, &mut uvs, &mut indices, [0.0, span * 0.65, half * 0.3], [half * 0.28, span * 0.28, half * 0.9]);
+        }
+        Role::Radar => {
+            append_local_box(&mut positions, &mut normals, &mut uvs, &mut indices, [0.0, 0.0, 0.0], [half * 0.6, span * 0.5, half * 0.6]);
+            append_local_box(&mut positions, &mut normals, &mut uvs, &mut indices, [0.0, span * 0.5, 0.0], [half * 0.18, span * 1.1, half * 0.18]);
+            append_local_box(&mut positions, &mut normals, &mut uvs, &mut indices, [0.0, span * 1.45, 0.0], [half * 0.75, span * 0.25, half * 0.22]);
+        }
+        Role::Engineer => {
+            append_local_box(&mut positions, &mut normals, &mut uvs, &mut indices, [0.0, 0.0, 0.0], [half * 0.75, span * 0.32, half * 0.85]);
+            append_local_box(&mut positions, &mut normals, &mut uvs, &mut indices, [0.0, span * 0.32, half * 0.3], [half * 0.35, span * 0.35, half * 0.35]);
         }
         Role::Mobile => {
-            append_local_box(&mut positions, &mut normals, &mut indices, [0.0, 0.0, 0.0], [half * 0.75, span * 0.35, half]);
-            append_local_box(&mut positions, &mut normals, &mut indices, [0.0, span * 0.35, half * 0.1], [half * 0.4, span * 0.25, half * 0.65]);
+            append_local_box(&mut positions, &mut normals, &mut uvs, &mut indices, [0.0, 0.0, 0.0], [half * 0.75, span * 0.35, half]);
+            append_local_box(&mut positions, &mut normals, &mut uvs, &mut indices, [0.0, span * 0.35, half * 0.1], [half * 0.4, span * 0.25, half * 0.65]);
         }
     }
     NormalizedMesh {
         positions,
         normals,
+        uvs,
         indices,
+        albedo: None,
     }
 }
 
 fn append_local_box(
     positions: &mut Vec<[f32; 3]>,
     normals: &mut Vec<[f32; 3]>,
+    uvs: &mut Vec<[f32; 2]>,
     indices: &mut Vec<u32>,
     base_center: [f32; 3],
     half_extents_with_full_h: [f32; 3],
@@ -345,6 +376,7 @@ fn append_local_box(
         let base = positions.len() as u32;
         positions.extend_from_slice(&q);
         normals.extend_from_slice(&[n, n, n, n]);
+        uvs.extend_from_slice(&[[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]);
         indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
     }
 }
@@ -359,6 +391,7 @@ pub struct PlaySession {
     pub ais: Vec<ScriptedAi>,
     pub human_army: ArmyId,
     pub spectate: bool,
+    pub fog_of_war: bool,
     pub selected: Vec<UnitId>,
     pub build_mode: Option<String>,
     pub attack_move_mode: bool,
@@ -367,6 +400,7 @@ pub struct PlaySession {
     pub hover_world: Option<[f32; 3]>,
     pub drag_box_world: Option<([f32; 3], [f32; 3])>,
     pub status_banner: String,
+    replay: Option<(Replay, usize)>,
 }
 
 impl PlaySession {
@@ -386,6 +420,7 @@ impl PlaySession {
             ais,
             human_army,
             spectate,
+            fog_of_war: false,
             selected,
             build_mode: None,
             attack_move_mode: false,
@@ -394,14 +429,37 @@ impl PlaySession {
             hover_world: None,
             drag_box_world: None,
             status_banner: if spectate {
-                "Spectator AI active (F1 to take command)".to_string()
+                "Spectator AI active (F1 take control, F2 FOW)".to_string()
             } else {
-                "Ready (B Factory, M Mex, P PGen, T/Y Produce, RMB Move/Attack)".to_string()
+                "B:Fac M:Mex P:PGen D:PD N:Rad | G/T/Y/U:Build | F1:AI F2:FOW".to_string()
             },
+            replay: None,
+        }
+    }
+
+    pub fn new_replay(world: Skirmish, replay: Replay, speed: u32) -> Self {
+        Self {
+            world,
+            ais: Vec::new(),
+            human_army: 0,
+            spectate: true,
+            fog_of_war: false,
+            selected: Vec::new(),
+            build_mode: None,
+            attack_move_mode: false,
+            paused: false,
+            speed: speed.clamp(1, 8),
+            hover_world: None,
+            drag_box_world: None,
+            status_banner: format!("REPLAY ({} cmds)", replay.commands.len()),
+            replay: Some((replay, 0)),
         }
     }
 
     pub fn toggle_spectate(&mut self) {
+        if self.replay.is_some() {
+            return;
+        }
         self.spectate = !self.spectate;
         if self.spectate {
             if !self.ais.iter().any(|ai| ai.army == self.human_army) {
@@ -419,6 +477,21 @@ impl PlaySession {
 
     pub fn step_sim(&mut self) {
         if self.world.result().is_some() {
+            return;
+        }
+        if let Some((ref rep, ref mut cursor)) = self.replay {
+            if self.world.tick() >= rep.final_tick {
+                self.paused = true;
+                return;
+            }
+            let t = self.world.tick();
+            while *cursor < rep.commands.len() && rep.commands[*cursor].tick == t {
+                let rc = &rep.commands[*cursor];
+                self.world.issue(rc.army, rc.command.clone());
+                *cursor += 1;
+            }
+            self.world.step();
+            self.selected.retain(|id| self.world.unit(*id).is_some());
             return;
         }
         for ai in &mut self.ais {
@@ -491,6 +564,18 @@ impl PlaySession {
             .collect();
     }
 
+    fn selected_or_commander_builder(&self) -> Option<UnitId> {
+        self.selected
+            .iter()
+            .copied()
+            .find(|&id| {
+                self.world
+                    .unit(id)
+                    .is_some_and(|u| u.army == self.human_army && u.role.is_builder())
+            })
+            .or_else(|| self.world.commander_of(self.human_army).map(|u| u.id))
+    }
+
     pub fn issue_left_click_action(
         &mut self,
         world_xz: (i64, i64),
@@ -498,9 +583,9 @@ impl PlaySession {
         _pick_radius: i64,
     ) -> bool {
         if let Some(ref btype) = self.build_mode.clone() {
-            let Some(acu_id) = self.world.commander_of(self.human_army).map(|u| u.id) else {
+            let Some(builder_id) = self.selected_or_commander_builder() else {
                 self.build_mode = None;
-                self.status_banner = "No commander alive to build".to_string();
+                self.status_banner = "No builder alive".to_string();
                 return true;
             };
             let is_mex = self
@@ -526,7 +611,7 @@ impl PlaySession {
             self.world.issue(
                 self.human_army,
                 Command::Build {
-                    builder: acu_id,
+                    builder: builder_id,
                     unit_type: btype.clone(),
                     x: target.0,
                     y: target.1,
@@ -585,6 +670,16 @@ impl PlaySession {
             })
             .collect();
         let mobiles = self.selected_mobiles();
+        let builders: Vec<UnitId> = self
+            .selected
+            .iter()
+            .copied()
+            .filter(|id| {
+                self.world
+                    .unit(*id)
+                    .is_some_and(|u| u.army == self.human_army && u.role.is_builder())
+            })
+            .collect();
 
         if mobiles.is_empty() && !factories.is_empty() {
             for f in factories {
@@ -614,18 +709,65 @@ impl PlaySession {
                 },
             );
             self.status_banner = format!("Attack target #{target}");
-        } else {
-            self.world.issue(
-                self.human_army,
-                Command::Move {
-                    units: mobiles,
-                    x: world_xz.0,
-                    y: world_xz.1,
-                    queue,
-                },
-            );
-            self.status_banner = "Move ordered".to_string();
+            return;
         }
+
+        if !builders.is_empty() {
+            if let Some((ally_id, ally_hp, ally_max_hp, ally_role)) = self
+                .world
+                .unit_at(world_xz, pick_radius, Some(self.human_army), None)
+                .and_then(|id| self.world.unit(id))
+                .map(|u| (u.id, u.hp, u.max_hp, u.role))
+            {
+                if ally_hp < ally_max_hp {
+                    self.world.issue(
+                        self.human_army,
+                        Command::Repair {
+                            units: builders,
+                            target: ally_id,
+                            queue,
+                        },
+                    );
+                    self.status_banner = format!("Repairing #{ally_id}");
+                    return;
+                } else if ally_role == Role::Factory || ally_role.is_builder() {
+                    self.world.issue(
+                        self.human_army,
+                        Command::Assist {
+                            units: builders,
+                            target: ally_id,
+                            queue,
+                        },
+                    );
+                    self.status_banner = format!("Assisting #{ally_id}");
+                    return;
+                }
+            }
+            if let Some((_, wp)) = self.world.wreck_at(world_xz, pick_radius + 4 * SCALE) {
+                self.world.issue(
+                    self.human_army,
+                    Command::Reclaim {
+                        units: builders,
+                        x: wp.0,
+                        y: wp.1,
+                        queue,
+                    },
+                );
+                self.status_banner = "Reclaiming wreck".to_string();
+                return;
+            }
+        }
+
+        self.world.issue(
+            self.human_army,
+            Command::Move {
+                units: mobiles,
+                x: world_xz.0,
+                y: world_xz.1,
+                queue,
+            },
+        );
+        self.status_banner = "Move ordered".to_string();
     }
 
     pub fn trigger_build_mode(&mut self, role: Role) {
@@ -636,11 +778,20 @@ impl PlaySession {
             Role::Factory => f.factory,
             Role::Extractor => f.extractor,
             Role::Generator => f.generator,
+            Role::PointDefense => f.point_defense,
+            Role::Radar => f.radar,
             _ => return,
         };
         self.attack_move_mode = false;
         self.build_mode = Some(tid.clone());
-        self.status_banner = format!("Place {tid} with LMB (Shift+LMB to queue, RMB/Esc cancel)");
+        self.status_banner = format!("Place {tid} (LMB place, Shift+LMB queue, RMB cancel)");
+    }
+
+    pub fn trigger_produce_engineer(&mut self, count: u32) {
+        let Some(f) = self.world.faction(self.human_army).cloned() else {
+            return;
+        };
+        self.trigger_produce_type(f.engineer, count);
     }
 
     pub fn trigger_produce(&mut self, slot: usize, count: u32) {
@@ -650,6 +801,10 @@ impl PlaySession {
         let Some(utype) = f.land_units.get(slot).cloned() else {
             return;
         };
+        self.trigger_produce_type(utype, count);
+    }
+
+    fn trigger_produce_type(&mut self, utype: String, count: u32) {
         let mut factories: Vec<UnitId> = self
             .selected
             .iter()
@@ -682,7 +837,27 @@ impl PlaySession {
                 },
             );
         }
-        self.status_banner = format!("Queued {count}x {utype} across {} factory(ies)", factories.len());
+        self.status_banner = format!("Queued {count}x {utype}");
+    }
+
+    pub fn trigger_overcharge_nearest(&mut self) {
+        let Some(acu) = self.world.commander_of(self.human_army) else {
+            return;
+        };
+        let acu_id = acu.id;
+        let acu_pos = (acu.pos.x, acu.pos.y);
+        if let Some(target) = self.world.unit_at(acu_pos, 26 * SCALE, None, Some(self.human_army)) {
+            self.world.issue(
+                self.human_army,
+                Command::Overcharge {
+                    unit: acu_id,
+                    target,
+                },
+            );
+            self.status_banner = format!("OVERCHARGE -> #{target}!");
+        } else {
+            self.status_banner = "No enemy in Overcharge range".to_string();
+        }
     }
 
     pub fn trigger_stop(&mut self) {
@@ -692,6 +867,41 @@ impl PlaySession {
             let units = self.selected.clone();
             self.world.issue(self.human_army, Command::Stop { units });
             self.status_banner = "Stopped selected units".to_string();
+        }
+    }
+
+    pub fn trigger_hud_action(&mut self, action: HudAction, shift: bool) {
+        let count = if shift { 5 } else { 1 };
+        match action {
+            HudAction::BuildFactory => self.trigger_build_mode(Role::Factory),
+            HudAction::BuildExtractor => self.trigger_build_mode(Role::Extractor),
+            HudAction::BuildGenerator => self.trigger_build_mode(Role::Generator),
+            HudAction::BuildPointDefense => self.trigger_build_mode(Role::PointDefense),
+            HudAction::BuildRadar => self.trigger_build_mode(Role::Radar),
+            HudAction::ProduceEngineer => self.trigger_produce_engineer(count),
+            HudAction::ProduceTank => self.trigger_produce(0, count),
+            HudAction::ProduceBot => self.trigger_produce(1, count),
+            HudAction::ProduceArtillery => self.trigger_produce(2, count),
+            HudAction::AttackMove => {
+                self.build_mode = None;
+                self.attack_move_mode = !self.attack_move_mode;
+                self.status_banner = if self.attack_move_mode {
+                    "Attack-Move: LMB target location".to_string()
+                } else {
+                    "Cancelled Attack-Move".to_string()
+                };
+            }
+            HudAction::Stop => self.trigger_stop(),
+            HudAction::TogglePause => self.paused = !self.paused,
+            HudAction::ToggleFog => {
+                self.fog_of_war = !self.fog_of_war;
+                self.status_banner = if self.fog_of_war {
+                    "Fog of War + Radar Intel ON".to_string()
+                } else {
+                    "Full Map Reveal ON".to_string()
+                };
+            }
+            HudAction::ToggleAi => self.toggle_spectate(),
         }
     }
 
@@ -725,59 +935,44 @@ impl PlaySession {
         let Some(a) = self.world.army(self.human_army) else {
             return format!("FARust — {map_name} [{time}]{end_tag}");
         };
-        let n_fac = self
-            .world
-            .units()
-            .filter(|u| u.army == self.human_army && u.role == Role::Factory)
-            .count();
-        let n_mob = self
-            .world
-            .units()
-            .filter(|u| u.army == self.human_army && u.role == Role::Mobile)
-            .count();
-        let mode = if let Some(ref b) = self.build_mode {
-            format!(" | BUILD:{b}")
-        } else if self.attack_move_mode {
-            " | ATTACK-MOVE".to_string()
-        } else {
-            String::new()
-        };
         format!(
-            "FARust — {map_name} [{time} {speed_tag}] | M {}/{}(+{:.1}) E {}/{}(+{:.0}) | Fac {n_fac} Army {n_mob} | Sel {}{mode}{end_tag} | {}",
+            "FARust — {map_name} [{time} {speed_tag}] | M {}/{} E {}/{} | Sel {}{end_tag}",
             a.mass / SCALE,
             a.mass_cap / SCALE,
-            a.income_mass as f64 * TICK_HZ as f64 / SCALE as f64,
             a.energy / SCALE,
             a.energy_cap / SCALE,
-            a.income_energy as f64 * TICK_HZ as f64 / SCALE as f64,
             self.selected.len(),
-            self.status_banner
         )
     }
 }
 
 // ---------------------------------------------------------------------------
-// Dynamic 3D Battlefield Geometry Builder
+// Colors, Instanced Unit Batches & Dynamic Overlays (Tracers, Projectiles, Icons)
 // ---------------------------------------------------------------------------
 
-fn army_color(world: &Skirmish, army: ArmyId) -> [f32; 4] {
+pub(crate) fn army_rgb(world: &Skirmish, army: ArmyId) -> [f32; 3] {
     let faction_key = world
         .army(army)
         .and_then(|a| world.catalog().factions.get(a.faction))
         .map(|f| f.key.as_str())
         .unwrap_or("");
     match faction_key {
-        "uef" => [0.24, 0.56, 0.96, 0.45],
-        "cybran" => [0.92, 0.24, 0.22, 0.45],
-        "aeon" => [0.20, 0.80, 0.42, 0.45],
-        "seraphim" => [0.95, 0.78, 0.22, 0.45],
+        "uef" => [0.22, 0.56, 0.98],
+        "cybran" => [0.94, 0.24, 0.22],
+        "aeon" => [0.20, 0.84, 0.44],
+        "seraphim" => [0.96, 0.80, 0.22],
         _ => match army % 4 {
-            0 => [0.24, 0.56, 0.96, 0.45],
-            1 => [0.92, 0.24, 0.22, 0.45],
-            2 => [0.20, 0.80, 0.42, 0.45],
-            _ => [0.95, 0.78, 0.22, 0.45],
+            0 => [0.22, 0.56, 0.98],
+            1 => [0.94, 0.24, 0.22],
+            2 => [0.20, 0.84, 0.44],
+            _ => [0.96, 0.80, 0.22],
         },
     }
+}
+
+fn army_color(world: &Skirmish, army: ArmyId) -> [f32; 4] {
+    let c = army_rgb(world, army);
+    [c[0], c[1], c[2], 0.45]
 }
 
 fn unit_yaw(world: &Skirmish, u: &crate::skirmish::Unit) -> f32 {
@@ -789,10 +984,14 @@ fn unit_yaw(world: &Skirmish, u: &crate::skirmish::Unit) -> f32 {
     match u.orders.front() {
         Some(UnitOrder::Move { x, y })
         | Some(UnitOrder::AttackMove { x, y })
-        | Some(UnitOrder::Build { x, y, .. }) => {
+        | Some(UnitOrder::Build { x, y, .. })
+        | Some(UnitOrder::Reclaim { x, y }) => {
             ((x - u.pos.x) as f32).atan2((y - u.pos.y) as f32)
         }
-        Some(UnitOrder::Attack(tid)) => world
+        Some(UnitOrder::Attack(tid))
+        | Some(UnitOrder::Repair(tid))
+        | Some(UnitOrder::Assist(tid))
+        | Some(UnitOrder::Overcharge(tid)) => world
             .unit(*tid)
             .map(|t| ((t.pos.x - u.pos.x) as f32).atan2((t.pos.y - u.pos.y) as f32))
             .unwrap_or(0.0),
@@ -800,28 +999,29 @@ fn unit_yaw(world: &Skirmish, u: &crate::skirmish::Unit) -> f32 {
     }
 }
 
-/// Builds per-frame unit meshes, rings, HP/build bars, beams, lasers, order lines, and ghosts.
-pub fn build_skirmish_dynamic_mesh(
+pub(crate) fn build_skirmish_render_frame(
     session: &PlaySession,
     scmap: &ScMap,
     meshes: &UnitMeshCache,
     camera: &OrbitCamera,
-) -> (Vec<GpuVertex>, Vec<u32>) {
-    let mut verts = Vec::with_capacity(16_384);
-    let mut indices = Vec::with_capacity(32_768);
+) -> (BTreeMap<String, Vec<GpuUnitInstance>>, Vec<GpuVertex>, Vec<u32>) {
+    let mut batches: BTreeMap<String, Vec<GpuUnitInstance>> = BTreeMap::new();
+    let mut verts = Vec::with_capacity(8192);
+    let mut indices = Vec::with_capacity(16384);
     let scale = SCALE as f32;
     let zoom_boost = (camera.distance / 320.0).clamp(1.0, 3.2);
+    let strategic_zoom = camera.distance > 340.0;
     let world = &session.world;
     let selected_set = &session.selected;
 
-    // 1. Subtle green markers on unclaimed mass points
+    // 1. Unclaimed mass points
     for (idx, &(mx, mz)) in world.mass_points().iter().enumerate() {
         if world.mass_claim(idx).is_some() {
             continue;
         }
         let wx = mx as f32 / scale;
         let wz = mz as f32 / scale;
-        let wy = sample_terrain_y(scmap, wx, wz) + 0.12;
+        let wy = sample_terrain_y(scmap, wx, wz) + 0.14;
         append_ring(
             &mut verts,
             &mut indices,
@@ -833,43 +1033,61 @@ pub fn build_skirmish_dynamic_mesh(
         );
     }
 
-    // 2. Live units + selection rings + HP/build bars + tracers + order lines
+    // 2. Reclaimable wrecks
+    for w in world.wrecks() {
+        let wx = w.pos.x as f32 / scale;
+        let wz = w.pos.y as f32 / scale;
+        let wy = sample_terrain_y(scmap, wx, wz);
+        let sz = 0.48 * zoom_boost.sqrt();
+        append_box_world(&mut verts, &mut indices, [wx, wy, wz], sz, sz * 0.35, [0.045, 0.042, 0.040, 0.25]);
+    }
+
+    // 3. Units (instanced real .scm meshes at close/mid zoom, crisp strategic icons when zoomed far out)
     for u in world.units() {
+        let vis = if session.fog_of_war {
+            world.intel_visibility(session.human_army, u)
+        } else {
+            IntelVisibility::Visible
+        };
+        if vis == IntelVisibility::Hidden {
+            continue;
+        }
         let wx = u.pos.x as f32 / scale;
         let wz = u.pos.y as f32 / scale;
         let wy = sample_terrain_y(scmap, wx, wz);
-        let mesh = meshes.mesh_for(&u.type_id, u.role);
-        let yaw = if u.role.is_structure() {
-            0.0
-        } else {
-            unit_yaw(world, u)
-        };
-        let (sy, cy) = yaw.sin_cos();
         let color = army_color(world, u.army);
-        let base_v = verts.len() as u32;
+
+        if vis == IntelVisibility::RadarBlip {
+            let r = 1.8 * zoom_boost.sqrt();
+            append_box_world(&mut verts, &mut indices, [wx, wy + 0.6, wz], r, r * 1.4, [1.0, 0.3, 0.25, 0.2]);
+            continue;
+        }
+
         let render_scale = if u.role.is_structure() {
             zoom_boost.powf(0.45)
         } else {
             zoom_boost * 1.15
         };
 
-        for (p, n) in mesh.positions.iter().zip(mesh.normals.iter()) {
-            let px = p[0] * render_scale;
-            let py = p[1] * render_scale;
-            let pz = p[2] * render_scale;
-            let rx = px * cy + pz * sy;
-            let rz = -px * sy + pz * cy;
-            let nx = n[0] * cy + n[2] * sy;
-            let nz = -n[0] * sy + n[2] * cy;
-            verts.push(GpuVertex {
-                position: [wx + rx, wy + py, wz + rz],
-                normal: normalize_or_up([nx, n[1], nz]),
-                uv: [0.5, 0.5],
-                color,
-            });
-        }
-        for &idx in &mesh.indices {
-            indices.push(base_v + idx);
+        if strategic_zoom {
+            let s = (u.radius as f32 / scale).max(1.2) * (zoom_boost * 0.75);
+            let h = if u.role == Role::Commander { s * 1.6 } else if u.role.is_structure() { s * 0.9 } else { s * 1.1 };
+            append_box_world(&mut verts, &mut indices, [wx, wy + 0.3, wz], s, h, color);
+        } else {
+            let yaw = if u.role.is_structure() { 0.0 } else { unit_yaw(world, u) };
+            let use_tex = if meshes.mesh_for(&u.type_id, u.role).albedo.is_some() {
+                1.0
+            } else {
+                0.0
+            };
+            batches
+                .entry(u.type_id.clone())
+                .or_default()
+                .push(GpuUnitInstance {
+                    pos_scale: [wx, wy, wz, render_scale],
+                    yaw_flags: [yaw, use_tex, 0.0, 0.0],
+                    team_color: color,
+                });
         }
 
         let is_sel = selected_set.contains(&u.id);
@@ -887,9 +1105,7 @@ pub fn build_skirmish_dynamic_mesh(
             );
         }
 
-        // HP bar for damaged or selected units; construction progress bar when building
-        let show_hp = is_sel || u.hp < u.max_hp || u.role == Role::Commander;
-        if show_hp {
+        if is_sel || u.hp < u.max_hp || u.role == Role::Commander {
             let bar_y = wy + (radius_m * 1.25).max(2.4) + 1.2;
             let bar_w = (radius_m * 1.6).clamp(2.2, 8.0);
             let bar_h = 0.45 * zoom_boost.sqrt();
@@ -917,7 +1133,7 @@ pub fn build_skirmish_dynamic_mesh(
                 prog,
                 [0.20, 0.85, 1.0, 0.15],
             );
-            if u.role == Role::Commander {
+            if u.role.is_builder() {
                 let bx = job.x as f32 / scale;
                 let bz = job.y as f32 / scale;
                 let by = sample_terrain_y(scmap, bx, bz) + 1.2;
@@ -932,7 +1148,6 @@ pub fn build_skirmish_dynamic_mesh(
             }
         }
 
-        // Weapon tracer (visible for 2 ticks after firing)
         if let Some((tid, shot_tick)) = u.last_shot
             && world.tick().saturating_sub(shot_tick) <= 2
             && let Some(t) = world.unit(tid)
@@ -955,7 +1170,6 @@ pub fn build_skirmish_dynamic_mesh(
             );
         }
 
-        // Order lines & rally lines for selected units
         if is_sel {
             let mut prev = [wx, wy + 0.35, wz];
             for ord in &u.orders {
@@ -963,9 +1177,17 @@ pub fn build_skirmish_dynamic_mesh(
                     UnitOrder::Move { x, y } => ((*x, *y), [0.25, 0.95, 0.45, 0.2]),
                     UnitOrder::AttackMove { x, y } => ((*x, *y), [1.0, 0.55, 0.15, 0.2]),
                     UnitOrder::Build { x, y, .. } => ((*x, *y), [1.0, 0.88, 0.25, 0.2]),
-                    UnitOrder::Attack(tid) => {
+                    UnitOrder::Reclaim { x, y } => ((*x, *y), [0.25, 0.90, 0.78, 0.2]),
+                    UnitOrder::Attack(tid) | UnitOrder::Overcharge(tid) => {
                         if let Some(t) = world.unit(*tid) {
                             ((t.pos.x, t.pos.y), [1.0, 0.22, 0.22, 0.2])
+                        } else {
+                            continue;
+                        }
+                    }
+                    UnitOrder::Repair(tid) | UnitOrder::Assist(tid) => {
+                        if let Some(t) = world.unit(*tid) {
+                            ((t.pos.x, t.pos.y), [0.30, 0.75, 1.0, 0.2])
                         } else {
                             continue;
                         }
@@ -996,7 +1218,22 @@ pub fn build_skirmish_dynamic_mesh(
         }
     }
 
-    // 3. Build placement ghost
+    // 4. Ballistic projectiles & Overcharge bolts
+    for p in world.projectiles() {
+        let px = p.pos.x as f32 / scale;
+        let pz = p.pos.y as f32 / scale;
+        let t = (p.ticks_lived as f32 / p.total_ticks.max(1) as f32).clamp(0.0, 1.0);
+        let arc_y = 4.0 * t * (1.0 - t) * (p.arc_height as f32 / scale);
+        let py = sample_terrain_y(scmap, px, pz) + 1.2 + arc_y;
+        let (sz, col) = if p.is_overcharge {
+            (1.1 * zoom_boost.sqrt(), [0.35, 0.92, 1.0, 0.95])
+        } else {
+            (0.45 * zoom_boost.sqrt(), [1.0, 0.72, 0.20, 0.95])
+        };
+        append_box_world(&mut verts, &mut indices, [px, py, pz], sz, sz, col);
+    }
+
+    // 5. Build placement ghost
     if let (Some(btype), Some(hover)) = (&session.build_mode, session.hover_world) {
         let mut hx = world_f32_to_milli(hover);
         let is_mex = world
@@ -1029,7 +1266,7 @@ pub fn build_skirmish_dynamic_mesh(
         append_ring(&mut verts, &mut indices, [gx, gy, gz], radius, 0.5 * zoom_boost.sqrt(), gcol, 20);
     }
 
-    // 4. Box selection rectangle
+    // 6. Box selection rectangle
     if let Some((a, b)) = session.drag_box_world {
         let x0 = a[0].min(b[0]);
         let x1 = a[0].max(b[0]);
@@ -1049,7 +1286,50 @@ pub fn build_skirmish_dynamic_mesh(
         }
     }
 
+    (batches, verts, indices)
+}
+
+#[allow(dead_code)]
+pub fn build_skirmish_dynamic_mesh(
+    session: &PlaySession,
+    scmap: &ScMap,
+    meshes: &UnitMeshCache,
+    camera: &OrbitCamera,
+) -> (Vec<GpuVertex>, Vec<u32>) {
+    let (_batches, verts, indices) = build_skirmish_render_frame(session, scmap, meshes, camera);
     (verts, indices)
+}
+
+fn append_box_world(
+    verts: &mut Vec<GpuVertex>,
+    indices: &mut Vec<u32>,
+    base_center: [f32; 3],
+    half_xz: f32,
+    height: f32,
+    color: [f32; 4],
+) {
+    let mut pos = Vec::new();
+    let mut nrm = Vec::new();
+    let mut uvs = Vec::new();
+    let mut idx = Vec::new();
+    append_local_box(
+        &mut pos,
+        &mut nrm,
+        &mut uvs,
+        &mut idx,
+        base_center,
+        [half_xz, height, half_xz],
+    );
+    let base = verts.len() as u32;
+    for ((p, n), uv) in pos.into_iter().zip(nrm).zip(uvs) {
+        verts.push(GpuVertex {
+            position: p,
+            normal: n,
+            uv,
+            color,
+        });
+    }
+    indices.extend(idx.into_iter().map(|i| base + i));
 }
 
 fn append_ring(
@@ -1107,7 +1387,6 @@ fn append_bar_billboard(
     let z = center[2];
     let n = [0.0, 1.0, 0.0];
 
-    // Dark background bar slightly behind
     let bg = [0.08, 0.08, 0.10, 0.0];
     let b = verts.len() as u32;
     verts.extend_from_slice(&[
@@ -1168,7 +1447,7 @@ fn normalize_or_up(v: [f32; 3]) -> [f32; 3] {
 }
 
 // ---------------------------------------------------------------------------
-// Camera helpers & Scene construction
+// GPU Upload Helpers, Scene, and Camera
 // ---------------------------------------------------------------------------
 
 pub fn initial_army_camera(world: &Skirmish, scmap: &ScMap, army: ArmyId, aspect: f32) -> OrbitCamera {
@@ -1189,81 +1468,153 @@ pub fn initial_army_camera(world: &Skirmish, scmap: &ScMap, army: ArmyId, aspect
     cam
 }
 
-/// Frames the tightest active firefight (most recent shooter + target) or closest
-/// opposing frontline units so snapshots clearly show real `.scm` meshes, bars, and tracers.
 pub fn battle_snapshot_camera(world: &Skirmish, scmap: &ScMap, aspect: f32) -> OrbitCamera {
     let scale = SCALE as f32;
+    let water_y = if scmap.water.has_water {
+        scmap.water.elevation
+    } else {
+        f32::NEG_INFINITY
+    };
+    let units: Vec<_> = world.units().collect();
 
-    let latest_clash = world
-        .units()
+    // Pick a unit on dry land right in the thickest active battle cluster.
+    let focus = units
+        .iter()
         .filter_map(|u| {
-            let (tid, tick) = u.last_shot?;
-            let t = world.unit(tid)?;
-            Some((
-                tick,
-                (
-                    ((u.pos.x + t.pos.x) as f32 * 0.5) / scale,
-                    ((u.pos.y + t.pos.y) as f32 * 0.5) / scale,
-                ),
-            ))
-        })
-        .max_by_key(|(tick, _)| *tick)
-        .map(|(_, c)| c);
-
-    let focus = latest_clash.or_else(|| {
-        let mut best: Option<(i64, (f32, f32))> = None;
-        let all: Vec<_> = world.units().collect();
-        for a in &all {
-            for b in &all {
-                if a.army >= b.army {
-                    continue;
-                }
-                let dx = a.pos.x - b.pos.x;
-                let dz = a.pos.y - b.pos.y;
-                let d2 = dx.saturating_mul(dx).saturating_add(dz.saturating_mul(dz));
-                if best.is_none_or(|(bd, _)| d2 < bd) {
-                    best = Some((
-                        d2,
-                        (
-                            ((a.pos.x + b.pos.x) as f32 * 0.5) / scale,
-                            ((a.pos.y + b.pos.y) as f32 * 0.5) / scale,
-                        ),
-                    ));
+            let ux = u.pos.x as f32 / scale;
+            let uz = u.pos.y as f32 / scale;
+            if sample_terrain_y(scmap, ux, uz) < water_y + 0.5 {
+                return None;
+            }
+            let recent_shot = u
+                .last_shot
+                .is_some_and(|(_, tick)| tick + 80 >= world.tick());
+            let mut min_enemy_d2 = f32::MAX;
+            let mut enemies_near = 0u64;
+            let mut allies_near = 0u64;
+            for o in &units {
+                let dx = o.pos.x as f32 / scale - ux;
+                let dz = o.pos.y as f32 / scale - uz;
+                let d2 = dx * dx + dz * dz;
+                if o.army != u.army {
+                    if d2 < min_enemy_d2 {
+                        min_enemy_d2 = d2;
+                    }
+                    if d2 <= 36.0 * 36.0 {
+                        enemies_near += 1;
+                    }
+                } else if d2 <= 28.0 * 28.0 {
+                    allies_near += 1;
                 }
             }
-        }
-        best.map(|(_, c)| c)
-    });
+            // Also check active combat near this unit vs nearest enemy distance.
+            let closeness = (5000 - (min_enemy_d2.sqrt() as u64).min(5000)) as u64;
+            let score = (u64::from(recent_shot) << 44)
+                | (enemies_near.min(63) << 36)
+                | (allies_near.min(63) << 28)
+                | closeness;
+            Some((score, (ux, uz)))
+        })
+        .max_by_key(|(score, _)| *score)
+        .map(|(_, c)| c);
 
     let Some((cx, cz)) = focus else {
         return OrbitCamera::for_map(scmap.map_width, scmap.map_height, 20.0, aspect);
     };
-    let cy = sample_terrain_y(scmap, cx, cz);
+    let cy = sample_terrain_y(scmap, cx, cz).max(water_y);
 
     let span = scmap.map_width.max(scmap.map_height).max(256.0);
     let mut cam = OrbitCamera::for_map(scmap.map_width, scmap.map_height, cy, aspect);
     cam.target = [cx, cy, cz];
-    cam.yaw = 0.55;
-    cam.pitch = 0.68;
-    cam.distance = 110.0_f32.clamp(40.0, span * 0.4);
+    cam.yaw = 0.52;
+    cam.pitch = 0.60;
+    cam.distance = 56.0_f32.clamp(32.0, span * 0.25);
     cam
 }
 
-fn build_terrain_loaded_scene(map: &MapContext, camera: OrbitCamera) -> LoadedScene {
-    let (vertices, indices) = scene::build_terrain_mesh(&map.scmap, None);
-    let albedo = RgbaImage {
+fn build_terrain_loaded_scene(
+    game_dir: Option<&Path>,
+    map: &MapContext,
+    camera: OrbitCamera,
+) -> (LoadedScene, Option<RgbaImage>) {
+    let baked = game_dir.and_then(|d| scene::bake_terrain_albedo(d, &map.scmap, 2048));
+    let (vertices, indices, overlay_vertices, overlay_indices) =
+        scene::build_terrain_and_overlay_meshes(&map.scmap, None, baked.is_some());
+    let minimap_img = decode_dds_rgba8(&map.scmap.preview_dds)
+        .ok()
+        .or_else(|| baked.clone());
+    let albedo = baked.unwrap_or_else(|| RgbaImage {
         width: 1,
         height: 1,
         pixels: vec![255, 255, 255, 255],
-    };
-    LoadedScene {
+    });
+    let scene = LoadedScene {
         title: format!("{} ({})", map.map_name, map.map_id),
         vertices,
         indices,
+        overlay_vertices,
+        overlay_indices,
         albedo,
         initial_camera: camera,
         clear_color: [0.42, 0.58, 0.78, 1.0],
+    };
+    (scene, minimap_img)
+}
+
+fn upload_unit_templates(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    resources: &GpuSceneResources,
+    meshes: &UnitMeshCache,
+) -> BTreeMap<String, GpuMeshTemplate> {
+    let mut templates = BTreeMap::new();
+    for (id, nm) in &meshes.by_type {
+        let verts: Vec<GpuVertex> = nm
+            .positions
+            .iter()
+            .zip(nm.normals.iter())
+            .zip(nm.uvs.iter())
+            .map(|((&p, &n), &uv)| GpuVertex {
+                position: p,
+                normal: n,
+                uv,
+                color: [1.0, 1.0, 1.0, 0.5],
+            })
+            .collect();
+        let tpl = resources.create_mesh_template(
+            device,
+            queue,
+            &verts,
+            &nm.indices,
+            nm.albedo.as_ref(),
+            id,
+        );
+        templates.insert(id.clone(), tpl);
     }
+    templates
+}
+
+fn upload_frame_resources(
+    device: &wgpu::Device,
+    resources: &mut GpuSceneResources,
+    templates: &BTreeMap<String, GpuMeshTemplate>,
+    session: &PlaySession,
+    map: &MapContext,
+    meshes: &UnitMeshCache,
+    camera: &OrbitCamera,
+    width: u32,
+    height: u32,
+) {
+    let (batches, dyn_v, dyn_i) = build_skirmish_render_frame(session, &map.scmap, meshes, camera);
+    let gpu_batches: Vec<(&GpuMeshTemplate, &[GpuUnitInstance])> = batches
+        .iter()
+        .filter_map(|(tid, insts)| templates.get(tid).map(|tpl| (tpl, insts.as_slice())))
+        .collect();
+    resources.set_unit_batches(device, gpu_batches);
+    resources.set_dynamic(device, &dyn_v, &dyn_i);
+
+    let (mm_v, mm_i, hud_v, hud_i) = hud::build_hud_geometry(session, map, camera, width, height);
+    resources.set_hud(device, &mm_v, &mm_i, &hud_v, &hud_i);
 }
 
 // ---------------------------------------------------------------------------
@@ -1271,6 +1622,7 @@ fn build_terrain_loaded_scene(map: &MapContext, camera: OrbitCamera) -> LoadedSc
 // ---------------------------------------------------------------------------
 
 pub fn render_skirmish_snapshot(
+    game_dir: Option<&Path>,
     session: &PlaySession,
     map: &MapContext,
     meshes: &UnitMeshCache,
@@ -1286,7 +1638,7 @@ pub fn render_skirmish_snapshot(
     let mut camera = camera_override
         .unwrap_or_else(|| initial_army_camera(&session.world, &map.scmap, session.human_army, aspect));
     camera.set_aspect(width, height);
-    let scene = build_terrain_loaded_scene(map, camera.clone());
+    let (scene, minimap_img) = build_terrain_loaded_scene(game_dir, map, camera.clone());
 
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
@@ -1303,8 +1655,21 @@ pub fn render_skirmish_snapshot(
 
     let format = wgpu::TextureFormat::Rgba8UnormSrgb;
     let mut resources = GpuSceneResources::new(&device, &queue, &scene, format, MSAA_SAMPLES, &camera);
-    let (dyn_v, dyn_i) = build_skirmish_dynamic_mesh(session, &map.scmap, meshes, &camera);
-    resources.set_dynamic(&device, &dyn_v, &dyn_i);
+    if let Some(ref mm) = minimap_img {
+        resources.set_minimap_texture(&device, &queue, mm);
+    }
+    let templates = upload_unit_templates(&device, &queue, &resources, meshes);
+    upload_frame_resources(
+        &device,
+        &mut resources,
+        &templates,
+        session,
+        map,
+        meshes,
+        &camera,
+        width,
+        height,
+    );
 
     let (_msaa_tex, msaa_view) = viewer::create_attachment(
         &device,
@@ -1422,6 +1787,7 @@ pub fn render_skirmish_snapshot(
 // ---------------------------------------------------------------------------
 
 pub fn run_play_window(
+    game_dir: Option<&Path>,
     session: PlaySession,
     map: MapContext,
     meshes: UnitMeshCache,
@@ -1430,6 +1796,7 @@ pub fn run_play_window(
 ) -> Result<(), String> {
     let event_loop = EventLoop::new().map_err(|e| format!("failed to create event loop: {e}"))?;
     let mut app = PlayApp {
+        game_dir: game_dir.map(Path::to_path_buf),
         session,
         map,
         meshes,
@@ -1455,6 +1822,7 @@ struct PlayGpuState {
     msaa_view: wgpu::TextureView,
     depth_view: wgpu::TextureView,
     resources: GpuSceneResources,
+    templates: BTreeMap<String, GpuMeshTemplate>,
     camera: OrbitCamera,
     clear_color: [f64; 4],
     modifiers: ModifiersState,
@@ -1471,6 +1839,7 @@ struct PlayGpuState {
 }
 
 struct PlayApp {
+    game_dir: Option<std::path::PathBuf>,
     session: PlaySession,
     map: MapContext,
     meshes: UnitMeshCache,
@@ -1537,14 +1906,27 @@ impl PlayApp {
             self.session.human_army,
             aspect,
         );
-        let terrain_scene = build_terrain_loaded_scene(&self.map, camera.clone());
+        let (terrain_scene, minimap_img) =
+            build_terrain_loaded_scene(self.game_dir.as_deref(), &self.map, camera.clone());
         let clear_color = terrain_scene.clear_color;
 
         let mut resources =
             GpuSceneResources::new(&device, &queue, &terrain_scene, format, MSAA_SAMPLES, &camera);
-        let (dyn_v, dyn_i) =
-            build_skirmish_dynamic_mesh(&self.session, &self.map.scmap, &self.meshes, &camera);
-        resources.set_dynamic(&device, &dyn_v, &dyn_i);
+        if let Some(ref mm) = minimap_img {
+            resources.set_minimap_texture(&device, &queue, mm);
+        }
+        let templates = upload_unit_templates(&device, &queue, &resources, &self.meshes);
+        upload_frame_resources(
+            &device,
+            &mut resources,
+            &templates,
+            &self.session,
+            &self.map,
+            &self.meshes,
+            &camera,
+            width,
+            height,
+        );
 
         let (_msaa_tex, msaa_view) = viewer::create_attachment(
             &device,
@@ -1574,6 +1956,7 @@ impl PlayApp {
             msaa_view,
             depth_view,
             resources,
+            templates,
             camera,
             clear_color,
             modifiers: ModifiersState::empty(),
@@ -1754,6 +2137,7 @@ impl ApplicationHandler for PlayApp {
                         let dy = (cur.1 - py) as f32;
                         st.camera.pan(-dx * 0.0018, dy * 0.0018);
                         st.resources.update_camera(&st.queue, &st.camera);
+                        st.dirty_dynamic = true;
                         st.window.request_redraw();
                     }
                     st.rmb_last_px = Some(cur);
@@ -1778,9 +2162,28 @@ impl ApplicationHandler for PlayApp {
                     st.config.height as f64 * 0.5,
                 ));
                 let shift = st.modifiers.shift_key();
+                let hud_layout =
+                    HudLayout::compute(&self.session, st.config.width, st.config.height);
+
                 match button {
                     MouseButton::Left => {
                         if pressed {
+                            if let Some(act) = hud_layout.hit_test_button(cur.0 as f32, cur.1 as f32) {
+                                self.session.trigger_hud_action(act, shift);
+                                st.dirty_dynamic = true;
+                                st.window.request_redraw();
+                                return;
+                            }
+                            if let Some((u, v)) = hud_layout.hit_test_minimap(cur.0 as f32, cur.1 as f32) {
+                                let wx = u * self.map.scmap.map_width;
+                                let wz = v * self.map.scmap.map_height;
+                                let wy = sample_terrain_y(&self.map.scmap, wx, wz);
+                                st.camera.target = [wx, wy, wz];
+                                st.resources.update_camera(&st.queue, &st.camera);
+                                st.dirty_dynamic = true;
+                                st.window.request_redraw();
+                                return;
+                            }
                             st.lmb_down_px = Some(cur);
                         } else if let Some(down) = st.lmb_down_px.take() {
                             self.session.drag_box_world = None;
@@ -1822,6 +2225,14 @@ impl ApplicationHandler for PlayApp {
                     }
                     MouseButton::Right => {
                         if pressed {
+                            if let Some((u, v)) = hud_layout.hit_test_minimap(cur.0 as f32, cur.1 as f32) {
+                                let wx = (u as f64 * self.map.size.0 as f64).round() as i64;
+                                let wz = (v as f64 * self.map.size.1 as f64).round() as i64;
+                                self.session.issue_right_click((wx, wz), shift, 4 * SCALE);
+                                st.dirty_dynamic = true;
+                                st.window.request_redraw();
+                                return;
+                            }
                             st.rmb_down_px = Some(cur);
                             st.rmb_last_px = Some(cur);
                             st.rmb_dragged = false;
@@ -1946,13 +2357,7 @@ impl ApplicationHandler for PlayApp {
                         cam_changed = true;
                     }
                     PhysicalKey::Code(KeyCode::KeyA) => {
-                        self.session.build_mode = None;
-                        self.session.attack_move_mode = !self.session.attack_move_mode;
-                        self.session.status_banner = if self.session.attack_move_mode {
-                            "Attack-Move: LMB target location".to_string()
-                        } else {
-                            "Cancelled Attack-Move".to_string()
-                        };
+                        self.session.trigger_hud_action(HudAction::AttackMove, shift);
                         ui_changed = true;
                     }
                     PhysicalKey::Code(KeyCode::KeyS) => {
@@ -1971,12 +2376,32 @@ impl ApplicationHandler for PlayApp {
                         self.session.trigger_build_mode(Role::Generator);
                         ui_changed = true;
                     }
+                    PhysicalKey::Code(KeyCode::KeyD) => {
+                        self.session.trigger_build_mode(Role::PointDefense);
+                        ui_changed = true;
+                    }
+                    PhysicalKey::Code(KeyCode::KeyN) => {
+                        self.session.trigger_build_mode(Role::Radar);
+                        ui_changed = true;
+                    }
+                    PhysicalKey::Code(KeyCode::KeyG) => {
+                        self.session.trigger_produce_engineer(count);
+                        ui_changed = true;
+                    }
                     PhysicalKey::Code(KeyCode::KeyT) => {
                         self.session.trigger_produce(0, count);
                         ui_changed = true;
                     }
                     PhysicalKey::Code(KeyCode::KeyY) => {
                         self.session.trigger_produce(1, count);
+                        ui_changed = true;
+                    }
+                    PhysicalKey::Code(KeyCode::KeyU) => {
+                        self.session.trigger_produce(2, count);
+                        ui_changed = true;
+                    }
+                    PhysicalKey::Code(KeyCode::KeyO) => {
+                        self.session.trigger_overcharge_nearest();
                         ui_changed = true;
                     }
                     PhysicalKey::Code(KeyCode::Space) => {
@@ -1995,6 +2420,10 @@ impl ApplicationHandler for PlayApp {
                         self.session.toggle_spectate();
                         ui_changed = true;
                     }
+                    PhysicalKey::Code(KeyCode::F2) => {
+                        self.session.trigger_hud_action(HudAction::ToggleFog, false);
+                        ui_changed = true;
+                    }
                     _ => {}
                 }
                 if cam_changed {
@@ -2011,13 +2440,17 @@ impl ApplicationHandler for PlayApp {
             }
             WindowEvent::RedrawRequested => {
                 if st.dirty_dynamic {
-                    let (dyn_v, dyn_i) = build_skirmish_dynamic_mesh(
+                    upload_frame_resources(
+                        &st.device,
+                        &mut st.resources,
+                        &st.templates,
                         &self.session,
-                        &self.map.scmap,
+                        &self.map,
                         &self.meshes,
                         &st.camera,
+                        st.config.width,
+                        st.config.height,
                     );
-                    st.resources.set_dynamic(&st.device, &dyn_v, &dyn_i);
                     st.dirty_dynamic = false;
                 }
                 let frame = match st.surface.get_current_texture() {
@@ -2051,10 +2484,6 @@ impl ApplicationHandler for PlayApp {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Unit tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2082,6 +2511,7 @@ mod tests {
                 elevation_deep: 8.0,
                 elevation_abyss: 2.0,
             },
+            terrain_textures: None,
         }
     }
 
@@ -2101,7 +2531,6 @@ mod tests {
         sess.select_factories();
         assert_eq!(sess.selected, vec![fac]);
 
-        // Box around everything selects ACU + tank and excludes Factory when mobiles are inside
         sess.select_box((0, 0), (200 * SCALE, 200 * SCALE), false);
         assert!(sess.selected.contains(&acu));
         assert!(!sess.selected.contains(&fac));
@@ -2136,16 +2565,15 @@ mod tests {
     }
 
     #[test]
-    fn build_mode_extractor_snaps_and_queues_and_builds_dynamic_mesh() {
+    fn build_mode_extractor_snaps_and_queues_and_builds_render_frame() {
         let w = test_world(103);
         let scmap = test_scmap();
         let cache = UnitMeshCache::load(None, w.catalog());
         let mut sess = PlaySession::new(w, 0, false, 1);
 
-        // Press M -> snap to (40, 40) mass point from (41, 39)
         sess.trigger_build_mode(Role::Extractor);
         assert!(sess.issue_left_click_action((41 * SCALE, 39 * SCALE), true, 3 * SCALE));
-        assert!(sess.build_mode.is_some()); // Shift keeps build mode active
+        assert!(sess.build_mode.is_some());
         sess.trigger_build_mode(Role::Factory);
         assert!(sess.issue_left_click_action((72 * SCALE, 52 * SCALE), true, 3 * SCALE));
         sess.build_mode = None;
@@ -2156,14 +2584,14 @@ mod tests {
         assert!(sess.world.units().any(|u| u.army == 0 && u.role == Role::Extractor));
         assert!(sess.world.units().any(|u| u.army == 0 && u.role == Role::Factory));
 
-        // T produces primary unit and rally updates via right-click on selected factory
         sess.select_factories();
         sess.issue_right_click((120 * SCALE, 120 * SCALE), false, 3 * SCALE);
         sess.trigger_produce(0, 1);
         sess.step_sim();
 
         let cam = initial_army_camera(&sess.world, &scmap, 0, 1.6);
-        let (v, i) = build_skirmish_dynamic_mesh(&sess, &scmap, &cache, &cam);
+        let (batches, v, i) = build_skirmish_render_frame(&sess, &scmap, &cache, &cam);
+        assert!(!batches.is_empty());
         assert!(!v.is_empty() && !i.is_empty());
         assert!(v.iter().all(|vx| vx.position.iter().all(|c| c.is_finite())));
         assert!(i.iter().all(|&ix| (ix as usize) < v.len()));

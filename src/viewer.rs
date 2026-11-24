@@ -29,6 +29,29 @@ struct Uniforms {
     sun_dir: [f32; 4],
 }
 
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+pub(crate) struct GpuUnitInstance {
+    pub pos_scale: [f32; 4],
+    pub yaw_flags: [f32; 4],
+    pub team_color: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+pub(crate) struct HudVertex {
+    pub pos: [f32; 2],
+    pub uv: [f32; 2],
+    pub color: [f32; 4],
+}
+
+pub(crate) struct GpuMeshTemplate {
+    pub vertex_buf: wgpu::Buffer,
+    pub index_buf: wgpu::Buffer,
+    pub index_count: u32,
+    pub bind_group: wgpu::BindGroup,
+}
+
 const SHADER_WGSL: &str = r#"
 struct Uniforms {
     view_proj: mat4x4<f32>,
@@ -96,15 +119,204 @@ fn fs_main(in: VsOut, @builtin(front_facing) front_facing: bool) -> @location(0)
 }
 "#;
 
+const INSTANCED_SHADER_WGSL: &str = r#"
+struct Uniforms {
+    view_proj: mat4x4<f32>,
+    eye_pos: vec4<f32>,
+    sun_dir: vec4<f32>,
+};
+
+@group(0) @binding(0) var<uniform> u: Uniforms;
+@group(0) @binding(1) var t_albedo: texture_2d<f32>;
+@group(0) @binding(2) var s_albedo: sampler;
+
+struct VsIn {
+    @location(0) position: vec3<f32>,
+    @location(1) normal: vec3<f32>,
+    @location(2) uv: vec2<f32>,
+    @location(3) color: vec4<f32>,
+    @location(4) pos_scale: vec4<f32>,
+    @location(5) yaw_flags: vec4<f32>,
+    @location(6) team_color: vec4<f32>,
+};
+
+struct VsOut {
+    @builtin(position) clip_pos: vec4<f32>,
+    @location(0) world_pos: vec3<f32>,
+    @location(1) normal: vec3<f32>,
+    @location(2) uv: vec2<f32>,
+    @location(3) team_color: vec4<f32>,
+    @location(4) use_tex: f32,
+};
+
+@vertex
+fn vs_main(in: VsIn) -> VsOut {
+    let s = sin(in.yaw_flags.x);
+    let c = cos(in.yaw_flags.x);
+    let scaled = in.position * in.pos_scale.w;
+    let world_p = in.pos_scale.xyz + vec3<f32>(
+        scaled.x * c + scaled.z * s,
+        scaled.y,
+        -scaled.x * s + scaled.z * c
+    );
+    let world_n = vec3<f32>(
+        in.normal.x * c + in.normal.z * s,
+        in.normal.y,
+        -in.normal.x * s + in.normal.z * c
+    );
+    var out: VsOut;
+    out.clip_pos = u.view_proj * vec4<f32>(world_p, 1.0);
+    out.world_pos = world_p;
+    out.normal = world_n;
+    out.uv = in.uv;
+    out.team_color = in.team_color;
+    out.use_tex = in.yaw_flags.y;
+    return out;
+}
+
+@fragment
+fn fs_main(in: VsOut, @builtin(front_facing) front_facing: bool) -> @location(0) vec4<f32> {
+    let tex = textureSample(t_albedo, s_albedo, in.uv);
+    let tex_rgb = mix(tex.rgb, in.team_color.rgb, clamp(tex.a * 0.85, 0.0, 1.0));
+    let base_rgb = mix(in.team_color.rgb, tex_rgb, clamp(in.use_tex, 0.0, 1.0));
+
+    var n = normalize(in.normal);
+    if (!front_facing) {
+        n = -n;
+    }
+    let l = normalize(u.sun_dir.xyz);
+    let v = normalize(u.eye_pos.xyz - in.world_pos);
+    let h = normalize(l + v);
+    let hemi_t = clamp(n.y * 0.5 + 0.5, 0.0, 1.0);
+    let ambient = mix(vec3<f32>(0.22, 0.21, 0.20), vec3<f32>(0.42, 0.48, 0.58), hemi_t);
+    let ndotl = max(dot(n, l), 0.0);
+    let sun = vec3<f32>(1.18, 1.12, 1.0) * ndotl;
+    let spec = pow(max(dot(n, h), 0.0), 32.0) * in.team_color.a * (0.25 + 0.75 * ndotl);
+    let lit = base_rgb * (ambient + sun) + vec3<f32>(spec);
+    return vec4<f32>(lit, 1.0);
+}
+"#;
+
+const HUD_SHADER_WGSL: &str = r#"
+struct Uniforms {
+    view_proj: mat4x4<f32>,
+    eye_pos: vec4<f32>,
+    sun_dir: vec4<f32>,
+};
+
+@group(0) @binding(0) var<uniform> _u: Uniforms;
+@group(0) @binding(1) var t_hud: texture_2d<f32>;
+@group(0) @binding(2) var s_hud: sampler;
+
+struct VsIn {
+    @location(0) pos: vec2<f32>,
+    @location(1) uv: vec2<f32>,
+    @location(2) color: vec4<f32>,
+};
+
+struct VsOut {
+    @builtin(position) clip_pos: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) color: vec4<f32>,
+};
+
+@vertex
+fn vs_main(in: VsIn) -> VsOut {
+    var out: VsOut;
+    out.clip_pos = vec4<f32>(in.pos, 0.0, 1.0);
+    out.uv = in.uv;
+    out.color = in.color;
+    return out;
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    let tex = textureSample(t_hud, s_hud, in.uv);
+    return tex * in.color;
+}
+"#;
+
 pub(crate) struct GpuSceneResources {
     pipeline: wgpu::RenderPipeline,
+    instanced_pipeline: wgpu::RenderPipeline,
+    hud_pipeline: wgpu::RenderPipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
     bind_group: wgpu::BindGroup,
+    overlay_bind_group: wgpu::BindGroup,
+    minimap_bind_group: wgpu::BindGroup,
+    sampler: wgpu::Sampler,
     uniform_buf: wgpu::Buffer,
     vertex_buf: wgpu::Buffer,
     index_buf: wgpu::Buffer,
     index_count: u32,
-    /// Per-frame geometry (units, overlays) drawn with the same pipeline.
+    static_overlay: Option<(wgpu::Buffer, wgpu::Buffer, u32)>,
+    /// Per-frame geometry (rings, tracers, strategic icons, bars) drawn untextured.
     dynamic: Option<(wgpu::Buffer, wgpu::Buffer, u32)>,
+    /// Per-frame instanced unit draws referencing template buffers + instance buffer.
+    unit_batches: Vec<(wgpu::Buffer, wgpu::Buffer, u32, wgpu::BindGroup, wgpu::Buffer, u32)>,
+    /// Optional 2D minimap textured pass + solid/text HUD pass.
+    hud_minimap: Option<(wgpu::Buffer, wgpu::Buffer, u32)>,
+    hud_solid: Option<(wgpu::Buffer, wgpu::Buffer, u32)>,
+}
+
+fn create_rgba_bind_group(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    layout: &wgpu::BindGroupLayout,
+    uniform_buf: &wgpu::Buffer,
+    sampler: &wgpu::Sampler,
+    img: &crate::dds_decode::RgbaImage,
+    label: &str,
+) -> wgpu::BindGroup {
+    let tex_size = wgpu::Extent3d {
+        width: img.width.max(1),
+        height: img.height.max(1),
+        depth_or_array_layers: 1,
+    };
+    let tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: tex_size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &tex,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &img.pixels,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(4 * tex_size.width),
+            rows_per_image: Some(tex_size.height),
+        },
+        tex_size,
+    );
+    let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some(label),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniform_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(&view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::Sampler(sampler),
+            },
+        ],
+    })
 }
 
 impl GpuSceneResources {
@@ -120,62 +332,27 @@ impl GpuSceneResources {
             label: Some("farust_scene_shader"),
             source: wgpu::ShaderSource::Wgsl(SHADER_WGSL.into()),
         });
-
-        let tex_size = wgpu::Extent3d {
-            width: scene.albedo.width.max(1),
-            height: scene.albedo.height.max(1),
-            depth_or_array_layers: 1,
-        };
-        let albedo_tex = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("albedo_tex"),
-            size: tex_size,
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
+        let uniform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("scene_uniforms"),
+            contents: bytemuck::bytes_of(&make_uniforms(camera)),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &albedo_tex,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            &scene.albedo.pixels,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(4 * tex_size.width),
-                rows_per_image: Some(tex_size.height),
-            },
-            tex_size,
-        );
-        let albedo_view = albedo_tex.create_view(&wgpu::TextureViewDescriptor::default());
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("albedo_sampler"),
-            address_mode_u: wgpu::AddressMode::Repeat,
-            address_mode_v: wgpu::AddressMode::Repeat,
-            address_mode_w: wgpu::AddressMode::Repeat,
+            label: Some("scene_sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
             mipmap_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
-
-        let uniforms = make_uniforms(camera);
-        let uniform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("uniform_buf"),
-            contents: bytemuck::bytes_of(&uniforms),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
-
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("scene_bgl"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
@@ -202,24 +379,38 @@ impl GpuSceneResources {
             ],
         });
 
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("scene_bg"),
-            layout: &bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: uniform_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&albedo_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&sampler),
-                },
-            ],
-        });
+        let bind_group = create_rgba_bind_group(
+            device,
+            queue,
+            &bind_group_layout,
+            &uniform_buf,
+            &sampler,
+            &scene.albedo,
+            "scene_bg",
+        );
+        let white_img = crate::dds_decode::RgbaImage {
+            width: 1,
+            height: 1,
+            pixels: vec![255, 255, 255, 255],
+        };
+        let overlay_bind_group = create_rgba_bind_group(
+            device,
+            queue,
+            &bind_group_layout,
+            &uniform_buf,
+            &sampler,
+            &white_img,
+            "overlay_bg",
+        );
+        let minimap_bind_group = create_rgba_bind_group(
+            device,
+            queue,
+            &bind_group_layout,
+            &uniform_buf,
+            &sampler,
+            &white_img,
+            "minimap_bg",
+        );
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("scene_pl"),
@@ -254,13 +445,57 @@ impl GpuSceneResources {
             ],
         };
 
+        let instance_layout = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<GpuUnitInstance>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Instance,
+            attributes: &[
+                wgpu::VertexAttribute {
+                    offset: 0,
+                    shader_location: 4,
+                    format: wgpu::VertexFormat::Float32x4,
+                },
+                wgpu::VertexAttribute {
+                    offset: 16,
+                    shader_location: 5,
+                    format: wgpu::VertexFormat::Float32x4,
+                },
+                wgpu::VertexAttribute {
+                    offset: 32,
+                    shader_location: 6,
+                    format: wgpu::VertexFormat::Float32x4,
+                },
+            ],
+        };
+
+        let hud_vertex_layout = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<HudVertex>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &[
+                wgpu::VertexAttribute {
+                    offset: 0,
+                    shader_location: 0,
+                    format: wgpu::VertexFormat::Float32x2,
+                },
+                wgpu::VertexAttribute {
+                    offset: 8,
+                    shader_location: 1,
+                    format: wgpu::VertexFormat::Float32x2,
+                },
+                wgpu::VertexAttribute {
+                    offset: 16,
+                    shader_location: 2,
+                    format: wgpu::VertexFormat::Float32x4,
+                },
+            ],
+        };
+
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("scene_pipeline"),
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs_main"),
-                buffers: &[vertex_layout],
+                buffers: &[vertex_layout.clone()],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             },
             fragment: Some(wgpu::FragmentState {
@@ -295,6 +530,96 @@ impl GpuSceneResources {
             cache: None,
         });
 
+        let inst_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("farust_instanced_shader"),
+            source: wgpu::ShaderSource::Wgsl(INSTANCED_SHADER_WGSL.into()),
+        });
+        let instanced_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("instanced_pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &inst_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[vertex_layout, instance_layout],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &inst_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: target_format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::LessEqual,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState {
+                count: sample_count,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            multiview: None,
+            cache: None,
+        });
+
+        let hud_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("farust_hud_shader"),
+            source: wgpu::ShaderSource::Wgsl(HUD_SHADER_WGSL.into()),
+        });
+        let hud_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("hud_pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &hud_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[hud_vertex_layout],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &hud_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: target_format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::Always,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState {
+                count: sample_count,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            multiview: None,
+            cache: None,
+        });
+
         let vertex_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("vertex_buf"),
             contents: bytemuck::cast_slice(&scene.vertices),
@@ -305,16 +630,167 @@ impl GpuSceneResources {
             contents: bytemuck::cast_slice(&scene.indices),
             usage: wgpu::BufferUsages::INDEX,
         });
+        let static_overlay = if !scene.overlay_vertices.is_empty() && !scene.overlay_indices.is_empty() {
+            let ov_vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("static_overlay_vb"),
+                contents: bytemuck::cast_slice(&scene.overlay_vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+            let ov_ib = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("static_overlay_ib"),
+                contents: bytemuck::cast_slice(&scene.overlay_indices),
+                usage: wgpu::BufferUsages::INDEX,
+            });
+            Some((ov_vb, ov_ib, scene.overlay_indices.len() as u32))
+        } else {
+            None
+        };
 
         Self {
             pipeline,
+            instanced_pipeline,
+            hud_pipeline,
+            bind_group_layout,
             bind_group,
+            overlay_bind_group,
+            minimap_bind_group,
+            sampler,
             uniform_buf,
             vertex_buf,
             index_buf,
             index_count: scene.indices.len() as u32,
+            static_overlay,
             dynamic: None,
+            unit_batches: Vec::new(),
+            hud_minimap: None,
+            hud_solid: None,
         }
+    }
+
+    pub(crate) fn create_mesh_template(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        vertices: &[GpuVertex],
+        indices: &[u32],
+        albedo: Option<&crate::dds_decode::RgbaImage>,
+        label: &str,
+    ) -> GpuMeshTemplate {
+        let vertex_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some(label),
+            contents: bytemuck::cast_slice(vertices),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let index_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some(label),
+            contents: bytemuck::cast_slice(indices),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+        let bind_group = match albedo {
+            Some(img) => create_rgba_bind_group(
+                device,
+                queue,
+                &self.bind_group_layout,
+                &self.uniform_buf,
+                &self.sampler,
+                img,
+                label,
+            ),
+            None => self.overlay_bind_group.clone(),
+        };
+        GpuMeshTemplate {
+            vertex_buf,
+            index_buf,
+            index_count: indices.len() as u32,
+            bind_group,
+        }
+    }
+
+    pub(crate) fn set_unit_batches(
+        &mut self,
+        device: &wgpu::Device,
+        batches: Vec<(&GpuMeshTemplate, &[GpuUnitInstance])>,
+    ) {
+        self.unit_batches.clear();
+        for (tpl, instances) in batches {
+            if instances.is_empty() || tpl.index_count == 0 {
+                continue;
+            }
+            let inst_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("unit_inst_buf"),
+                contents: bytemuck::cast_slice(instances),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+            self.unit_batches.push((
+                tpl.vertex_buf.clone(),
+                tpl.index_buf.clone(),
+                tpl.index_count,
+                tpl.bind_group.clone(),
+                inst_buf,
+                instances.len() as u32,
+            ));
+        }
+    }
+
+    pub(crate) fn set_minimap_texture(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        img: &crate::dds_decode::RgbaImage,
+    ) {
+        self.minimap_bind_group = create_rgba_bind_group(
+            device,
+            queue,
+            &self.bind_group_layout,
+            &self.uniform_buf,
+            &self.sampler,
+            img,
+            "minimap_tex",
+        );
+    }
+
+    pub(crate) fn set_hud(
+        &mut self,
+        device: &wgpu::Device,
+        minimap_v: &[HudVertex],
+        minimap_i: &[u32],
+        solid_v: &[HudVertex],
+        solid_i: &[u32],
+    ) {
+        self.hud_minimap = if !minimap_v.is_empty() && !minimap_i.is_empty() {
+            Some((
+                device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("hud_minimap_vb"),
+                    contents: bytemuck::cast_slice(minimap_v),
+                    usage: wgpu::BufferUsages::VERTEX,
+                }),
+                device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("hud_minimap_ib"),
+                    contents: bytemuck::cast_slice(minimap_i),
+                    usage: wgpu::BufferUsages::INDEX,
+                }),
+                minimap_i.len() as u32,
+            ))
+        } else {
+            None
+        };
+        self.hud_solid = if !solid_v.is_empty() && !solid_i.is_empty() {
+            Some((
+                device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("hud_solid_vb"),
+                    contents: bytemuck::cast_slice(solid_v),
+                    usage: wgpu::BufferUsages::VERTEX,
+                }),
+                device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("hud_solid_ib"),
+                    contents: bytemuck::cast_slice(solid_i),
+                    usage: wgpu::BufferUsages::INDEX,
+                }),
+                solid_i.len() as u32,
+            ))
+        } else {
+            None
+        };
     }
 
     /// Replace the per-frame dynamic geometry (empty input clears it).
@@ -382,10 +858,43 @@ impl GpuSceneResources {
         if self.index_count > 0 {
             rpass.draw_indexed(0..self.index_count, 0, 0..1);
         }
-        if let Some((vb, ib, n)) = &self.dynamic {
+        if let Some((vb, ib, n)) = &self.static_overlay {
+            rpass.set_bind_group(0, &self.overlay_bind_group, &[]);
             rpass.set_vertex_buffer(0, vb.slice(..));
             rpass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
             rpass.draw_indexed(0..*n, 0, 0..1);
+        }
+        if !self.unit_batches.is_empty() {
+            rpass.set_pipeline(&self.instanced_pipeline);
+            for (vb, ib, idx_n, bg, inst_b, inst_n) in &self.unit_batches {
+                rpass.set_bind_group(0, bg, &[]);
+                rpass.set_vertex_buffer(0, vb.slice(..));
+                rpass.set_vertex_buffer(1, inst_b.slice(..));
+                rpass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                rpass.draw_indexed(0..*idx_n, 0, 0..*inst_n);
+            }
+            rpass.set_pipeline(&self.pipeline);
+        }
+        if let Some((vb, ib, n)) = &self.dynamic {
+            rpass.set_bind_group(0, &self.overlay_bind_group, &[]);
+            rpass.set_vertex_buffer(0, vb.slice(..));
+            rpass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+            rpass.draw_indexed(0..*n, 0, 0..1);
+        }
+        if self.hud_minimap.is_some() || self.hud_solid.is_some() {
+            rpass.set_pipeline(&self.hud_pipeline);
+            if let Some((vb, ib, n)) = &self.hud_minimap {
+                rpass.set_bind_group(0, &self.minimap_bind_group, &[]);
+                rpass.set_vertex_buffer(0, vb.slice(..));
+                rpass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                rpass.draw_indexed(0..*n, 0, 0..1);
+            }
+            if let Some((vb, ib, n)) = &self.hud_solid {
+                rpass.set_bind_group(0, &self.overlay_bind_group, &[]);
+                rpass.set_vertex_buffer(0, vb.slice(..));
+                rpass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                rpass.draw_indexed(0..*n, 0, 0..1);
+            }
         }
     }
 }

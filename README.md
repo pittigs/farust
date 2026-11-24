@@ -80,3 +80,24 @@ Controls in `farust play`:
 - `RMB`: move / attack / factory rally (`Shift` queues), `RMB` drag: pan, `MMB` drag or `Q`/`E`: orbit, Wheel: zoom
 - `B` Land Factory, `M` Mass Extractor (auto-snaps to mass points), `P` Power Generator, `T`/`Y` produce units (`Shift` x5)
 - `A` Attack-Move, `S` Stop, `Space` Pause, `+`/`-` Speed (`1x..8x`), `C` Center camera, `R` Full-map camera, `F1` Toggle AI control
+
+## Steps 7–10 — done: FA rendering/HUD, deeper gameplay, replays & TCP lockstep, WorkerPool + SpatialGrid scale
+
+- **Phase 7 — Textured Instancing, Terrain Strata, Strategic Zoom & HUD**:
+  - `.scmap` terrain strata & blend-map (`texturemap0`/`texturemap1`) baked in parallel into high-res terrain albedo (`src/scmap.rs`, `src/scene.rs`).
+  - Hardware-instanced `.scm` unit rendering with `_Albedo` + `_SpecTeam` team-color mask shading, strategic zoom icons at high altitude, clickable minimap, resource bars, and 14-button 2D HUD (`src/viewer.rs`, `src/hud.rs`).
+- **Phase 8 — Deeper FA Gameplay Mechanics**:
+  - T1 Engineers (`G` build, repair, assist, reclaim wrecks), Point Defense (`D`), Radar (`N`), ballistic AoE artillery (`U`), ACU Overcharge (`O`), unit separation, and Fog-of-War / Radar intel toggle (`F2`).
+- **Phase 9 — Replays & 2-Player TCP Lockstep**:
+  - Binary `.farust-replay` (`FARPL1`) recording/verification/playback (`src/replay.rs`) and `TcpStream` 2-player lockstep networking with per-turn desync checking (`src/net.rs`).
+- **Phase 10 — Persistent `WorkerPool`, `SpatialGrid` & 2,000+ Unit Scaling**:
+  - Zero-`unsafe` persistent `WorkerPool` (`src/jobs.rs`) for batched A* pathfinding inside `Skirmish` (`1t == Nt` bit-identical hashes) and parallel `render_prep`, plus deterministic integer `SpatialGrid` (`src/spatial.rs`).
+
+```sh
+cargo run --release -- skirmish SCMP_001 --record fa-unpack/replays/scmp_001.farust-replay
+cargo run --release -- replay verify fa-unpack/replays/scmp_001.farust-replay
+cargo run --release -- replay play fa-unpack/replays/scmp_001.farust-replay
+cargo run --release -- host 127.0.0.1:15000 SCMP_001 --ticks 600
+cargo run --release -- join 127.0.0.1:15000
+cargo run --release -- bench-scale SCMP_001 --units 2048 --ticks 200
+```

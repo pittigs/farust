@@ -2,8 +2,9 @@
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
+use std::sync::Arc;
 
-use crate::jobs::par_map_ordered;
+use crate::jobs::{WorkerPool, par_map_ordered};
 use crate::scmap::ScMap;
 
 pub const CARDINAL_COST: u64 = 1000;
@@ -326,6 +327,19 @@ pub fn solve_paths_batch(
     threads: usize,
 ) -> Vec<PathResult> {
     par_map_ordered(requests, threads, |_, req| find_path(grid, req))
+}
+
+/// Solves a batch of A* path requests on a persistent [`WorkerPool`].
+pub fn solve_paths_batch_pool(
+    grid: &Arc<PathGrid>,
+    requests: Arc<Vec<PathRequest>>,
+    pool: &WorkerPool,
+) -> Vec<PathResult> {
+    let g = Arc::clone(grid);
+    pool.par_map_ordered_arc(
+        requests,
+        Arc::new(move |_: usize, req: &PathRequest| find_path(&g, req)),
+    )
 }
 
 pub fn path_batch_hash(results: &[PathResult]) -> u64 {

@@ -1,6 +1,8 @@
 //! Phase 5 parallel render-frame preparation from a read-only simulation snapshot.
 
-use crate::jobs::par_map_ordered;
+use std::sync::Arc;
+
+use crate::jobs::{WorkerPool, par_map_ordered};
 use crate::scmap::ScMap;
 use crate::sim::SimUnitSnapshot;
 
@@ -35,88 +37,89 @@ fn fnv1a_extend(mut hash: u64, bytes: &[u8]) -> u64 {
     hash
 }
 
-pub fn prepare_render_frame(
-    units: &[SimUnitSnapshot],
+fn evaluate_unit_instance(
+    u: &SimUnitSnapshot,
     scmap: Option<&ScMap>,
-    view_proj: [[f32; 4]; 4],
-    camera_eye: [f32; 3],
-    threads: usize,
-) -> PreparedFrame {
-    let scale = crate::sim::SCALE as f32;
-
-    let results = par_map_ordered(units, threads, |_, u| {
-        let wx = u.x as f32 / scale;
-        let wz = u.y as f32 / scale;
-        let wy = if let Some(map) = scmap {
-            let gx = (wx.round() as i64).clamp(0, map.heightmap_width as i64) as u32;
-            let gz = (wz.round() as i64).clamp(0, map.heightmap_height as i64) as u32;
-            let terrain_y = map.height_at(gx, gz).unwrap_or(0.0);
-            if map.water.has_water {
-                terrain_y.max(map.water.elevation)
-            } else {
-                terrain_y
-            }
+    view_proj: &[[f32; 4]; 4],
+    camera_eye: &[f32; 3],
+    scale: f32,
+) -> Option<RenderInstance> {
+    let wx = u.x as f32 / scale;
+    let wz = u.y as f32 / scale;
+    let wy = if let Some(map) = scmap {
+        let gx = (wx.round() as i64).clamp(0, map.heightmap_width as i64) as u32;
+        let gz = (wz.round() as i64).clamp(0, map.heightmap_height as i64) as u32;
+        let terrain_y = map.height_at(gx, gz).unwrap_or(0.0);
+        if map.water.has_water {
+            terrain_y.max(map.water.elevation)
         } else {
-            0.0
-        };
-
-        let clip_row = |r: usize| -> f32 {
-            view_proj[0][r] * wx + view_proj[1][r] * wy + view_proj[2][r] * wz + view_proj[3][r]
-        };
-
-        let clip_x = clip_row(0);
-        let clip_y = clip_row(1);
-        let clip_z = clip_row(2);
-        let clip_w = clip_row(3);
-
-        let m = 4.0_f32;
-        let visible = clip_w > 0.0
-            && clip_x >= -clip_w - m
-            && clip_x <= clip_w + m
-            && clip_y >= -clip_w - m
-            && clip_y <= clip_w + m
-            && clip_z >= -m
-            && clip_z <= clip_w + m;
-
-        if !visible {
-            return None;
+            terrain_y
         }
+    } else {
+        0.0
+    };
 
-        let dx = wx - camera_eye[0];
-        let dy = wy - camera_eye[1];
-        let dz = wz - camera_eye[2];
-        let dist_sq = dx * dx + dy * dy + dz * dz;
+    let clip_row = |r: usize| -> f32 {
+        view_proj[0][r] * wx + view_proj[1][r] * wy + view_proj[2][r] * wz + view_proj[3][r]
+    };
 
-        let lod = if dist_sq < 80.0 * 80.0 {
-            0
-        } else if dist_sq < 260.0 * 260.0 {
-            1
-        } else {
-            2
-        };
+    let clip_x = clip_row(0);
+    let clip_y = clip_row(1);
+    let clip_z = clip_row(2);
+    let clip_w = clip_row(3);
 
-        let health_ratio = if u.max_hp > 0 {
-            (u.hp as f32 / u.max_hp as f32).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
+    let m = 4.0_f32;
+    let visible = clip_w > 0.0
+        && clip_x >= -clip_w - m
+        && clip_x <= clip_w + m
+        && clip_y >= -clip_w - m
+        && clip_y <= clip_w + m
+        && clip_z >= -m
+        && clip_z <= clip_w + m;
 
-        let model_matrix = [
-            [1.0, 0.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0, 0.0],
-            [0.0, 0.0, 1.0, 0.0],
-            [wx, wy, wz, 1.0],
-        ];
+    if !visible {
+        return None;
+    }
 
-        Some(RenderInstance {
-            unit_id: u.id,
-            model_matrix,
-            world_pos: [wx, wy, wz],
-            health_ratio,
-            lod,
-        })
-    });
+    let dx = wx - camera_eye[0];
+    let dy = wy - camera_eye[1];
+    let dz = wz - camera_eye[2];
+    let dist_sq = dx * dx + dy * dy + dz * dz;
 
+    let lod = if dist_sq < 80.0 * 80.0 {
+        0
+    } else if dist_sq < 260.0 * 260.0 {
+        1
+    } else {
+        2
+    };
+
+    let health_ratio = if u.max_hp > 0 {
+        (u.hp as f32 / u.max_hp as f32).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+
+    let model_matrix = [
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [wx, wy, wz, 1.0],
+    ];
+
+    Some(RenderInstance {
+        unit_id: u.id,
+        model_matrix,
+        world_pos: [wx, wy, wz],
+        health_ratio,
+        lod,
+    })
+}
+
+fn finalize_prepared_frame(
+    units: &[SimUnitSnapshot],
+    results: Vec<Option<RenderInstance>>,
+) -> PreparedFrame {
     let mut instances = Vec::with_capacity(units.len());
     let mut culled_count = 0usize;
     let mut lod_counts = [0usize; 3];
@@ -149,6 +152,41 @@ pub fn prepare_render_frame(
         lod_counts,
         digest_fnv1a: hash,
     }
+}
+
+pub fn prepare_render_frame(
+    units: &[SimUnitSnapshot],
+    scmap: Option<&ScMap>,
+    view_proj: [[f32; 4]; 4],
+    camera_eye: [f32; 3],
+    threads: usize,
+) -> PreparedFrame {
+    let scale = crate::sim::SCALE as f32;
+    let results = par_map_ordered(units, threads, |_, u| {
+        evaluate_unit_instance(u, scmap, &view_proj, &camera_eye, scale)
+    });
+    finalize_prepared_frame(units, results)
+}
+
+/// Persistent worker-pool variant of [`prepare_render_frame`] yielding identical digests.
+pub fn prepare_render_frame_pool(
+    units: &Arc<Vec<SimUnitSnapshot>>,
+    scmap: Option<&Arc<ScMap>>,
+    view_proj: [[f32; 4]; 4],
+    camera_eye: [f32; 3],
+    pool: &WorkerPool,
+) -> PreparedFrame {
+    let scale = crate::sim::SCALE as f32;
+    let map_opt = scmap.cloned();
+
+    let results = pool.par_map_ordered_arc(
+        Arc::clone(units),
+        Arc::new(move |_: usize, u: &SimUnitSnapshot| {
+            evaluate_unit_instance(u, map_opt.as_deref(), &view_proj, &camera_eye, scale)
+        }),
+    );
+
+    finalize_prepared_frame(units, results)
 }
 
 #[cfg(test)]

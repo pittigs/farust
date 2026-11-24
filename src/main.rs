@@ -5,9 +5,12 @@ mod dds;
 mod dds_decode;
 mod economy;
 mod jobs;
+mod hud;
+mod net;
 mod pathfinding;
 mod play;
 mod render_prep;
+mod replay;
 mod scenario;
 mod scd;
 mod scene;
@@ -16,6 +19,7 @@ mod scmap;
 mod sim;
 mod skirmish;
 mod skirmish_ai;
+mod spatial;
 mod viewer;
 
 use std::collections::BTreeMap;
@@ -41,8 +45,12 @@ fn print_usage() {
     eprintln!("  farust view-map <NAME> [GAME_DIR] [--size WxH] [--snapshot OUT.png]");
     eprintln!("  farust sim-run --ticks N [--seed S] [--scenario NAME] [--dt SEC] [--hash] [--json]");
     eprintln!("  farust bench-multicore [GAME_DIR] [--threads N] [--limit N] [--json]");
-    eprintln!("  farust skirmish [MAP] [GAME_DIR] [--armies 1,2] [--factions uef,cybran] [--seed S] [--max-ticks N] [--quiet] [--json]");
+    eprintln!("  farust bench-scale [MAP] [GAME_DIR] [--units N] [--ticks T] [--threads K] [--json]");
+    eprintln!("  farust skirmish [MAP] [GAME_DIR] [--armies 1,2] [--factions uef,cybran] [--seed S] [--max-ticks N] [--record FILE] [--quiet] [--json]");
     eprintln!("  farust play [MAP] [GAME_DIR] [--armies 1,2] [--factions uef,cybran] [--seed S] [--speed N] [--spectate] [--size WxH] [--snapshot OUT.png] [--snapshot-ticks N]");
+    eprintln!("  farust replay <verify|play> <FILE> [GAME_DIR] [--size WxH] [--snapshot OUT.png] [--snapshot-ticks N]");
+    eprintln!("  farust host <ADDR:PORT> [MAP] [GAME_DIR] [--factions uef,cybran] [--seed S] [--headless-ticks N]");
+    eprintln!("  farust join <ADDR:PORT> [GAME_DIR] [--headless-ticks N]");
     eprintln!();
     eprintln!("env:");
     eprintln!("  FA_PATH  override for the game install dir");
@@ -206,8 +214,12 @@ fn run(args: &[String]) -> Result<(), String> {
         "view-map" => cmd_view_map(args),
         "sim-run" => cmd_sim_run(args),
         "bench-multicore" => cmd_bench_multicore(args),
+        "bench-scale" => cmd_bench_scale(args),
         "skirmish" => cmd_skirmish(args),
         "play" => cmd_play(args),
+        "replay" => cmd_replay(args),
+        "host" => cmd_host(args),
+        "join" => cmd_join(args),
         cmd => Err(format!("unknown command: {cmd}")),
     }
 }
@@ -223,6 +235,7 @@ fn cmd_maps(args: &[String]) -> Result<(), String> {
         let mut scenarios_ok = 0usize;
         let mut saves_ok = 0usize;
         let mut scmaps_ok = 0usize;
+        let mut strata_ok = 0usize;
 
         for m in &maps {
             let meta = match scenario::parse_scenario_file(&m.scenario_path, &m.id) {
@@ -245,7 +258,12 @@ fn cmd_maps(args: &[String]) -> Result<(), String> {
             match m.scmap_path.as_deref() {
                 Some(scmap_path) => match scmap::ScMap::parse_file(scmap_path) {
                     Ok(map_data) => match dds::parse_dds(&map_data.preview_dds) {
-                        Ok(_) => scmaps_ok += 1,
+                        Ok(_) => {
+                            scmaps_ok += 1;
+                            if map_data.terrain_textures.is_some() {
+                                strata_ok += 1;
+                            }
+                        }
                         Err(e) => failures.push(format!("{}: preview dds: {e}", m.id)),
                     },
                     Err(e) => failures.push(format!("{}: scmap: {e}", m.id)),
@@ -262,12 +280,13 @@ fn cmd_maps(args: &[String]) -> Result<(), String> {
             ));
         }
         println!(
-            "{}: checked {} maps: {} scenarios, {} saves, {} scmaps (0 errors)",
+            "{}: checked {} maps: {} scenarios, {} saves, {} scmaps ({} with terrain strata, 0 errors)",
             scd::maps_dir(&game_dir).display(),
             maps.len(),
             scenarios_ok,
             saves_ok,
-            scmaps_ok
+            scmaps_ok,
+            strata_ok
         );
         return Ok(());
     }
@@ -708,8 +727,9 @@ fn cmd_bench_multicore(args: &[String]) -> Result<(), String> {
             bench_world.apply_path_waypoints(uid, &paths_nt[i as usize].waypoints);
         }
     }
-    let snapshots = bench_world.snapshot_units();
-    let mut cam = camera::OrbitCamera::for_map(scmap.map_width, scmap.map_height, 17.5, 1.6);
+    let snapshots = std::sync::Arc::new(bench_world.snapshot_units());
+    let scmap_arc = std::sync::Arc::new(scmap);
+    let mut cam = camera::OrbitCamera::for_map(scmap_arc.map_width, scmap_arc.map_height, 17.5, 1.6);
     cam.distance = 220.0;
     cam.pitch = 0.72;
     let vp = cam.view_proj_matrix();
@@ -717,17 +737,19 @@ fn cmd_bench_multicore(args: &[String]) -> Result<(), String> {
     let frames = 25usize;
 
     let t4 = Instant::now();
-    let mut frame_1t = render_prep::prepare_render_frame(&snapshots, Some(&scmap), vp, eye, 1);
+    let mut frame_1t = render_prep::prepare_render_frame(&snapshots, Some(&scmap_arc), vp, eye, 1);
     for _ in 1..frames {
-        frame_1t = render_prep::prepare_render_frame(&snapshots, Some(&scmap), vp, eye, 1);
+        frame_1t = render_prep::prepare_render_frame(&snapshots, Some(&scmap_arc), vp, eye, 1);
     }
     let render_1t_ms = t4.elapsed().as_secs_f64() * 1000.0 / frames as f64;
 
+    let pool = jobs::WorkerPool::new(threads);
     let t5 = Instant::now();
     let mut frame_nt =
-        render_prep::prepare_render_frame(&snapshots, Some(&scmap), vp, eye, threads);
+        render_prep::prepare_render_frame_pool(&snapshots, Some(&scmap_arc), vp, eye, &pool);
     for _ in 1..frames {
-        frame_nt = render_prep::prepare_render_frame(&snapshots, Some(&scmap), vp, eye, threads);
+        frame_nt =
+            render_prep::prepare_render_frame_pool(&snapshots, Some(&scmap_arc), vp, eye, &pool);
     }
     let render_nt_ms = t5.elapsed().as_secs_f64() * 1000.0 / frames as f64;
 
@@ -863,6 +885,9 @@ fn positional_after(args: &[String], start: usize) -> Option<PathBuf> {
             || a == "--max-ticks"
             || a == "--speed"
             || a == "--snapshot-ticks"
+            || a == "--record"
+            || a == "--units"
+            || a == "--headless-ticks"
         {
             i += 2;
             continue;
@@ -990,6 +1015,19 @@ fn cmd_skirmish(args: &[String]) -> Result<(), String> {
     let map = skirmish::MapContext::load(&game_dir, map_name)?;
     let setup = parse_skirmish_setup(args, &catalog, map.starts.len())?;
     let mut world = skirmish::Skirmish::on_map(catalog, &map, &setup, seed)?;
+    let record_out = flag_str(args, "--record").map(PathBuf::from);
+    let mut recorder = record_out.as_ref().map(|_| {
+        let setups: Vec<skirmish::ArmySetup> = world
+            .armies()
+            .iter()
+            .map(|a| skirmish::ArmySetup {
+                name: a.name.clone(),
+                faction: a.faction,
+                start: a.start,
+            })
+            .collect();
+        replay::ReplayRecorder::new(&map.map_id, seed, setups)
+    });
     let mut ais: Vec<skirmish_ai::ScriptedAi> = (0..setup.len())
         .map(|i| skirmish_ai::ScriptedAi::new(i as skirmish::ArmyId))
         .collect();
@@ -1027,12 +1065,33 @@ fn cmd_skirmish(args: &[String]) -> Result<(), String> {
 
     let t1 = Instant::now();
     while world.tick() < max_ticks && world.result().is_none() {
+        let tick = world.tick();
         for ai in &mut ais {
-            ai.think(&mut world);
+            for cmd in ai.decide(&world) {
+                if let Some(ref mut rec) = recorder {
+                    rec.record(tick, ai.army, &cmd);
+                }
+                world.issue(ai.army, cmd);
+            }
         }
         world.step();
+        if let Some(ref mut rec) = recorder {
+            rec.maybe_checkpoint(world.tick(), world.state_hash());
+        }
         if !quiet && world.tick() % 1200 == 0 {
             print_skirmish_status(&world);
+        }
+    }
+    if let (Some(rec), Some(ref path)) = (recorder, record_out) {
+        let rep = rec.finish(world.tick(), world.state_hash());
+        rep.save(path)?;
+        if !quiet {
+            println!(
+                "replay:   saved {} ({} cmds, {} checkpoints)",
+                path.display(),
+                rep.commands.len(),
+                rep.checkpoints.len()
+            );
         }
     }
     let sim_ms = t1.elapsed().as_secs_f64() * 1000.0;
@@ -1145,6 +1204,7 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
             width as f32 / height as f32,
         );
         let adapter = play::render_skirmish_snapshot(
+            Some(&game_dir),
             &session,
             &map,
             &meshes,
@@ -1165,8 +1225,341 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
     }
 
     println!("Starting interactive skirmish on {} ({})", map.map_name, map.map_id);
-    println!("Controls: LMB select/box | RMB move/attack/rally | RMB drag pan | MMB/Q/E orbit | Wheel zoom");
-    println!("          1 ACU | 2 Factories | 3 Army | B Factory | M Mex | P PGen | T/Y Produce | A AttackMove | S Stop | Space Pause | +/- Speed | F1 Toggle AI");
+    println!("Controls: LMB select/box | RMB move/attack/repair/assist/reclaim | RMB drag pan | MMB/Q/E orbit | Wheel zoom");
+    println!("          1 ACU | 2 Factories | 3 Army | B Fac | M Mex | P PGen | D PD | N Rad | G Eng | T Tank | Y Bot | U Arty | O Overcharge | F1 AI | F2 FOW");
     let session = play::PlaySession::new(world, 0, spectate, speed);
-    play::run_play_window(session, map, meshes, width, height)
+    play::run_play_window(Some(&game_dir), session, map, meshes, width, height)
+}
+
+fn cmd_replay(args: &[String]) -> Result<(), String> {
+    if args.len() < 4 {
+        return Err("usage: farust replay <verify|play> <FILE> [GAME_DIR] [--size WxH] [--snapshot OUT.png] [--snapshot-ticks N]".to_string());
+    }
+    let mode = args[2].as_str();
+    let replay_path = PathBuf::from(&args[3]);
+    let game_dir = positional_after(args, 4).unwrap_or_else(scd::default_game_dir);
+
+    let rep = replay::Replay::load(&replay_path)?;
+    let catalog = skirmish::Catalog::load(&game_dir)?;
+    let map = skirmish::MapContext::load(&game_dir, &rep.header.map_id)?;
+
+    match mode {
+        "verify" => {
+            let t0 = Instant::now();
+            let report = rep.verify(catalog, &map)?;
+            let ms = t0.elapsed().as_secs_f64() * 1000.0;
+            println!(
+                "replay verified: {} | ticks={} cmds={} checkpoints={} | hash={:016x} ({ms:.0}ms)",
+                report.map_id,
+                report.ticks,
+                report.commands,
+                report.checkpoints_verified,
+                report.final_hash
+            );
+            Ok(())
+        }
+        "play" => {
+            let speed = flag_usize(args, "--speed").unwrap_or(2).clamp(1, 8) as u32;
+            let (width, height) = parse_size_flag(args).unwrap_or((1280, 800));
+            let meshes = play::UnitMeshCache::load(Some(&game_dir), &catalog);
+            let world = skirmish::Skirmish::new(
+                catalog,
+                map.grid.clone(),
+                map.size,
+                map.mass_points.clone(),
+                &rep.header.setups,
+                rep.header.seed,
+            )?;
+            let mut session = play::PlaySession::new_replay(world, rep, speed);
+            if let Some(out) = flag_str(args, "--snapshot") {
+                let target_ticks = flag_usize(args, "--snapshot-ticks").unwrap_or(3000) as u64;
+                for _ in 0..target_ticks {
+                    if session.paused || session.world.result().is_some() {
+                        break;
+                    }
+                    session.step_sim();
+                }
+                let cam = play::battle_snapshot_camera(
+                    &session.world,
+                    &map.scmap,
+                    width as f32 / height as f32,
+                );
+                let gpu = play::render_skirmish_snapshot(
+                    Some(&game_dir),
+                    &session,
+                    &map,
+                    &meshes,
+                    width,
+                    height,
+                    Path::new(out),
+                    Some(cam),
+                )?;
+                println!(
+                    "replay snapshot @ tick {}: hash={} on {} -> {out}",
+                    session.world.tick(),
+                    session.world.hash_hex(),
+                    gpu
+                );
+                return Ok(());
+            }
+            play::run_play_window(Some(&game_dir), session, map, meshes, width, height)
+        }
+        other => Err(format!("unknown replay subcommand '{other}' (expected verify|play)")),
+    }
+}
+
+fn cmd_host(args: &[String]) -> Result<(), String> {
+    if args.len() < 3 {
+        return Err("usage: farust host <ADDR:PORT> [MAP] [GAME_DIR] [--factions uef,cybran] [--seed S] [--headless-ticks N]".to_string());
+    }
+    let addr = &args[2];
+    let map_name = args
+        .get(3)
+        .filter(|a| !a.starts_with("--"))
+        .map(String::as_str)
+        .unwrap_or("SCMP_001");
+    let game_dir = positional_after(args, 4).unwrap_or_else(scd::default_game_dir);
+    let seed = flag_str(args, "--seed")
+        .map(|s| s.parse::<u64>().map_err(|_| format!("invalid --seed '{s}'")))
+        .transpose()?
+        .unwrap_or(sim::DEFAULT_SEED);
+    let ticks = flag_usize(args, "--headless-ticks").unwrap_or(1800) as u64;
+
+    let catalog = skirmish::Catalog::load(&game_dir)?;
+    let map = skirmish::MapContext::load(&game_dir, map_name)?;
+    let setup = parse_skirmish_setup(args, &catalog, map.starts.len())?;
+    let setups: Vec<skirmish::ArmySetup> = setup
+        .iter()
+        .take(2)
+        .map(|&(spot, faction)| skirmish::ArmySetup {
+            name: map.starts[spot].0.clone(),
+            faction,
+            start: map.starts[spot].1,
+        })
+        .collect();
+    if setups.len() < 2 {
+        return Err("lockstep host requires 2 armies".to_string());
+    }
+
+    println!("Hosting TCP lockstep match on {addr} ({})...", map.map_id);
+    let (mut peer, bound_addr) = net::LockstepPeer::host_bind(addr, &map.map_id, seed, &setups)?;
+    println!("Peer connected on {bound_addr}; running {ticks} ticks...");
+    let mut world = skirmish::Skirmish::new(
+        catalog,
+        map.grid.clone(),
+        map.size,
+        map.mass_points.clone(),
+        &setups,
+        seed,
+    )?;
+    let final_hash = net::run_headless_lockstep(&mut peer, &mut world, ticks)?;
+    println!(
+        "lockstep host complete: ticks={} hash={final_hash:016x}",
+        world.tick()
+    );
+    Ok(())
+}
+
+fn cmd_join(args: &[String]) -> Result<(), String> {
+    if args.len() < 3 {
+        return Err("usage: farust join <ADDR:PORT> [GAME_DIR] [--headless-ticks N]".to_string());
+    }
+    let addr = &args[2];
+    let game_dir = positional_after(args, 3).unwrap_or_else(scd::default_game_dir);
+    let ticks = flag_usize(args, "--headless-ticks").unwrap_or(1800) as u64;
+
+    let (mut peer, hs) = net::LockstepPeer::connect(addr)?;
+    let catalog = skirmish::Catalog::load(&game_dir)?;
+    let map = skirmish::MapContext::load(&game_dir, &hs.map_id)?;
+    let mut world = skirmish::Skirmish::new(
+        catalog,
+        map.grid.clone(),
+        map.size,
+        map.mass_points.clone(),
+        &hs.setups,
+        hs.seed,
+    )?;
+    let final_hash = net::run_headless_lockstep(&mut peer, &mut world, ticks)?;
+    println!(
+        "lockstep client complete: army={} ticks={} hash={final_hash:016x}",
+        peer.local_army,
+        world.tick()
+    );
+    Ok(())
+}
+
+fn cmd_bench_scale(args: &[String]) -> Result<(), String> {
+    let map_name = args
+        .get(2)
+        .filter(|a| !a.starts_with("--"))
+        .map(String::as_str)
+        .unwrap_or("SCMP_001");
+    let game_dir = positional_after(args, 3).unwrap_or_else(scd::default_game_dir);
+    let unit_count = flag_usize(args, "--units").unwrap_or(2048).clamp(64, 16_384);
+    let ticks = flag_usize(args, "--ticks").unwrap_or(200).clamp(10, 5000) as u64;
+    let threads = flag_usize(args, "--threads")
+        .unwrap_or_else(jobs::default_thread_count)
+        .max(1);
+
+    let catalog = skirmish::Catalog::load(&game_dir)?;
+    let map = skirmish::MapContext::load(&game_dir, map_name)?;
+    let setup = vec![(0, 0), (1, 1)];
+
+    let build_army_world = |pool: Option<std::sync::Arc<jobs::WorkerPool>>| -> Result<skirmish::Skirmish, String> {
+        let mut w = skirmish::Skirmish::on_map(catalog.clone(), &map, &setup, sim::DEFAULT_SEED)?;
+        w.set_worker_pool(pool);
+        let half = unit_count / 2;
+        let p0 = w.armies()[0].start;
+        let p1 = w.armies()[1].start;
+        let f0_tank = w.faction(0).unwrap().land_units[0].clone();
+        let f1_tank = w.faction(1).unwrap().land_units[0].clone();
+        let cols = (half as f64).sqrt().ceil() as i64;
+        let mut u0s = Vec::with_capacity(half);
+        let mut u1s = Vec::with_capacity(half);
+        for i in 0..half as i64 {
+            let ox = ((i % cols) - cols / 2) * 3 * sim::SCALE;
+            let oy = ((i / cols) - cols / 2) * 3 * sim::SCALE;
+            if let Some(id) = w.spawn_unit(
+                0,
+                &f0_tank,
+                (
+                    (p0.0 + ox).clamp(20 * sim::SCALE, map.size.0 - 20 * sim::SCALE),
+                    (p0.1 + oy).clamp(20 * sim::SCALE, map.size.1 - 20 * sim::SCALE),
+                ),
+            ) {
+                u0s.push(id);
+            }
+            if let Some(id) = w.spawn_unit(
+                1,
+                &f1_tank,
+                (
+                    (p1.0 + ox).clamp(20 * sim::SCALE, map.size.0 - 20 * sim::SCALE),
+                    (p1.1 + oy).clamp(20 * sim::SCALE, map.size.1 - 20 * sim::SCALE),
+                ),
+            ) {
+                u1s.push(id);
+            }
+        }
+        w.rebuild_spatial();
+        // Split each army across 16 attack-move squads so batched A* routes solve in parallel
+        for chunk in u0s.chunks((u0s.len() / 16).max(1)) {
+            w.issue(
+                0,
+                skirmish::Command::AttackMove {
+                    units: chunk.to_vec(),
+                    x: p1.0,
+                    y: p1.1,
+                    queue: false,
+                },
+            );
+        }
+        for chunk in u1s.chunks((u1s.len() / 16).max(1)) {
+            w.issue(
+                1,
+                skirmish::Command::AttackMove {
+                    units: chunk.to_vec(),
+                    x: p0.0,
+                    y: p0.1,
+                    queue: false,
+                },
+            );
+        }
+        Ok(w)
+    };
+
+    let mut w_1t = build_army_world(None)?;
+    let t0 = Instant::now();
+    w_1t.run(ticks);
+    let sim_1t_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let hash_1t = w_1t.state_hash();
+
+    let pool = std::sync::Arc::new(jobs::WorkerPool::new(threads));
+    let mut w_nt = build_army_world(Some(std::sync::Arc::clone(&pool)))?;
+    let t1 = Instant::now();
+    w_nt.run(ticks);
+    let sim_nt_ms = t1.elapsed().as_secs_f64() * 1000.0;
+    let hash_nt = w_nt.state_hash();
+
+    if hash_1t != hash_nt {
+        return Err(format!(
+            "scale determinism failure: 1t={hash_1t:016x} vs {threads}t={hash_nt:016x}"
+        ));
+    }
+
+    // Also measure render_prep across all surviving units with persistent WorkerPool
+    let snaps: Vec<sim::SimUnitSnapshot> = w_nt
+        .units()
+        .map(|u| sim::SimUnitSnapshot {
+            id: u.id,
+            blueprint_id: u.type_id.clone(),
+            x: u.pos.x,
+            y: u.pos.y,
+            hp: u.hp,
+            max_hp: u.max_hp,
+        })
+        .collect();
+    let snaps_arc = std::sync::Arc::new(snaps);
+    let scmap_arc = std::sync::Arc::new(map.scmap.clone());
+    let mut cam = camera::OrbitCamera::for_map(scmap_arc.map_width, scmap_arc.map_height, 17.5, 1.6);
+    cam.distance = 220.0;
+    cam.pitch = 0.72;
+    let vp = cam.view_proj_matrix();
+    let eye = cam.eye_position();
+    let frames = 25usize;
+
+    let t2 = Instant::now();
+    let mut r_1t = render_prep::prepare_render_frame(&snaps_arc, Some(&scmap_arc), vp, eye, 1);
+    for _ in 1..frames {
+        r_1t = render_prep::prepare_render_frame(&snaps_arc, Some(&scmap_arc), vp, eye, 1);
+    }
+    let rp_1t_ms = t2.elapsed().as_secs_f64() * 1000.0 / frames as f64;
+
+    let t3 = Instant::now();
+    let mut r_nt =
+        render_prep::prepare_render_frame_pool(&snaps_arc, Some(&scmap_arc), vp, eye, &pool);
+    for _ in 1..frames {
+        r_nt = render_prep::prepare_render_frame_pool(&snaps_arc, Some(&scmap_arc), vp, eye, &pool);
+    }
+    let rp_nt_ms = t3.elapsed().as_secs_f64() * 1000.0 / frames as f64;
+
+    if r_1t.digest_fnv1a != r_nt.digest_fnv1a {
+        return Err("scale render_prep digest mismatch".to_string());
+    }
+
+    let sim_speedup = sim_1t_ms / sim_nt_ms.max(0.001);
+    let rp_speedup = rp_1t_ms / rp_nt_ms.max(0.001);
+    if has_flag(args, "--json") {
+        println!(
+            "{{\"map\":\"{}\",\"units\":{},\"ticks\":{ticks},\"threads\":{threads},\"sim_1t_ms\":{sim_1t_ms:.2},\"sim_nt_ms\":{sim_nt_ms:.2},\"sim_speedup\":{sim_speedup:.2},\"render_1t_ms\":{rp_1t_ms:.3},\"render_nt_ms\":{rp_nt_ms:.3},\"render_speedup\":{rp_speedup:.2},\"paths\":{},\"shots\":{},\"kills\":{},\"hash\":\"{hash_nt:016x}\"}}",
+            map.map_id,
+            snaps_arc.len(),
+            w_nt.paths_solved(),
+            w_nt.shots_fired(),
+            w_nt.kills()
+        );
+        return Ok(());
+    }
+
+    println!(
+        "scale test:  {} | spawned={} alive={} | ticks={ticks} | threads=1 vs {threads}",
+        map.map_id,
+        unit_count + 2,
+        w_nt.units().count()
+    );
+    println!(
+        "sim_tick:    1t={sim_1t_ms:.2}ms ({:.0} ticks/s) -> {threads}t={sim_nt_ms:.2}ms ({:.0} ticks/s) [{sim_speedup:.2}x]",
+        ticks as f64 / (sim_1t_ms / 1000.0),
+        ticks as f64 / (sim_nt_ms / 1000.0)
+    );
+    println!(
+        "render_prep: 1t={rp_1t_ms:.3}ms/frame -> {threads}t={rp_nt_ms:.3}ms/frame [{rp_speedup:.2}x] | digest={:016x}",
+        r_nt.digest_fnv1a
+    );
+    println!(
+        "activity:    paths={} shots={} kills={} | hash={hash_nt:016x} (1t == {threads}t exact)",
+        w_nt.paths_solved(),
+        w_nt.shots_fired(),
+        w_nt.kills()
+    );
+    Ok(())
 }
