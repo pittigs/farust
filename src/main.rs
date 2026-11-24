@@ -1409,16 +1409,33 @@ fn cmd_bench_scale(args: &[String]) -> Result<(), String> {
         let mut w = skirmish::Skirmish::on_map(catalog.clone(), &map, &setup, sim::DEFAULT_SEED)?;
         w.set_worker_pool(pool);
         let half = unit_count / 2;
-        let p0 = w.armies()[0].start;
-        let p1 = w.armies()[1].start;
+        let s0 = w.armies()[0].start;
+        let s1 = w.armies()[1].start;
+        let dx = s1.0 - s0.0;
+        let dy = s1.1 - s0.1;
+        let dist = skirmish::isqrt((dx as i128) * (dx as i128) + (dy as i128) * (dy as i128)).max(1);
+        let p0 = s0;
+        let mut p1 = s1;
+        for s_dec in (3i64..=11).rev() {
+            let step = s_dec * 10;
+            let cx = (s0.0 + ((dx as i128 * (step * sim::SCALE) as i128) / dist as i128) as i64)
+                .clamp(40 * sim::SCALE, map.size.0 - 40 * sim::SCALE);
+            let cy = (s0.1 + ((dy as i128 * (step * sim::SCALE) as i128) / dist as i128) as i64)
+                .clamp(40 * sim::SCALE, map.size.1 - 40 * sim::SCALE);
+            let (gx, gy) = map.grid.world_to_cell(cx, cy);
+            if !map.grid.is_blocked(gx, gy) {
+                p1 = (cx, cy);
+                break;
+            }
+        }
         let f0_tank = w.faction(0).unwrap().land_units[0].clone();
         let f1_tank = w.faction(1).unwrap().land_units[0].clone();
         let cols = (half as f64).sqrt().ceil() as i64;
         let mut u0s = Vec::with_capacity(half);
         let mut u1s = Vec::with_capacity(half);
         for i in 0..half as i64 {
-            let ox = ((i % cols) - cols / 2) * 3 * sim::SCALE;
-            let oy = ((i / cols) - cols / 2) * 3 * sim::SCALE;
+            let ox = ((i % cols) - cols / 2) * 5 * sim::SCALE / 2;
+            let oy = ((i / cols) - cols / 2) * 5 * sim::SCALE / 2;
             if let Some(id) = w.spawn_unit(
                 0,
                 &f0_tank,

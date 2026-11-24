@@ -84,14 +84,14 @@ Controls in `farust play`:
 ## Steps 7–10 — done: FA rendering/HUD, deeper gameplay, replays & TCP lockstep, WorkerPool + SpatialGrid scale
 
 - **Phase 7 — Textured Instancing, Terrain Strata, Strategic Zoom & HUD**:
-  - `.scmap` terrain strata & blend-map (`texturemap0`/`texturemap1`) baked in parallel into high-res terrain albedo (`src/scmap.rs`, `src/scene.rs`).
-  - Hardware-instanced `.scm` unit rendering with `_Albedo` + `_SpecTeam` team-color mask shading, strategic zoom icons at high altitude, clickable minimap, resource bars, and 14-button 2D HUD (`src/viewer.rs`, `src/hud.rs`).
+  - `.scmap` terrain strata (`10` albedo + `9` tangent-normal layers + `texturemap0`/`texturemap1`), map lighting/fog, water params, sky cubemap (`SkyCube_*.dds`), and placed props (`src/scmap.rs`, `src/scene.rs`).
+  - GPU multi-stratum terrain splatting, 2048×2048 PCF shadow mapping, transparent depth-faded rippled water with sky reflections, alpha-cutout instanced `.scmap` props (`Pine06`, rocks, logs), `_LOD0.scm` team-colored units + charred `.scm` wrecks, clickable minimap, and real FA 64×64 DDS unit icons in the HUD (`src/viewer.rs`, `src/hud.rs`).
 - **Phase 8 — Deeper FA Gameplay Mechanics**:
   - T1 Engineers (`G` build, repair, assist, reclaim wrecks), Point Defense (`D`), Radar (`N`), ballistic AoE artillery (`U`), ACU Overcharge (`O`), unit separation, and Fog-of-War / Radar intel toggle (`F2`).
 - **Phase 9 — Replays & 2-Player TCP Lockstep**:
   - Binary `.farust-replay` (`FARPL1`) recording/verification/playback (`src/replay.rs`) and `TcpStream` 2-player lockstep networking with per-turn desync checking (`src/net.rs`).
 - **Phase 10 — Persistent `WorkerPool`, `SpatialGrid` & 2,000+ Unit Scaling**:
-  - Zero-`unsafe` persistent `WorkerPool` (`src/jobs.rs`) for batched A* pathfinding inside `Skirmish` (`1t == Nt` bit-identical hashes) and parallel `render_prep`, plus deterministic integer `SpatialGrid` (`src/spatial.rs`).
+  - Zero-`unsafe` persistent `WorkerPool` (`src/jobs.rs`) for batched A* pathfinding + deterministic parallel `step_separation` (`src/skirmish.rs`) with `1t == Nt` bit-identical hashes, dense zero-BTreeMap `UnitSpatialSnap`, parallel `render_prep`, and tight `SpatialGrid` (`src/spatial.rs`) sustaining 2,050 combat units at ~210 ticks/s.
 
 ```sh
 cargo run --release -- skirmish SCMP_001 --record fa-unpack/replays/scmp_001.farust-replay

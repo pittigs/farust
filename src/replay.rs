@@ -489,6 +489,7 @@ mod tests {
                 background_path: String::new(),
                 sky_cubemap_path: String::new(),
                 cubemaps: vec![],
+                lighting: crate::scmap::ScMapLighting::default(),
                 water: WaterInfo {
                     has_water: true,
                     elevation: 10.0,

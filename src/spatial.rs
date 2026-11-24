@@ -6,8 +6,8 @@
 
 use crate::sim::SCALE;
 
-/// Spatial cell size in milli-units (16 world meters).
-pub const SPATIAL_CELL_MILLI: i64 = 16 * SCALE;
+/// Spatial cell size in milli-units (6 world meters for tight unit queries).
+pub const SPATIAL_CELL_MILLI: i64 = 6 * SCALE;
 
 #[derive(Debug, Clone)]
 pub struct SpatialGrid {
@@ -53,6 +53,7 @@ impl SpatialGrid {
     }
 
     /// Collects all candidate unit IDs in cells overlapping `[cx - r, cx + r] x [cy - r, cy + r]`.
+    #[allow(dead_code)]
     pub fn query_radius(&self, cx: i64, cy: i64, radius: i64, out: &mut Vec<u32>) {
         out.clear();
         let r = radius.max(0);
@@ -67,9 +68,27 @@ impl SpatialGrid {
     }
 
     /// Deterministic ascending-`UnitId` query variant.
+    #[allow(dead_code)]
     pub fn query_radius_sorted(&self, cx: i64, cy: i64, radius: i64, out: &mut Vec<u32>) {
         self.query_radius(cx, cy, radius, out);
         out.sort_unstable();
+    }
+
+    /// Zero-allocation deterministic cell sweep invoking `f` for every entry in cells
+    /// overlapping `[cx - r, cx + r] x [cy - r, cy + r]`.
+    #[inline]
+    pub fn for_each_in_radius<F: FnMut(u32)>(&self, cx: i64, cy: i64, radius: i64, mut f: F) {
+        let r = radius.max(0);
+        let (x0, y0) = self.cell_coords(cx - r, cy - r);
+        let (x1, y1) = self.cell_coords(cx + r, cy + r);
+        for gy in y0..=y1 {
+            let row_off = gy * self.width;
+            for gx in x0..=x1 {
+                for &val in &self.cells[row_off + gx] {
+                    f(val);
+                }
+            }
+        }
     }
 }
 

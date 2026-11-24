@@ -74,11 +74,11 @@ impl HudLayout {
             ("[F1]AI", HudAction::ToggleAi, session.spectate),
         ];
 
-        let bw = 74.0;
-        let bh = 28.0;
+        let bw = 66.0;
+        let bh = 54.0;
         let gap = 6.0;
         let base_x = 12.0;
-        let y2 = h - bh - 12.0;
+        let y2 = h - bh - 10.0;
         let y1 = y2 - bh - gap;
 
         for (i, (label, action, active)) in row1.into_iter().enumerate() {
@@ -130,22 +130,71 @@ impl HudLayout {
     }
 }
 
-/// Builds `(minimap_verts, minimap_indices, solid_verts, solid_indices)` for the 2D HUD pass.
+/// Returns the 9 unit IDs of `human_army` matching icon atlas slots `0..9`.
+pub fn human_faction_icon_ids(session: &PlaySession) -> Vec<String> {
+    let Some(f) = session.world.faction(session.human_army) else {
+        return Vec::new();
+    };
+    let tank = f.land_units.first().cloned().unwrap_or_default();
+    let bot = f.land_units.get(1).cloned().unwrap_or_else(|| tank.clone());
+    let arty = f.land_units.get(2).cloned().unwrap_or_else(|| tank.clone());
+    vec![
+        f.factory.clone(),
+        f.extractor.clone(),
+        f.generator.clone(),
+        f.point_defense.clone(),
+        f.radar.clone(),
+        f.engineer.clone(),
+        tank,
+        bot,
+        arty,
+    ]
+}
+
+fn hud_action_icon_slot(action: HudAction) -> Option<usize> {
+    match action {
+        HudAction::BuildFactory => Some(0),
+        HudAction::BuildExtractor => Some(1),
+        HudAction::BuildGenerator => Some(2),
+        HudAction::BuildPointDefense => Some(3),
+        HudAction::BuildRadar => Some(4),
+        HudAction::ProduceEngineer => Some(5),
+        HudAction::ProduceTank => Some(6),
+        HudAction::ProduceBot => Some(7),
+        HudAction::ProduceArtillery => Some(8),
+        _ => None,
+    }
+}
+
+/// Builds `(minimap_v, minimap_i, bg_v, bg_i, icons_v, icons_i, text_v, text_i)` for the 2D HUD pass.
 pub fn build_hud_geometry(
     session: &PlaySession,
     map: &MapContext,
     camera: &OrbitCamera,
     width: u32,
     height: u32,
-) -> (Vec<HudVertex>, Vec<u32>, Vec<HudVertex>, Vec<u32>) {
+) -> (
+    Vec<HudVertex>,
+    Vec<u32>,
+    Vec<HudVertex>,
+    Vec<u32>,
+    Vec<HudVertex>,
+    Vec<u32>,
+    Vec<HudVertex>,
+    Vec<u32>,
+) {
     let layout = HudLayout::compute(session, width, height);
     let w = layout.width;
     let h = layout.height;
 
     let mut mm_v = Vec::new();
     let mut mm_i = Vec::new();
-    let mut v = Vec::with_capacity(4096);
-    let mut i = Vec::with_capacity(6144);
+    let mut v = Vec::with_capacity(2048);
+    let mut i = Vec::with_capacity(3072);
+    let mut ic_v = Vec::with_capacity(64);
+    let mut ic_i = Vec::with_capacity(96);
+    let mut fg_v = Vec::with_capacity(4096);
+    let mut fg_i = Vec::with_capacity(6144);
 
     // 1. Minimap textured backdrop quad
     let [mx, my, mw, mh] = layout.minimap;
@@ -168,7 +217,7 @@ pub fn build_hud_geometry(
             a.mass_cap / SCALE,
             a.income_mass as f64 * TICK_HZ as f64 / SCALE as f64
         );
-        draw_text(&mut v, &mut i, 14.0, 26.0, 1.6, &m_txt, [0.55, 0.98, 0.65, 1.0], w, h);
+        draw_text(&mut fg_v, &mut fg_i, 14.0, 26.0, 1.6, &m_txt, [0.55, 0.98, 0.65, 1.0], w, h);
 
         // Energy gauge
         push_rect(&mut v, &mut i, 214.0, 10.0, 180.0, 11.0, [0.12, 0.15, 0.18, 0.95], w, h);
@@ -179,7 +228,7 @@ pub fn build_hud_geometry(
             a.energy_cap / SCALE,
             a.income_energy as f64 * TICK_HZ as f64 / SCALE as f64
         );
-        draw_text(&mut v, &mut i, 214.0, 26.0, 1.6, &e_txt, [1.0, 0.90, 0.42, 1.0], w, h);
+        draw_text(&mut fg_v, &mut fg_i, 214.0, 26.0, 1.6, &e_txt, [1.0, 0.90, 0.42, 1.0], w, h);
     }
 
     let secs = session.world.tick() / TICK_HZ;
@@ -201,7 +250,7 @@ pub fn build_hud_geometry(
         n_units,
         session.selected.len()
     );
-    draw_text(&mut v, &mut i, 420.0, 16.0, 1.9, &mid_txt, [0.92, 0.95, 1.0, 1.0], w, h);
+    draw_text(&mut fg_v, &mut fg_i, 420.0, 16.0, 1.9, &mid_txt, [0.92, 0.95, 1.0, 1.0], w, h);
 
     if let Some(res) = session.world.result() {
         let banner = match res {
@@ -210,20 +259,22 @@ pub fn build_hud_geometry(
             GameResult::Draw => "DRAW",
         };
         push_rect(&mut v, &mut i, w * 0.5 - 120.0, 56.0, 240.0, 34.0, [0.06, 0.08, 0.12, 0.90], w, h);
-        draw_text(&mut v, &mut i, w * 0.5 - 64.0, 65.0, 2.5, banner, [1.0, 0.85, 0.20, 1.0], w, h);
+        draw_text(&mut fg_v, &mut fg_i, w * 0.5 - 64.0, 65.0, 2.5, banner, [1.0, 0.85, 0.20, 1.0], w, h);
     } else if !session.status_banner.is_empty() {
         let trunc: String = session.status_banner.chars().take(48).collect();
-        draw_text(&mut v, &mut i, 420.0, 32.0, 1.4, &trunc, [0.72, 0.82, 0.95, 0.95], w, h);
+        draw_text(&mut fg_v, &mut fg_i, 420.0, 32.0, 1.4, &trunc, [0.72, 0.82, 0.95, 0.95], w, h);
     }
 
-    // 3. Bottom-left Command / Build / Production Palette
-    let bar_w = 7.0 * (74.0 + 6.0) + 12.0;
-    push_rect(&mut v, &mut i, 6.0, h - 78.0, bar_w, 72.0, [0.05, 0.07, 0.11, 0.78], w, h);
+    // 3. Bottom-left Command / Build / Production Palette (with FA unit icons + hotkeys)
+    let bar_w = 7.0 * (66.0 + 6.0) + 12.0;
+    let bar_h = 2.0 * 54.0 + 6.0 + 14.0;
+    push_rect(&mut v, &mut i, 6.0, h - bar_h - 4.0, bar_w, bar_h, [0.05, 0.07, 0.11, 0.80], w, h);
+    const ICON_SLOTS: f32 = 9.0;
     for btn in &layout.buttons {
         let bg = if btn.active {
             [0.18, 0.48, 0.78, 0.95]
         } else {
-            [0.11, 0.15, 0.22, 0.90]
+            [0.11, 0.15, 0.22, 0.92]
         };
         let border = if btn.active {
             [0.45, 0.92, 1.0, 1.0]
@@ -231,19 +282,37 @@ pub fn build_hud_geometry(
             [0.26, 0.34, 0.46, 0.95]
         };
         push_rect(&mut v, &mut i, btn.x, btn.y, btn.w, btn.h, bg, w, h);
-        push_rect_outline(&mut v, &mut i, btn.x, btn.y, btn.w, btn.h, 1.5, border, w, h);
-        draw_text(&mut v, &mut i, btn.x + 6.0, btn.y + 9.0, 1.55, btn.label, [0.94, 0.97, 1.0, 1.0], w, h);
+        push_rect_outline(&mut fg_v, &mut fg_i, btn.x, btn.y, btn.w, btn.h, 1.5, border, w, h);
+
+        if let Some(slot) = hud_action_icon_slot(btn.action) {
+            let icon_sz = 32.0;
+            let ix = btn.x + (btn.w - icon_sz) * 0.5;
+            let iy = btn.y + 4.0;
+            let u0 = (slot as f32 + 0.03) / ICON_SLOTS;
+            let u1 = (slot as f32 + 0.97) / ICON_SLOTS;
+            let base = ic_v.len() as u32;
+            ic_v.extend_from_slice(&[
+                HudVertex { pos: to_ndc(ix, iy, w, h), uv: [u0, 0.0], color: [1.0, 1.0, 1.0, 0.98] },
+                HudVertex { pos: to_ndc(ix + icon_sz, iy, w, h), uv: [u1, 0.0], color: [1.0, 1.0, 1.0, 0.98] },
+                HudVertex { pos: to_ndc(ix + icon_sz, iy + icon_sz, w, h), uv: [u1, 1.0], color: [1.0, 1.0, 1.0, 0.98] },
+                HudVertex { pos: to_ndc(ix, iy + icon_sz, w, h), uv: [u0, 1.0], color: [1.0, 1.0, 1.0, 0.98] },
+            ]);
+            ic_i.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+            draw_text(&mut fg_v, &mut fg_i, btn.x + 5.0, btn.y + 39.0, 1.35, btn.label, [0.94, 0.97, 1.0, 1.0], w, h);
+        } else {
+            draw_text(&mut fg_v, &mut fg_i, btn.x + 6.0, btn.y + 22.0, 1.45, btn.label, [0.94, 0.97, 1.0, 1.0], w, h);
+        }
     }
 
     // 4. Minimap border + live unit dots + camera viewport target
-    push_rect_outline(&mut v, &mut i, mx - 2.0, my - 2.0, mw + 4.0, mh + 4.0, 2.0, [0.30, 0.44, 0.64, 0.95], w, h);
+    push_rect_outline(&mut fg_v, &mut fg_i, mx - 2.0, my - 2.0, mw + 4.0, mh + 4.0, 2.0, [0.30, 0.44, 0.64, 0.95], w, h);
     let map_w = (map.size.0 as f32 / SCALE as f32).max(1.0);
     let map_h = (map.size.1 as f32 / SCALE as f32).max(1.0);
 
     for &(mpx, mpz) in session.world.mass_points() {
         let ux = mx + ((mpx as f32 / SCALE as f32) / map_w) * mw;
         let uy = my + ((mpz as f32 / SCALE as f32) / map_h) * mh;
-        push_rect(&mut v, &mut i, ux - 1.5, uy - 1.5, 3.0, 3.0, [0.22, 0.90, 0.42, 0.75], w, h);
+        push_rect(&mut fg_v, &mut fg_i, ux - 1.5, uy - 1.5, 3.0, 3.0, [0.22, 0.90, 0.42, 0.75], w, h);
     }
     for u in session.world.units() {
         if session.fog_of_war && u.army != session.human_army {
@@ -252,7 +321,7 @@ pub fn build_hud_geometry(
                 IntelVisibility::RadarBlip => {
                     let ux = mx + ((u.pos.x as f32 / SCALE as f32) / map_w) * mw;
                     let uy = my + ((u.pos.y as f32 / SCALE as f32) / map_h) * mh;
-                    push_rect(&mut v, &mut i, ux - 2.0, uy - 2.0, 4.0, 4.0, [0.96, 0.30, 0.25, 0.85], w, h);
+                    push_rect(&mut fg_v, &mut fg_i, ux - 2.0, uy - 2.0, 4.0, 4.0, [0.96, 0.30, 0.25, 0.85], w, h);
                     continue;
                 }
                 IntelVisibility::Visible => {}
@@ -263,8 +332,8 @@ pub fn build_hud_geometry(
         let dot = if u.role == Role::Commander { 5.0 } else if u.role.is_structure() { 3.5 } else { 2.5 };
         let rgb = army_rgb(&session.world, u.army);
         push_rect(
-            &mut v,
-            &mut i,
+            &mut fg_v,
+            &mut fg_i,
             ux - dot * 0.5,
             uy - dot * 0.5,
             dot,
@@ -280,8 +349,8 @@ pub fn build_hud_geometry(
     let rw = (camera.distance / map_w * mw * 0.45).clamp(10.0, mw * 0.6);
     let rh = rw / camera.aspect.max(0.5);
     push_rect_outline(
-        &mut v,
-        &mut i,
+        &mut fg_v,
+        &mut fg_i,
         (cx - rw * 0.5).clamp(mx, mx + mw - 4.0),
         (cy - rh * 0.5).clamp(my, my + mh - 4.0),
         rw.min(mw),
@@ -292,7 +361,7 @@ pub fn build_hud_geometry(
         h,
     );
 
-    (mm_v, mm_i, v, i)
+    (mm_v, mm_i, v, i, ic_v, ic_i, fg_v, fg_i)
 }
 
 #[inline]
@@ -467,6 +536,7 @@ mod tests {
                 background_path: String::new(),
                 sky_cubemap_path: String::new(),
                 cubemaps: vec![],
+                lighting: crate::scmap::ScMapLighting::default(),
                 water: WaterInfo {
                     has_water: true,
                     elevation: 10.0,
@@ -501,10 +571,14 @@ mod tests {
             .expect("minimap hit");
         assert!((mm.0 - 0.25).abs() < 1e-4 && (mm.1 - 0.75).abs() < 1e-4);
 
-        let (mv, mi, sv, si) = build_hud_geometry(&sess, &map, &cam, 1280, 800);
+        let (mv, mi, bg_v, bg_i, ic_v, ic_i, fg_v, fg_i) =
+            build_hud_geometry(&sess, &map, &cam, 1280, 800);
         assert_eq!(mv.len(), 4);
         assert_eq!(mi.len(), 6);
-        assert!(!sv.is_empty() && !si.is_empty());
-        assert!(sv.iter().all(|vx| vx.pos.iter().all(|c| c.is_finite())));
+        assert!(!bg_v.is_empty() && !bg_i.is_empty());
+        assert_eq!(ic_v.len(), 9 * 4);
+        assert_eq!(ic_i.len(), 9 * 6);
+        assert!(!fg_v.is_empty() && !fg_i.is_empty());
+        assert!(fg_v.iter().all(|vx| vx.pos.iter().all(|c| c.is_finite())));
     }
 }

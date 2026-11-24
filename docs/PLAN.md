@@ -77,12 +77,15 @@ Game dir (default, override with `FA_PATH`):
 - Exit: start to finish on `SCMP_001` with built units fighting, deterministic
   replay hash, and GPU battle snapshot rendered. Done.
 
-### Phase 7 — Textured instancing, terrain strata & HUD (done)
-- `.scmap` terrain strata & blend-map parsing (`src/scmap.rs`) + parallel
-  multi-stratum terrain albedo baking (`src/scene.rs`).
-- Hardware-instanced `.scm` rendering with `_Albedo` + `_SpecTeam` team-color
-  alpha masks, strategic zoom icons, clickable minimap, resource bars, and 14-button
-  2D bitmap-font HUD (`src/viewer.rs`, `src/hud.rs`).
+### Phase 7 — Textured instancing, terrain splatting, water, skybox, props & HUD (done)
+- `.scmap` v2.60 full lighting, water parameters, sky cubemap, normal-map &
+  prop placement parsing (`src/scmap.rs`) + parallel asset loaders & 64×64 FA
+  unit icon atlas (`src/scene.rs`, `src/dds_decode.rs`).
+- GPU multi-stratum terrain splatting (10 albedo + 9 tangent-normal `2d_array`),
+  skybox cubemap, transparent depth-faded rippled water with sky reflections,
+  `2048×2048` PCF shadow map, alpha-cutout instanced `.scmap` trees/rocks/logs,
+  `_LOD0` units + charred `.scm` wrecks, clickable minimap, and real FA icon HUD
+  (`src/viewer.rs`, `src/hud.rs`, `src/play.rs`).
 
 ### Phase 8 — Deeper FA gameplay mechanics (done)
 - T1 Engineers (`build`, `repair`, `assist`, `reclaim` wrecks), Point Defense,
@@ -98,11 +101,13 @@ Game dir (default, override with `FA_PATH`):
   canonical `ArmyId` command ordering and per-turn hash desync verification.
 
 ### Phase 10 — Persistent `WorkerPool`, `SpatialGrid` & 2,000+ unit scaling (done)
-- Zero-`unsafe` persistent `WorkerPool` (`src/jobs.rs`) driving batched A* routing in
-  `Skirmish` with exact `1t == Nt` parity and parallel `render_prep` (`src/pathfinding.rs`,
-  `src/render_prep.rs`), plus deterministic integer `SpatialGrid` (`src/spatial.rs`).
-- Verified 2,050-unit scale benchmark via `farust bench-scale SCMP_001 --units 2048 --ticks 200`
-  with exact `1t == 20t` state hashes.
+- Zero-`unsafe` persistent `WorkerPool` (`src/jobs.rs`) driving batched A* routing and
+  parallel `step_separation` in `Skirmish` with exact `1t == Nt` parity and parallel
+  `render_prep` (`src/pathfinding.rs`, `src/render_prep.rs`), plus tight 6m
+  zero-alloc `SpatialGrid` (`src/spatial.rs`) and dense `UnitSpatialSnap`.
+- Verified 2,050-unit active combat benchmark via `farust bench-scale SCMP_001 --units 2048 --ticks 200`:
+  210 ticks/s (195→210 ticks/s), 6,654 paths, 14,094 shots, 541 kills, exact `1t == 20t`
+  hash `f1eebe99299d22c7`. Done.
 
 ## Risks / non-goals
 

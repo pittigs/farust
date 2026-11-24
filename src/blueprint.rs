@@ -248,6 +248,15 @@ impl<'a> Parser<'a> {
 
 /// Parse a whole blueprint file. Root must be `UnitBlueprint { ... }`.
 pub fn parse_blueprint(text: &str) -> Result<Value, String> {
+    parse_blueprint_kind(text, "UnitBlueprint")
+}
+
+/// Parse a prop blueprint file. Root must be `PropBlueprint { ... }`.
+pub fn parse_prop_blueprint(text: &str) -> Result<Value, String> {
+    parse_blueprint_kind(text, "PropBlueprint")
+}
+
+fn parse_blueprint_kind(text: &str, expected: &str) -> Result<Value, String> {
     let mut p = Parser {
         bytes: text.as_bytes(),
         pos: 0,
@@ -258,8 +267,8 @@ pub fn parse_blueprint(text: &str) -> Result<Value, String> {
         ..
     } = &value
     {
-        if name != "UnitBlueprint" {
-            return Err(format!("root constructor is '{name}', expected 'UnitBlueprint'"));
+        if name != expected {
+            return Err(format!("root constructor is '{name}', expected '{expected}'"));
         }
     }
     Ok(value)

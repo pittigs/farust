@@ -1,17 +1,21 @@
 //! Scene builders turning Forged Alliance unit meshes/textures and `.scmap` terrains
 //! into GPU-ready vertex/index/texture buffers.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use bytemuck::{Pod, Zeroable};
 
 use crate::blueprint::{self, Value};
 use crate::camera::OrbitCamera;
-use crate::dds_decode::{RgbaImage, decode_dds_rgba8};
+use crate::dds_decode::{
+    RgbaImage, decode_dds_cubemap_rgba8, decode_dds_rgba8, resize_rgba_bilinear,
+};
 use crate::jobs;
 use crate::scd;
 use crate::scenario;
 use crate::scm::ScmMesh;
-use crate::scmap::ScMap;
+use crate::scmap::{ScMap, ScMapLighting, ScMapProp};
+use crate::viewer::GpuUnitInstance;
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Pod, Zeroable)]
@@ -21,6 +25,49 @@ pub struct GpuVertex {
     pub uv: [f32; 2],
     /// rgb = vertex color multiplier, a = specular intensity (0.0..=1.0).
     pub color: [f32; 4],
+}
+
+/// Multi-stratum terrain textures & blend maps for per-pixel GPU terrain splatting.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct TerrainSplatData {
+    pub tm0: RgbaImage,
+    pub tm1: RgbaImage,
+    pub strata_albedo: Vec<RgbaImage>,
+    pub strata_normal: Vec<RgbaImage>,
+    pub albedo_scales: [f32; 10],
+    pub albedo_active: [u32; 10],
+    pub normal_scales: [f32; 9],
+    pub normal_active: [u32; 9],
+    pub lighting: ScMapLighting,
+    pub map_size: [f32; 2],
+    pub water_elevation: f32,
+    pub water_deep: f32,
+    pub water_abyss: f32,
+}
+
+/// Depth-encoded water surface mesh, wave normals, and water ramp for GPU water shading.
+#[derive(Debug, Clone)]
+pub struct WaterGpuData {
+    pub vertices: Vec<GpuVertex>,
+    pub indices: Vec<u32>,
+    pub waves_normal: RgbaImage,
+    pub water_ramp: RgbaImage,
+    pub fresnel_bias: f32,
+    pub fresnel_power: f32,
+    pub surface_color: [f32; 3],
+}
+
+/// Instanced environment prop batch (pine trees, boulders, logs) parsed from `.scmap`.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct PropMeshBatch {
+    pub label: String,
+    pub vertices: Vec<GpuVertex>,
+    pub indices: Vec<u32>,
+    pub albedo: Option<RgbaImage>,
+    pub alpha_cutout: bool,
+    pub instances: Vec<GpuUnitInstance>,
 }
 
 #[derive(Debug, Clone)]
@@ -35,6 +82,10 @@ pub struct LoadedScene {
     pub albedo: RgbaImage,
     pub initial_camera: OrbitCamera,
     pub clear_color: [f64; 4],
+    pub terrain_splat: Option<TerrainSplatData>,
+    pub water: Option<WaterGpuData>,
+    pub sky_cube: Option<[RgbaImage; 6]>,
+    pub prop_batches: Vec<PropMeshBatch>,
 }
 
 pub fn load_unit_scene(game_dir: &Path, unit_id: &str, aspect: f32) -> Result<LoadedScene, String> {
@@ -254,6 +305,10 @@ pub fn load_unit_scene(game_dir: &Path, unit_id: &str, aspect: f32) -> Result<Lo
         albedo,
         initial_camera,
         clear_color: [0.055, 0.070, 0.095, 1.0],
+        terrain_splat: None,
+        water: None,
+        sky_cube: None,
+        prop_batches: Vec::new(),
     })
 }
 
@@ -271,10 +326,19 @@ pub fn load_map_scene(game_dir: &Path, map_name: &str, aspect: f32) -> Result<Lo
         .ok_or_else(|| format!("Map '{}' has no .scmap file", map_files.id))?;
     let scmap = ScMap::parse_file(scmap_path)?;
 
-    let baked = bake_terrain_albedo(game_dir, &scmap, 2048);
-    let textured = baked.is_some();
+    let terrain_splat = load_terrain_splat_data(game_dir, &scmap);
+    let water = load_water_gpu_data(game_dir, &scmap);
+    let sky_cube = load_sky_cubemap(game_dir, &scmap);
+    let prop_batches = load_map_props(game_dir, &scmap);
+
+    let baked = if terrain_splat.is_some() {
+        None
+    } else {
+        bake_terrain_albedo(game_dir, &scmap, 1024)
+    };
+    let textured = terrain_splat.is_some() || baked.is_some();
     let (vertices, indices, overlay_vertices, overlay_indices) =
-        build_terrain_and_overlay_meshes(&scmap, markers.as_ref(), textured);
+        build_terrain_and_overlay_meshes_opts(&scmap, markers.as_ref(), textured, water.is_none());
 
     let albedo = baked.unwrap_or_else(|| RgbaImage {
         width: 1,
@@ -295,6 +359,7 @@ pub fn load_map_scene(game_dir: &Path, map_name: &str, aspect: f32) -> Result<Lo
     } else {
         format!("{} ({})", meta.name, meta.id)
     };
+    let fc = scmap.lighting.fog_color;
 
     Ok(LoadedScene {
         title,
@@ -304,7 +369,16 @@ pub fn load_map_scene(game_dir: &Path, map_name: &str, aspect: f32) -> Result<Lo
         overlay_indices,
         albedo,
         initial_camera,
-        clear_color: [0.42, 0.58, 0.78, 1.0],
+        clear_color: [
+            f64::from(fc[0].clamp(0.05, 1.0)),
+            f64::from(fc[1].clamp(0.05, 1.0)),
+            f64::from(fc[2].clamp(0.05, 1.0)),
+            1.0,
+        ],
+        terrain_splat,
+        water,
+        sky_cube,
+        prop_batches,
     })
 }
 
@@ -327,6 +401,16 @@ pub fn build_terrain_and_overlay_meshes(
     scmap: &ScMap,
     markers: Option<&scenario::SaveMarkers>,
     neutral_terrain_tint: bool,
+) -> (Vec<GpuVertex>, Vec<u32>, Vec<GpuVertex>, Vec<u32>) {
+    build_terrain_and_overlay_meshes_opts(scmap, markers, neutral_terrain_tint, true)
+}
+
+/// Variant allowing callers using [`WaterGpuData`] to omit the legacy flat opaque water quad.
+pub fn build_terrain_and_overlay_meshes_opts(
+    scmap: &ScMap,
+    markers: Option<&scenario::SaveMarkers>,
+    neutral_terrain_tint: bool,
+    include_water_quad: bool,
 ) -> (Vec<GpuVertex>, Vec<u32>, Vec<GpuVertex>, Vec<u32>) {
     let hm_w = scmap.heightmap_width;
     let hm_h = scmap.heightmap_height;
@@ -431,7 +515,7 @@ pub fn build_terrain_and_overlay_meshes(
         }
     }
 
-    if scmap.water.has_water {
+    if include_water_quad && scmap.water.has_water {
         let w = if scmap.map_width > 0.0 {
             scmap.map_width
         } else {
@@ -713,6 +797,471 @@ pub fn load_unit_albedo_and_team_mask(game_dir: &Path, unit_id: &str) -> Option<
         }
     }
     Some(albedo)
+}
+
+fn normalize_tangent_normal_image(mut img: RgbaImage) -> RgbaImage {
+    let px_count = img.pixels.len() / 4;
+    if px_count == 0 {
+        return RgbaImage {
+            width: 4,
+            height: 4,
+            pixels: [128u8, 128, 255, 255].repeat(16),
+        };
+    }
+    let sample_step = (px_count / 64).max(1);
+    let mut sum_b: u64 = 0;
+    let mut samples: u64 = 0;
+    for i in (0..px_count).step_by(sample_step) {
+        sum_b += u64::from(img.pixels[i * 4 + 2]);
+        samples += 1;
+    }
+    let avg_b = sum_b / samples.max(1);
+    if avg_b < 80 {
+        // FA DXT5/DXT3 normal map convention stores tangent X in Alpha and Y in Green.
+        for px in img.pixels.chunks_exact_mut(4) {
+            let nx = (f32::from(px[3]) / 255.0) * 2.0 - 1.0;
+            let ny = (f32::from(px[1]) / 255.0) * 2.0 - 1.0;
+            let nz = (1.0 - nx * nx - ny * ny).max(0.0).sqrt();
+            px[0] = ((nx * 0.5 + 0.5) * 255.0).round().clamp(0.0, 255.0) as u8;
+            px[1] = ((ny * 0.5 + 0.5) * 255.0).round().clamp(0.0, 255.0) as u8;
+            px[2] = ((nz * 0.5 + 0.5) * 255.0).round().clamp(0.0, 255.0) as u8;
+            px[3] = 255;
+        }
+    } else {
+        for px in img.pixels.chunks_exact_mut(4) {
+            px[3] = 255;
+        }
+    }
+    img
+}
+
+/// Loads all 10 albedo strata, 9 normal strata, and blend maps (`texturemap0`/`texturemap1`)
+/// for hardware GPU splatting.
+pub fn load_terrain_splat_data(game_dir: &Path, scmap: &ScMap) -> Option<TerrainSplatData> {
+    let tt = scmap.terrain_textures.as_ref()?;
+    let tm0 = decode_dds_rgba8(&tt.texturemap0_dds).ok()?;
+    let tm1 = (!tt.texturemap1_dds.is_empty())
+        .then(|| decode_dds_rgba8(&tt.texturemap1_dds).ok())
+        .flatten()
+        .unwrap_or_else(|| RgbaImage {
+            width: 1,
+            height: 1,
+            pixels: vec![0, 0, 0, 0],
+        });
+
+    let gamedata = scd::gamedata_dir(game_dir);
+    let mut raw_paths = Vec::with_capacity(19);
+    for s in tt.strata_albedo.iter().take(10) {
+        let p = s.path.trim().trim_start_matches('/').replace('\\', "/");
+        raw_paths.push((false, p));
+    }
+    while raw_paths.len() < 10 {
+        raw_paths.push((false, String::new()));
+    }
+    for s in tt.strata_normal.iter().take(9) {
+        let p = s.path.trim().trim_start_matches('/').replace('\\', "/");
+        raw_paths.push((true, p));
+    }
+    while raw_paths.len() < 19 {
+        raw_paths.push((true, String::new()));
+    }
+
+    let threads = jobs::default_thread_count();
+    let decoded: Vec<Option<RgbaImage>> = jobs::par_map_ordered(&raw_paths, threads, |_, (is_n, p)| {
+        if p.is_empty() {
+            return None;
+        }
+        let bytes = find_asset_in_scds(&gamedata, &["env.scd", "textures.scd"], std::slice::from_ref(p))?;
+        let img = decode_dds_rgba8(&bytes).ok()?;
+        if *is_n {
+            Some(resize_rgba_bilinear(&normalize_tangent_normal_image(img), 256, 256))
+        } else {
+            Some(resize_rgba_bilinear(&img, 512, 512))
+        }
+    });
+
+    if decoded[0].is_none() {
+        return None;
+    }
+
+    let neutral_albedo = RgbaImage {
+        width: 512,
+        height: 512,
+        pixels: [128u8, 128, 128, 255].repeat(512 * 512),
+    };
+    let neutral_normal = RgbaImage {
+        width: 256,
+        height: 256,
+        pixels: [128u8, 128, 255, 255].repeat(256 * 256),
+    };
+
+    let mut strata_albedo = Vec::with_capacity(10);
+    let mut albedo_scales = [0.0_f32; 10];
+    let mut albedo_active = [0u32; 10];
+    for i in 0..10 {
+        if let Some(ref img) = decoded[i] {
+            strata_albedo.push(img.clone());
+            let raw = tt.strata_albedo.get(i).map(|s| s.scale).unwrap_or(4.0);
+            albedo_scales[i] = if raw.is_finite() && raw > 0.05 { raw } else { 4.0 };
+            albedo_active[i] = 1;
+        } else {
+            strata_albedo.push(neutral_albedo.clone());
+        }
+    }
+
+    let mut strata_normal = Vec::with_capacity(9);
+    let mut normal_scales = [0.0_f32; 9];
+    let mut normal_active = [0u32; 9];
+    for i in 0..9 {
+        if let Some(ref img) = decoded[10 + i] {
+            strata_normal.push(img.clone());
+            let raw = tt.strata_normal.get(i).map(|s| s.scale).unwrap_or(4.0);
+            normal_scales[i] = if raw.is_finite() && raw > 0.05 { raw } else { 4.0 };
+            normal_active[i] = 1;
+        } else {
+            strata_normal.push(neutral_normal.clone());
+        }
+    }
+
+    let mw = if scmap.map_width > 0.0 {
+        scmap.map_width
+    } else {
+        scmap.heightmap_width.max(1) as f32
+    };
+    let mh = if scmap.map_height > 0.0 {
+        scmap.map_height
+    } else {
+        scmap.heightmap_height.max(1) as f32
+    };
+
+    Some(TerrainSplatData {
+        tm0,
+        tm1,
+        strata_albedo,
+        strata_normal,
+        albedo_scales,
+        albedo_active,
+        normal_scales,
+        normal_active,
+        lighting: scmap.lighting.clone(),
+        map_size: [mw, mh],
+        water_elevation: if scmap.water.has_water {
+            scmap.water.elevation
+        } else {
+            -1000.0
+        },
+        water_deep: scmap.water.elevation_deep,
+        water_abyss: scmap.water.elevation_abyss,
+    })
+}
+
+/// Builds a depth-encoded water mesh plus real wave normal & water color ramp textures from `.scmap`.
+pub fn load_water_gpu_data(game_dir: &Path, scmap: &ScMap) -> Option<WaterGpuData> {
+    if !scmap.water.has_water || scmap.heightmap_width == 0 || scmap.heightmap_height == 0 {
+        return None;
+    }
+    let mw = if scmap.map_width > 0.0 {
+        scmap.map_width
+    } else {
+        scmap.heightmap_width as f32
+    };
+    let mh = if scmap.map_height > 0.0 {
+        scmap.map_height
+    } else {
+        scmap.heightmap_height as f32
+    };
+    let grid_n = 128u32;
+    let nx = grid_n + 1;
+    let elev = scmap.water.elevation;
+
+    let mut vertices = Vec::with_capacity((nx * nx) as usize);
+    let mut depths = Vec::with_capacity((nx * nx) as usize);
+    for iz in 0..nx {
+        let v = iz as f32 / grid_n as f32;
+        let wz = v * mh;
+        let hz = (v * scmap.heightmap_height as f32)
+            .round()
+            .clamp(0.0, scmap.heightmap_height as f32) as u32;
+        for ix in 0..nx {
+            let u = ix as f32 / grid_n as f32;
+            let wx = u * mw;
+            let hx = (u * scmap.heightmap_width as f32)
+                .round()
+                .clamp(0.0, scmap.heightmap_width as f32) as u32;
+            let h = scmap.height_at(hx, hz).unwrap_or(elev);
+            let depth = (elev - h).max(0.0);
+            depths.push(elev - h);
+            vertices.push(GpuVertex {
+                position: [wx, elev, wz],
+                normal: [0.0, 1.0, 0.0],
+                uv: [u, v],
+                color: [depth, 0.0, 0.0, 1.0],
+            });
+        }
+    }
+    let mut indices = Vec::with_capacity((grid_n * grid_n * 6) as usize);
+    for iz in 0..grid_n {
+        for ix in 0..grid_n {
+            let c00 = (iz * nx + ix) as usize;
+            let c10 = c00 + 1;
+            let c01 = c00 + nx as usize;
+            let c11 = c01 + 1;
+            if depths[c00] > -2.0
+                || depths[c10] > -2.0
+                || depths[c01] > -2.0
+                || depths[c11] > -2.0
+            {
+                indices.extend_from_slice(&[
+                    c00 as u32, c01 as u32, c10 as u32, c10 as u32, c01 as u32, c11 as u32,
+                ]);
+            }
+        }
+    }
+
+    let gamedata = scd::gamedata_dir(game_dir);
+    let wp = scmap.terrain_textures.as_ref().map(|t| &t.water_params);
+    let wave_candidates: Vec<String> = wp
+        .and_then(|w| w.wave_textures.first())
+        .map(|s| vec![s.trim().trim_start_matches('/').replace('\\', "/"), "textures/engine/waves.dds".to_string()])
+        .unwrap_or_else(|| vec!["textures/engine/waves.dds".to_string()]);
+    let waves_normal = decode_first_dds(&gamedata, &["textures.scd", "env.scd"], &wave_candidates)
+        .map(normalize_tangent_normal_image)
+        .unwrap_or_else(|| RgbaImage {
+            width: 4,
+            height: 4,
+            pixels: [128u8, 128, 255, 255].repeat(16),
+        });
+
+    let ramp_candidates: Vec<String> = wp
+        .map(|w| {
+            vec![
+                w.water_ramp.trim().trim_start_matches('/').replace('\\', "/"),
+                "textures/engine/waterramp_eg.dds".to_string(),
+            ]
+        })
+        .unwrap_or_else(|| vec!["textures/engine/waterramp_eg.dds".to_string()]);
+    let water_ramp = decode_first_dds(&gamedata, &["textures.scd", "env.scd"], &ramp_candidates)
+        .unwrap_or_else(|| RgbaImage {
+            width: 4,
+            height: 1,
+            pixels: vec![
+                62, 132, 148, 255, 36, 98, 128, 255, 18, 62, 98, 255, 10, 36, 68, 255,
+            ],
+        });
+
+    Some(WaterGpuData {
+        vertices,
+        indices,
+        waves_normal,
+        water_ramp,
+        fresnel_bias: wp.map(|w| w.fresnel_bias).unwrap_or(0.06),
+        fresnel_power: wp.map(|w| w.fresnel_power).unwrap_or(1.8),
+        surface_color: wp.map(|w| w.surface_color).unwrap_or([0.06, 0.09, 0.12]),
+    })
+}
+
+/// Decodes the map's 6-face sky cubemap (`sky_cubemap_path` or `<default>` cubemap) from `textures.scd`.
+pub fn load_sky_cubemap(game_dir: &Path, scmap: &ScMap) -> Option<[RgbaImage; 6]> {
+    let gamedata = scd::gamedata_dir(game_dir);
+    let mut candidates = Vec::new();
+    let sky = scmap.sky_cubemap_path.trim().trim_start_matches('/').replace('\\', "/");
+    if !sky.is_empty() {
+        candidates.push(sky);
+    }
+    for (_, p) in &scmap.cubemaps {
+        let trimmed = p.trim().trim_start_matches('/').replace('\\', "/");
+        if !trimmed.is_empty() {
+            candidates.push(trimmed);
+        }
+    }
+    let bytes = find_asset_in_scds(&gamedata, &["textures.scd", "env.scd"], &candidates)?;
+    decode_dds_cubemap_rgba8(&bytes).ok()
+}
+
+fn resolve_rel_vfs_path(base_dir: &str, raw: &str) -> String {
+    let norm = raw.trim().replace('\\', "/");
+    if norm.is_empty() {
+        return String::new();
+    }
+    let mut parts: Vec<String> = if norm.starts_with('/') {
+        Vec::new()
+    } else {
+        base_dir
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned)
+            .collect()
+    };
+    for seg in norm.trim_start_matches('/').split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            other => parts.push(other.to_string()),
+        }
+    }
+    parts.join("/")
+}
+
+/// Loads unique `.scmap` prop meshes & textures from `env.scd` and builds hardware-instanced batches.
+pub fn load_map_props(game_dir: &Path, scmap: &ScMap) -> Vec<PropMeshBatch> {
+    let Some(ref tt) = scmap.terrain_textures else {
+        return Vec::new();
+    };
+    if tt.props.is_empty() {
+        return Vec::new();
+    }
+    let mut grouped: BTreeMap<String, (String, Vec<&ScMapProp>)> = BTreeMap::new();
+    for p in &tt.props {
+        let clean = p.blueprint_path.trim().trim_start_matches('/').replace('\\', "/");
+        if clean.is_empty() {
+            continue;
+        }
+        grouped
+            .entry(clean.to_ascii_lowercase())
+            .or_insert_with(|| (clean, Vec::new()))
+            .1
+            .push(p);
+    }
+
+    let entries: Vec<(String, Vec<&ScMapProp>)> = grouped.into_values().collect();
+    let gamedata = scd::gamedata_dir(game_dir);
+    let env_scd = gamedata.join("env.scd");
+    let threads = jobs::default_thread_count();
+
+    let built = jobs::par_map_ordered(&entries, threads, |_, (bp_rel, refs)| -> Option<PropMeshBatch> {
+        let (actual_bp, bp_bytes) = scd::read_scd_file_ci(&env_scd, bp_rel).ok()?;
+        let bp_text = String::from_utf8_lossy(&bp_bytes);
+        let root = blueprint::parse_prop_blueprint(&bp_text).ok()?;
+
+        let display = root.get("Display");
+        let uniform_scale = display
+            .and_then(|d| d.get_f64("UniformScale"))
+            .unwrap_or(1.0) as f32;
+        let lod0 = display
+            .and_then(|d| d.get("Mesh"))
+            .and_then(|m| m.get("LODs"))
+            .and_then(|l| l.table_list().into_iter().next());
+
+        let bp_norm = actual_bp.replace('\\', "/");
+        let bp_dir = bp_norm.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+        let base_stem = strip_suffix_ci(&bp_norm, "_prop.bp")
+            .or_else(|| strip_suffix_ci(&bp_norm, ".bp"))
+            .unwrap_or(&bp_norm);
+
+        let mut mesh_cands = Vec::new();
+        if let Some(mname) = lod0.and_then(|l| l.get_str("MeshName")) {
+            let p = resolve_rel_vfs_path(bp_dir, mname);
+            if !p.is_empty() {
+                mesh_cands.push(p);
+            }
+        }
+        mesh_cands.push(format!("{base_stem}_lod0.scm"));
+        mesh_cands.push(format!("{base_stem}_lod1.scm"));
+
+        let scm_bytes = find_asset_in_scds(&gamedata, &["env.scd"], &mesh_cands)?;
+        let mesh = ScmMesh::parse(&scm_bytes).ok()?;
+        if mesh.vertices.is_empty() || mesh.indices.is_empty() {
+            return None;
+        }
+
+        let mut alb_cands = Vec::new();
+        if let Some(aname) = lod0.and_then(|l| l.get_str("AlbedoName")) {
+            let p = resolve_rel_vfs_path(bp_dir, aname);
+            if !p.is_empty() {
+                alb_cands.push(p);
+            }
+        }
+        alb_cands.push(format!("{base_stem}_albedo.dds"));
+        let albedo = decode_first_dds(&gamedata, &["env.scd", "textures.scd"], &alb_cands);
+
+        let shader_name = lod0.and_then(|l| l.get_str("ShaderName")).unwrap_or("");
+        let alpha_cutout = shader_name.to_ascii_lowercase().contains("alpha")
+            || bp_norm.to_ascii_lowercase().contains("tree");
+
+        let vertices: Vec<GpuVertex> = mesh
+            .vertices
+            .iter()
+            .map(|v| GpuVertex {
+                position: [
+                    v.position[0] * uniform_scale,
+                    v.position[1] * uniform_scale,
+                    v.position[2] * uniform_scale,
+                ],
+                normal: normalize_or_up(v.normal),
+                uv: v.uv0,
+                color: [1.0, 1.0, 1.0, 0.2],
+            })
+            .collect();
+        let indices: Vec<u32> = mesh.indices.iter().map(|&i| u32::from(i)).collect();
+
+        let use_tex = if albedo.is_some() { 1.0 } else { 0.0 };
+        let cut = if alpha_cutout { 1.0 } else { 0.0 };
+        let instances = refs
+            .iter()
+            .map(|p| {
+                GpuUnitInstance::from_basis(
+                    p.position,
+                    p.rot_x,
+                    p.rot_y,
+                    p.rot_z,
+                    p.scale,
+                    [0.95, 0.95, 0.95, 0.12],
+                    [use_tex, cut, 0.0, 0.0],
+                )
+            })
+            .collect();
+
+        Some(PropMeshBatch {
+            label: bp_norm,
+            vertices,
+            indices,
+            albedo,
+            alpha_cutout,
+            instances,
+        })
+    });
+
+    built.into_iter().flatten().collect()
+}
+
+/// Loads FA `64x64` HUD unit icons from `textures.scd` into a horizontal `(64*N)x64` atlas.
+pub fn load_hud_icon_atlas(game_dir: &Path, unit_ids: &[&str]) -> Option<RgbaImage> {
+    if unit_ids.is_empty() {
+        return None;
+    }
+    let gamedata = scd::gamedata_dir(game_dir);
+    let cell = 64usize;
+    let total_w = unit_ids.len() * cell;
+    let mut pixels = vec![0u8; total_w * cell * 4];
+    let mut found_any = false;
+
+    for (slot, id) in unit_ids.iter().enumerate() {
+        let up = id.to_ascii_uppercase();
+        let candidates = [
+            format!("textures/ui/common/icons/units/{up}_icon.dds"),
+            format!("textures/ui/common/icons/units/{}_icon.dds", id.to_ascii_lowercase()),
+        ];
+        if let Some(img) = decode_first_dds(&gamedata, &["textures.scd"], &candidates) {
+            let icon = resize_rgba_bilinear(&img, cell as u32, cell as u32);
+            found_any = true;
+            for y in 0..cell {
+                let src_row = &icon.pixels[y * cell * 4..(y + 1) * cell * 4];
+                let dst_start = (y * total_w + slot * cell) * 4;
+                pixels[dst_start..dst_start + cell * 4].copy_from_slice(src_row);
+            }
+        }
+    }
+
+    if !found_any {
+        return None;
+    }
+    Some(RgbaImage {
+        width: total_w as u32,
+        height: cell as u32,
+        pixels,
+    })
 }
 
 fn terrain_vertex_color(

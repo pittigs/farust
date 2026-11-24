@@ -464,8 +464,20 @@ impl Unit {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Wreck {
     pub id: UnitId,
+    pub type_id: String,
     pub pos: Vec2,
     pub mass_left: i64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct UnitSpatialSnap {
+    id: UnitId,
+    army: ArmyId,
+    x: i64,
+    y: i64,
+    radius: i64,
+    speed: i64,
+    is_struct: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -589,7 +601,8 @@ pub struct Skirmish {
     wrecks: BTreeMap<UnitId, Wreck>,
     projectiles: BTreeMap<u32, Projectile>,
     grid: Arc<PathGrid>,
-    spatial: SpatialGrid,
+    spatial: Arc<SpatialGrid>,
+    spatial_snap: Arc<Vec<UnitSpatialSnap>>,
     pool: Option<Arc<WorkerPool>>,
     size: (i64, i64),
     mass_points: Vec<(i64, i64)>,
@@ -637,7 +650,7 @@ impl Skirmish {
             return Err("a skirmish needs 2..=8 armies".into());
         }
         let claims = vec![None; mass_points.len()];
-        let spatial = SpatialGrid::new(size.0, size.1, SPATIAL_CELL_MILLI);
+        let spatial = Arc::new(SpatialGrid::new(size.0, size.1, SPATIAL_CELL_MILLI));
         let mut w = Self {
             tick: 0,
             seed,
@@ -651,6 +664,7 @@ impl Skirmish {
             projectiles: BTreeMap::new(),
             grid: Arc::new(grid),
             spatial,
+            spatial_snap: Arc::new(Vec::new()),
             pool: None,
             size,
             mass_points,
@@ -821,20 +835,24 @@ impl Skirmish {
         army_filter: Option<ArmyId>,
         hostile_to: Option<ArmyId>,
     ) -> Option<UnitId> {
-        let mut cand = Vec::new();
+        let mut best: Option<(i128, UnitId)> = None;
         self.spatial
-            .query_radius_sorted(p.0, p.1, pick_radius + 10 * SCALE, &mut cand);
-        cand.into_iter()
-            .filter_map(|id| self.unit(id))
-            .filter(|u| army_filter.is_none_or(|a| u.army == a))
-            .filter(|u| hostile_to.is_none_or(|a| u.army != a))
-            .filter_map(|u| {
+            .for_each_in_radius(p.0, p.1, pick_radius + 10 * SCALE, |idx| {
+                let u = &self.spatial_snap[idx as usize];
+                if army_filter.is_some_and(|a| u.army != a)
+                    || hostile_to.is_some_and(|a| u.army == a)
+                {
+                    return;
+                }
                 let reach = (u.radius + pick_radius) as i128;
-                let d2 = dist_sq((u.pos.x, u.pos.y), p);
-                (d2 <= reach * reach).then_some((d2, u.id))
-            })
-            .min()
-            .map(|(_, id)| id)
+                let d2 = dist_sq((u.x, u.y), p);
+                if d2 <= reach * reach
+                    && best.is_none_or(|(bd, bid)| d2 < bd || (d2 == bd && u.id < bid))
+                {
+                    best = Some((d2, u.id));
+                }
+            });
+        best.map(|(_, id)| id)
     }
 
     /// Nearest wreck to `p` within `max_dist`.
@@ -1269,12 +1287,26 @@ impl Skirmish {
     }
 
     pub fn rebuild_spatial(&mut self) {
-        self.spatial.rebuild(
-            self.units
-                .values()
-                .filter(|u| u.alive)
-                .map(|u| (u.id, u.pos.x, u.pos.y)),
+        let mut snaps = Vec::with_capacity(self.units.len());
+        for u in self.units.values().filter(|u| u.alive) {
+            snaps.push(UnitSpatialSnap {
+                id: u.id,
+                army: u.army,
+                x: u.pos.x,
+                y: u.pos.y,
+                radius: u.radius,
+                speed: u.speed,
+                is_struct: u.role.is_structure(),
+            });
+        }
+        let spatial = Arc::make_mut(&mut self.spatial);
+        spatial.rebuild(
+            snaps
+                .iter()
+                .enumerate()
+                .map(|(i, s)| (i as u32, s.x, s.y)),
         );
+        self.spatial_snap = Arc::new(snaps);
     }
 
     fn recompute_caps(&mut self) {
@@ -1632,31 +1664,31 @@ impl Skirmish {
         }
     }
 
-    /// Nearest live enemy of `army` to `p` within `radius` via `SpatialGrid`.
+    /// Nearest live enemy of `army` to `p` within `radius` via dense `SpatialGrid` (zero alloc).
     fn nearest_enemy(&self, army: ArmyId, p: (i64, i64), radius: i64) -> Option<UnitId> {
         let lim = (radius as i128) * (radius as i128);
-        let mut cand = Vec::new();
-        self.spatial.query_radius_sorted(p.0, p.1, radius + 8 * SCALE, &mut cand);
+        let snap = &self.spatial_snap;
         let mut best_mobile: Option<(i128, UnitId)> = None;
         let mut best_struct: Option<(i128, UnitId)> = None;
-        for tid in cand {
-            let Some(u) = self.units.get(&tid) else { continue };
-            if !u.alive || u.army == army {
-                continue;
-            }
-            let d = dist_sq(p, (u.pos.x, u.pos.y));
-            if d > lim {
-                continue;
-            }
-            let slot = if u.role.is_structure() {
-                &mut best_struct
-            } else {
-                &mut best_mobile
-            };
-            if slot.is_none_or(|(bd, _)| d < bd) {
-                *slot = Some((d, u.id));
-            }
-        }
+        self.spatial
+            .for_each_in_radius(p.0, p.1, radius + 6 * SCALE, |idx| {
+                let u = &snap[idx as usize];
+                if u.army == army {
+                    return;
+                }
+                let d = dist_sq(p, (u.x, u.y));
+                if d > lim {
+                    return;
+                }
+                let slot = if u.is_struct {
+                    &mut best_struct
+                } else {
+                    &mut best_mobile
+                };
+                if slot.is_none_or(|(bd, bid)| d < bd || (d == bd && u.id < bid)) {
+                    *slot = Some((d, u.id));
+                }
+            });
         best_mobile.or(best_struct).map(|(_, id)| id)
     }
 
@@ -1848,38 +1880,35 @@ impl Skirmish {
         }
     }
 
-    /// Deterministic pairwise repulsion for crowded mobile units via `SpatialGrid`.
+    /// Deterministic parallel pairwise repulsion for crowded mobile units via `SpatialGrid`.
     fn step_separation(&mut self) {
-        let mut cand = Vec::new();
-        let mut deltas: Vec<(UnitId, i64, i64)> = Vec::new();
-        let mobile_ids: Vec<UnitId> = self
-            .units
-            .values()
-            .filter(|u| u.alive && u.speed > 0 && !u.role.is_structure())
-            .map(|u| u.id)
+        let mobile_indices: Vec<usize> = self
+            .spatial_snap
+            .iter()
+            .enumerate()
+            .filter(|(_, u)| u.speed > 0 && !u.is_struct)
+            .map(|(i, _)| i)
             .collect();
+        if mobile_indices.is_empty() {
+            return;
+        }
 
-        for &id in &mobile_ids {
-            let u = &self.units[&id];
-            self.spatial
-                .query_radius_sorted(u.pos.x, u.pos.y, u.radius + 3 * SCALE, &mut cand);
+        let compute_delta = |idx: usize, snap: &[UnitSpatialSnap], grid: &SpatialGrid| -> (UnitId, i64, i64) {
+            let u = &snap[idx];
             let mut push_x: i64 = 0;
             let mut push_y: i64 = 0;
-            for &oid in &cand {
-                if oid == id {
-                    continue;
+            grid.for_each_in_radius(u.x, u.y, u.radius + 3 * SCALE, |oidx| {
+                let o = &snap[oidx as usize];
+                if o.id == u.id || o.is_struct {
+                    return;
                 }
-                let Some(o) = self.units.get(&oid).filter(|o| o.alive && !o.role.is_structure())
-                else {
-                    continue;
-                };
                 let min_sep = u.radius + o.radius + SCALE / 2;
-                let dx = u.pos.x - o.pos.x;
-                let dy = u.pos.y - o.pos.y;
+                let dx = u.x - o.x;
+                let dy = u.y - o.y;
                 let d2 = (dx as i128) * (dx as i128) + (dy as i128) * (dy as i128);
                 if d2 < (min_sep as i128) * (min_sep as i128) {
                     if d2 == 0 {
-                        let sign = if id < oid { -1 } else { 1 };
+                        let sign = if u.id < o.id { -1 } else { 1 };
                         push_x += sign * (SCALE / 4);
                     } else {
                         let d = isqrt(d2).max(1);
@@ -1888,16 +1917,39 @@ impl Skirmish {
                         push_y += ((dy as i128) * (push as i128) / (d as i128)) as i64;
                     }
                 }
-            }
+            });
             if push_x != 0 || push_y != 0 {
                 let cap = (u.speed / 2).max(SCALE / 10);
-                deltas.push((id, push_x.clamp(-cap, cap), push_y.clamp(-cap, cap)));
+                (u.id, push_x.clamp(-cap, cap), push_y.clamp(-cap, cap))
+            } else {
+                (u.id, 0, 0)
             }
-        }
+        };
+
+        let deltas: Vec<(UnitId, i64, i64)> = if mobile_indices.len() >= 128
+            && let Some(ref pool) = self.pool
+            && pool.threads() > 1
+        {
+            let snap_arc = Arc::clone(&self.spatial_snap);
+            let grid_arc = Arc::clone(&self.spatial);
+            pool.par_map_ordered_arc(
+                Arc::new(mobile_indices),
+                Arc::new(move |_: usize, &idx: &usize| compute_delta(idx, &snap_arc, &grid_arc)),
+            )
+        } else {
+            let snap = &self.spatial_snap;
+            let grid = &self.spatial;
+            mobile_indices
+                .iter()
+                .map(|&idx| compute_delta(idx, snap, grid))
+                .collect()
+        };
 
         let (max_x, max_y) = self.size;
         for (id, dx, dy) in deltas {
-            if let Some(u) = self.units.get_mut(&id) {
+            if (dx != 0 || dy != 0)
+                && let Some(u) = self.units.get_mut(&id)
+            {
                 u.pos.x = (u.pos.x + dx).clamp(0, max_x);
                 u.pos.y = (u.pos.y + dy).clamp(0, max_y);
             }
@@ -2069,8 +2121,12 @@ impl Skirmish {
         for pid in exploded {
             let Some(p) = self.projectiles.remove(&pid) else { continue };
             let r = p.splash_radius.max(SCALE);
+            cand.clear();
             self.spatial
-                .query_radius_sorted(p.target.x, p.target.y, r + 4 * SCALE, &mut cand);
+                .for_each_in_radius(p.target.x, p.target.y, r + 4 * SCALE, |idx| {
+                    cand.push(self.spatial_snap[idx as usize].id);
+                });
+            cand.sort_unstable();
             for &uid in &cand {
                 let Some(t) = self.units.get_mut(&uid) else { continue };
                 if !t.alive || t.army == p.army {
@@ -2115,6 +2171,7 @@ impl Skirmish {
                             *id,
                             Wreck {
                                 id: *id,
+                                type_id,
                                 pos,
                                 mass_left,
                             },
@@ -2208,6 +2265,8 @@ impl Skirmish {
         }
         for (wid, w) in &self.wrecks {
             m(&mut h, &wid.to_le_bytes());
+            m(&mut h, &(w.type_id.len() as u32).to_le_bytes());
+            m(&mut h, w.type_id.as_bytes());
             m(&mut h, &w.pos.x.to_le_bytes());
             m(&mut h, &w.pos.y.to_le_bytes());
             m(&mut h, &w.mass_left.to_le_bytes());

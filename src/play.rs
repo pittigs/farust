@@ -205,8 +205,8 @@ impl UnitMeshCache {
             let target_span = (utype.size[0].max(utype.size[2]) as f32 / SCALE as f32).max(1.6);
             if let Some(ref scd_path) = units_scd {
                 let candidates = [
-                    format!("units/{id}/{id}_lod1.scm"),
                     format!("units/{id}/{id}_lod0.scm"),
+                    format!("units/{id}/{id}_lod1.scm"),
                 ];
                 let mut loaded = None;
                 for inner in &candidates {
@@ -1014,32 +1014,55 @@ pub(crate) fn build_skirmish_render_frame(
     let world = &session.world;
     let selected_set = &session.selected;
 
-    // 1. Unclaimed mass points
+    // 1. Unclaimed mass deposit pads + emerald locator rings
     for (idx, &(mx, mz)) in world.mass_points().iter().enumerate() {
         if world.mass_claim(idx).is_some() {
             continue;
         }
         let wx = mx as f32 / scale;
         let wz = mz as f32 / scale;
-        let wy = sample_terrain_y(scmap, wx, wz) + 0.14;
+        let wy = sample_terrain_y(scmap, wx, wz) + 0.10;
+        let s = zoom_boost.sqrt();
+        append_box_world(&mut verts, &mut indices, [wx, wy - 0.06, wz], 0.85 * s, 0.12, [0.018, 0.022, 0.028, 0.45]);
         append_ring(
             &mut verts,
             &mut indices,
-            [wx, wy, wz],
-            1.4 * zoom_boost.sqrt(),
-            0.35 * zoom_boost.sqrt(),
-            [0.24, 0.85, 0.42, 0.15],
+            [wx, wy + 0.08, wz],
+            1.15 * s,
+            0.26 * s,
+            [0.14, 0.86, 0.40, 0.22],
             12,
         );
     }
 
-    // 2. Reclaimable wrecks
+    // 2. Reclaimable wrecks (charred real unit .scm meshes; box fallback in strategic zoom or missing type)
     for w in world.wrecks() {
         let wx = w.pos.x as f32 / scale;
         let wz = w.pos.y as f32 / scale;
         let wy = sample_terrain_y(scmap, wx, wz);
-        let sz = 0.48 * zoom_boost.sqrt();
-        append_box_world(&mut verts, &mut indices, [wx, wy, wz], sz, sz * 0.35, [0.045, 0.042, 0.040, 0.25]);
+        if strategic_zoom || w.type_id.is_empty() {
+            let sz = 0.48 * zoom_boost.sqrt();
+            append_box_world(&mut verts, &mut indices, [wx, wy, wz], sz, sz * 0.35, [0.05, 0.045, 0.042, 0.25]);
+        } else {
+            let use_tex = if meshes.mesh_for(&w.type_id, Role::Mobile).albedo.is_some() {
+                1.0
+            } else {
+                0.0
+            };
+            let yaw = ((w.id.wrapping_mul(2654435761) & 1023) as f32 / 1024.0) * std::f32::consts::TAU;
+            let tilt = (((w.id % 5) as f32) - 2.0) * 0.07;
+            let render_scale = zoom_boost * 1.10;
+            batches.entry(w.type_id.clone()).or_default().push(
+                GpuUnitInstance::from_pos_yaw_scale(
+                    [wx, wy - 0.12 * render_scale, wz],
+                    yaw,
+                    tilt,
+                    render_scale,
+                    [0.45, 0.42, 0.40, 0.12],
+                    [use_tex, 0.0, 1.0, 0.10],
+                ),
+            );
+        }
     }
 
     // 3. Units (instanced real .scm meshes at close/mid zoom, crisp strategic icons when zoomed far out)
@@ -1083,11 +1106,14 @@ pub(crate) fn build_skirmish_render_frame(
             batches
                 .entry(u.type_id.clone())
                 .or_default()
-                .push(GpuUnitInstance {
-                    pos_scale: [wx, wy, wz, render_scale],
-                    yaw_flags: [yaw, use_tex, 0.0, 0.0],
-                    team_color: color,
-                });
+                .push(GpuUnitInstance::from_pos_yaw_scale(
+                    [wx, wy, wz],
+                    yaw,
+                    0.0,
+                    render_scale,
+                    color,
+                    [use_tex, 0.0, 0.0, 0.85],
+                ));
         }
 
         let is_sel = selected_set.contains(&u.id);
@@ -1526,9 +1552,9 @@ pub fn battle_snapshot_camera(world: &Skirmish, scmap: &ScMap, aspect: f32) -> O
     let span = scmap.map_width.max(scmap.map_height).max(256.0);
     let mut cam = OrbitCamera::for_map(scmap.map_width, scmap.map_height, cy, aspect);
     cam.target = [cx, cy, cz];
-    cam.yaw = 0.52;
-    cam.pitch = 0.60;
-    cam.distance = 56.0_f32.clamp(32.0, span * 0.25);
+    cam.yaw = 0.50;
+    cam.pitch = 0.44;
+    cam.distance = 44.0_f32.clamp(28.0, span * 0.25);
     cam
 }
 
@@ -1537,9 +1563,21 @@ fn build_terrain_loaded_scene(
     map: &MapContext,
     camera: OrbitCamera,
 ) -> (LoadedScene, Option<RgbaImage>) {
-    let baked = game_dir.and_then(|d| scene::bake_terrain_albedo(d, &map.scmap, 2048));
+    let terrain_splat = game_dir.and_then(|d| scene::load_terrain_splat_data(d, &map.scmap));
+    let water = game_dir.and_then(|d| scene::load_water_gpu_data(d, &map.scmap));
+    let sky_cube = game_dir.and_then(|d| scene::load_sky_cubemap(d, &map.scmap));
+    let prop_batches = game_dir
+        .map(|d| scene::load_map_props(d, &map.scmap))
+        .unwrap_or_default();
+
+    let baked = if terrain_splat.is_some() {
+        None
+    } else {
+        game_dir.and_then(|d| scene::bake_terrain_albedo(d, &map.scmap, 1024))
+    };
+    let textured = terrain_splat.is_some() || baked.is_some();
     let (vertices, indices, overlay_vertices, overlay_indices) =
-        scene::build_terrain_and_overlay_meshes(&map.scmap, None, baked.is_some());
+        scene::build_terrain_and_overlay_meshes_opts(&map.scmap, None, textured, water.is_none());
     let minimap_img = decode_dds_rgba8(&map.scmap.preview_dds)
         .ok()
         .or_else(|| baked.clone());
@@ -1548,6 +1586,7 @@ fn build_terrain_loaded_scene(
         height: 1,
         pixels: vec![255, 255, 255, 255],
     });
+    let fc = map.scmap.lighting.fog_color;
     let scene = LoadedScene {
         title: format!("{} ({})", map.map_name, map.map_id),
         vertices,
@@ -1556,7 +1595,16 @@ fn build_terrain_loaded_scene(
         overlay_indices,
         albedo,
         initial_camera: camera,
-        clear_color: [0.42, 0.58, 0.78, 1.0],
+        clear_color: [
+            f64::from(fc[0].clamp(0.05, 1.0)),
+            f64::from(fc[1].clamp(0.05, 1.0)),
+            f64::from(fc[2].clamp(0.05, 1.0)),
+            1.0,
+        ],
+        terrain_splat,
+        water,
+        sky_cube,
+        prop_batches,
     };
     (scene, minimap_img)
 }
@@ -1613,8 +1661,26 @@ fn upload_frame_resources(
     resources.set_unit_batches(device, gpu_batches);
     resources.set_dynamic(device, &dyn_v, &dyn_i);
 
-    let (mm_v, mm_i, hud_v, hud_i) = hud::build_hud_geometry(session, map, camera, width, height);
-    resources.set_hud(device, &mm_v, &mm_i, &hud_v, &hud_i);
+    let (mm_v, mm_i, bg_v, bg_i, ic_v, ic_i, fg_v, fg_i) =
+        hud::build_hud_geometry(session, map, camera, width, height);
+    resources.set_hud(device, &mm_v, &mm_i, &bg_v, &bg_i, &ic_v, &ic_i, &fg_v, &fg_i);
+}
+
+fn upload_hud_icons(
+    game_dir: Option<&Path>,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    resources: &mut GpuSceneResources,
+    session: &PlaySession,
+) {
+    let Some(dir) = game_dir else {
+        return;
+    };
+    let ids = hud::human_faction_icon_ids(session);
+    let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+    if let Some(atlas) = scene::load_hud_icon_atlas(dir, &refs) {
+        resources.set_hud_icons_texture(device, queue, &atlas);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1658,6 +1724,7 @@ pub fn render_skirmish_snapshot(
     if let Some(ref mm) = minimap_img {
         resources.set_minimap_texture(&device, &queue, mm);
     }
+    upload_hud_icons(game_dir, &device, &queue, &mut resources, session);
     let templates = upload_unit_templates(&device, &queue, &resources, meshes);
     upload_frame_resources(
         &device,
@@ -1915,6 +1982,13 @@ impl PlayApp {
         if let Some(ref mm) = minimap_img {
             resources.set_minimap_texture(&device, &queue, mm);
         }
+        upload_hud_icons(
+            self.game_dir.as_deref(),
+            &device,
+            &queue,
+            &mut resources,
+            &self.session,
+        );
         let templates = upload_unit_templates(&device, &queue, &resources, &self.meshes);
         upload_frame_resources(
             &device,
@@ -2505,6 +2579,7 @@ mod tests {
             background_path: String::new(),
             sky_cubemap_path: String::new(),
             cubemaps: vec![],
+            lighting: crate::scmap::ScMapLighting::default(),
             water: WaterInfo {
                 has_water: true,
                 elevation: 10.0,

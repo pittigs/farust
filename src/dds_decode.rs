@@ -124,6 +124,92 @@ pub fn decode_payload_rgba8(header: &DdsHeader, payload: &[u8]) -> Result<RgbaIm
     })
 }
 
+fn dds_mip_byte_len(format: &DdsFormat, w: u32, h: u32) -> Result<usize, String> {
+    match format {
+        DdsFormat::Dxt1 => Ok((w.div_ceil(4) as usize) * (h.div_ceil(4) as usize) * 8),
+        DdsFormat::Dxt3 | DdsFormat::Dxt5 => {
+            Ok((w.div_ceil(4) as usize) * (h.div_ceil(4) as usize) * 16)
+        }
+        DdsFormat::Bgra8 | DdsFormat::Rgba8 => Ok((w as usize) * (h as usize) * 4),
+        DdsFormat::Bgr8 => Ok((w as usize) * (h as usize) * 3),
+        DdsFormat::A8 | DdsFormat::L8 => Ok((w as usize) * (h as usize)),
+        _ => Err(format!("unsupported cubemap DDS format: {format}")),
+    }
+}
+
+/// Decodes all 6 cubemap faces (`+X, -X, +Y, -Y, +Z, -Z` at mip 0) from a DDS cubemap file.
+pub fn decode_dds_cubemap_rgba8(data: &[u8]) -> Result<[RgbaImage; 6], String> {
+    let header = parse_dds(data)?;
+    if !header.is_cubemap {
+        return Err("DDS image is not a cubemap".to_string());
+    }
+    let payload = data
+        .get(header.data_offset..)
+        .ok_or_else(|| "DDS cubemap data offset out of bounds".to_string())?;
+    let mips = header.mip_count.max(1);
+    let mut face_bytes: usize = 0;
+    for m in 0..mips {
+        let mw = (header.width >> m).max(1);
+        let mh = (header.height >> m).max(1);
+        face_bytes = face_bytes
+            .checked_add(dds_mip_byte_len(&header.format, mw, mh)?)
+            .ok_or_else(|| "cubemap face byte size overflow".to_string())?;
+    }
+    let single_face_payload = |face_idx: usize| -> Result<&[u8], String> {
+        let start = face_idx * face_bytes;
+        let mip0 = dds_mip_byte_len(&header.format, header.width, header.height)?;
+        payload
+            .get(start..start + mip0)
+            .ok_or_else(|| format!("truncated cubemap face {face_idx}"))
+    };
+    let mut faces = Vec::with_capacity(6);
+    for f in 0..6 {
+        faces.push(decode_payload_rgba8(&header, single_face_payload(f)?)?);
+    }
+    faces
+        .try_into()
+        .map_err(|_| "cubemap decode failed".to_string())
+}
+
+/// Resizes an [`RgbaImage`] with repeating bilinear filtering (safe for tiled terrain textures).
+pub fn resize_rgba_bilinear(img: &RgbaImage, dst_w: u32, dst_h: u32) -> RgbaImage {
+    let dst_w = dst_w.max(1);
+    let dst_h = dst_h.max(1);
+    if img.width == dst_w && img.height == dst_h {
+        return img.clone();
+    }
+    let sw = img.width.max(1) as usize;
+    let sh = img.height.max(1) as usize;
+    let mut out = vec![0u8; (dst_w as usize) * (dst_h as usize) * 4];
+    for y in 0..dst_h as usize {
+        let fy = (y as f32 + 0.5) / dst_h as f32 * sh as f32 - 0.5;
+        let y0 = (fy.floor() as isize).rem_euclid(sh as isize) as usize;
+        let y1 = (y0 + 1) % sh;
+        let ty = fy - fy.floor();
+        for x in 0..dst_w as usize {
+            let fx = (x as f32 + 0.5) / dst_w as f32 * sw as f32 - 0.5;
+            let x0 = (fx.floor() as isize).rem_euclid(sw as isize) as usize;
+            let x1 = (x0 + 1) % sw;
+            let tx = fx - fx.floor();
+            let dst = (y * dst_w as usize + x) * 4;
+            for c in 0..4 {
+                let c00 = img.pixels[(y0 * sw + x0) * 4 + c] as f32;
+                let c10 = img.pixels[(y0 * sw + x1) * 4 + c] as f32;
+                let c01 = img.pixels[(y1 * sw + x0) * 4 + c] as f32;
+                let c11 = img.pixels[(y1 * sw + x1) * 4 + c] as f32;
+                let a = c00 + (c10 - c00) * tx;
+                let b = c01 + (c11 - c01) * tx;
+                out[dst + c] = (a + (b - a) * ty).round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+    RgbaImage {
+        width: dst_w,
+        height: dst_h,
+        pixels: out,
+    }
+}
+
 fn resolve_row_stride(
     pitch_or_linear_size: u32,
     width: u32,
@@ -542,5 +628,40 @@ mod tests {
 
         let hdr_bgra = make_header(2, 2, 0, DdsFormat::Bgra8);
         assert!(decode_payload_rgba8(&hdr_bgra, &[0u8; 15]).is_err());
+    }
+
+    #[test]
+    fn test_resize_rgba_bilinear_and_cubemap_6_faces() {
+        let small = RgbaImage {
+            width: 2,
+            height: 2,
+            pixels: vec![0, 0, 0, 255, 200, 100, 50, 255, 0, 0, 0, 255, 200, 100, 50, 255],
+        };
+        let resized = resize_rgba_bilinear(&small, 4, 4);
+        assert_eq!(resized.width, 4);
+        assert_eq!(resized.height, 4);
+        assert_eq!(resized.pixels.len(), 64);
+
+        let mut dds = vec![0u8; 128];
+        dds[0..4].copy_from_slice(b"DDS ");
+        dds[4..8].copy_from_slice(&124u32.to_le_bytes());
+        dds[8..12].copy_from_slice(&0x0000_1007u32.to_le_bytes());
+        dds[12..16].copy_from_slice(&4u32.to_le_bytes());
+        dds[16..20].copy_from_slice(&4u32.to_le_bytes());
+        dds[76..80].copy_from_slice(&32u32.to_le_bytes());
+        dds[80..84].copy_from_slice(&0x4u32.to_le_bytes());
+        dds[84..88].copy_from_slice(b"DXT1");
+        dds[108..112].copy_from_slice(&0x1008u32.to_le_bytes());
+        dds[112..116].copy_from_slice(&0xFE00u32.to_le_bytes()); // cubemap all faces
+        for f in 0..6u8 {
+            let mut blk = [0u8; 8];
+            blk[0] = f;
+            dds.extend_from_slice(&blk);
+        }
+        let faces = decode_dds_cubemap_rgba8(&dds).expect("6-face DXT1 cubemap");
+        assert_eq!(faces.len(), 6);
+        for f in &faces {
+            assert_eq!((f.width, f.height), (4, 4));
+        }
     }
 }

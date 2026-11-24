@@ -18,7 +18,79 @@ pub struct TerrainStratum {
     pub scale: f32,
 }
 
-/// Terrain strata descriptors and embedded blend-map DDS textures parsed from a `.scmap` file.
+/// Sun, ambient, shadow, and atmospheric fog parameters parsed from `.scmap`.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct ScMapLighting {
+    pub lighting_multiplier: f32,
+    pub sun_direction: [f32; 3],
+    pub sun_ambience: [f32; 3],
+    pub sun_color: [f32; 3],
+    pub shadow_fill_color: [f32; 3],
+    pub specular_color: [f32; 4],
+    pub bloom: f32,
+    pub fog_color: [f32; 3],
+    pub fog_start: f32,
+    pub fog_end: f32,
+}
+
+impl Default for ScMapLighting {
+    fn default() -> Self {
+        Self {
+            lighting_multiplier: 1.4,
+            sun_direction: [0.46, 0.71, 0.53],
+            sun_ambience: [0.18, 0.20, 0.24],
+            sun_color: [1.35, 1.28, 1.18],
+            shadow_fill_color: [0.35, 0.38, 0.48],
+            specular_color: [0.5, 0.5, 0.5, 0.5],
+            bloom: 0.08,
+            fog_color: [0.58, 0.72, 0.85],
+            fog_start: 100.0,
+            fog_end: 1000.0,
+        }
+    }
+}
+
+/// Water shader parameters parsed from `.scmap`.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct ScMapWaterParams {
+    pub surface_color: [f32; 3],
+    pub color_lerp: [f32; 2],
+    pub fresnel_bias: f32,
+    pub fresnel_power: f32,
+    pub water_cubemap: String,
+    pub water_ramp: String,
+    pub wave_textures: Vec<String>,
+}
+
+impl Default for ScMapWaterParams {
+    fn default() -> Self {
+        Self {
+            surface_color: [0.06, 0.09, 0.12],
+            color_lerp: [0.25, 0.05],
+            fresnel_bias: 0.06,
+            fresnel_power: 1.8,
+            water_cubemap: String::new(),
+            water_ramp: String::new(),
+            wave_textures: Vec::new(),
+        }
+    }
+}
+
+/// One placed prop instance (tree, rock, log, boulder) in `.scmap`.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct ScMapProp {
+    pub blueprint_path: String,
+    pub position: [f32; 3],
+    pub rot_x: [f32; 3],
+    pub rot_y: [f32; 3],
+    pub rot_z: [f32; 3],
+    pub scale: [f32; 3],
+}
+
+/// Terrain strata descriptors, water params, embedded blend maps, and props parsed from `.scmap`.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct TerrainTextures {
@@ -26,9 +98,12 @@ pub struct TerrainTextures {
     pub strata_normal: Vec<TerrainStratum>,
     pub texturemap0_dds: Vec<u8>,
     pub texturemap1_dds: Vec<u8>,
+    pub normal_map_dds: Vec<u8>,
+    pub water_params: ScMapWaterParams,
+    pub props: Vec<ScMapProp>,
 }
 
-/// Parsed Supreme Commander `.scmap` map data (header, heightmap, environment paths, and water).
+/// Parsed Supreme Commander `.scmap` map data (header, heightmap, environment paths, lighting, and water).
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct ScMap {
@@ -45,6 +120,7 @@ pub struct ScMap {
     pub background_path: String,
     pub sky_cubemap_path: String,
     pub cubemaps: Vec<(String, String)>,
+    pub lighting: ScMapLighting,
     pub water: WaterInfo,
     pub terrain_textures: Option<TerrainTextures>,
 }
@@ -130,23 +206,27 @@ fn decode_cstr_bytes(bytes: &[u8]) -> String {
     }
 }
 
-/// Parses the v2.60 post-water water/wave/contour/stratum/decal/blendmap sections.
+/// Parses the v2.60 post-water water/wave/contour/stratum/decal/blendmap/skybox/props sections.
 /// Returns `None` on short synthetic test tails where full strata/DDS payloads are absent.
-fn parse_terrain_textures(tail: &[u8]) -> Option<TerrainTextures> {
+fn parse_terrain_textures(tail: &[u8], hm_w: u32, hm_h: u32) -> Option<TerrainTextures> {
     if tail.len() < 128 {
         return None;
     }
     let mut r = Reader::new(tail);
     // 20 f32 water shading parameters
-    r.skip(80).ok()?;
-    let _water_cubemap = r.read_cstr().ok()?;
-    let _water_ramp = r.read_cstr().ok()?;
+    let mut wf = [0.0_f32; 20];
+    for slot in &mut wf {
+        *slot = r.read_f32().ok()?;
+    }
+    let water_cubemap = r.read_cstr().ok()?;
+    let water_ramp = r.read_cstr().ok()?;
     // 4 wave normal repeats
     r.skip(16).ok()?;
     // 4 wave layers (vec2 movement + texture path)
+    let mut wave_textures = Vec::with_capacity(4);
     for _ in 0..4 {
         r.skip(8).ok()?;
-        let _ = r.read_cstr().ok()?;
+        wave_textures.push(r.read_cstr().ok()?);
     }
     let wave_gen_count = usize::try_from(r.read_u32().ok()?).ok()?;
     if wave_gen_count > r.remaining() / 70 {
@@ -208,9 +288,13 @@ fn parse_terrain_textures(tail: &[u8]) -> Option<TerrainTextures> {
     if norm_count > 16 {
         return None;
     }
-    for _ in 0..norm_count {
+    let mut normal_map_dds = Vec::new();
+    for i in 0..norm_count {
         let len = usize::try_from(r.read_u32().ok()?).ok()?;
-        r.skip(len).ok()?;
+        let bytes = r.read_bytes(len).ok()?;
+        if i == 0 && bytes.starts_with(b"DDS ") {
+            normal_map_dds = bytes.to_vec();
+        }
     }
 
     let tm0_len = usize::try_from(r.read_u32().ok()?).ok()?;
@@ -230,12 +314,77 @@ fn parse_terrain_textures(tail: &[u8]) -> Option<TerrainTextures> {
         Vec::new()
     };
 
+    let props = parse_props_tail(&mut r, hm_w, hm_h).unwrap_or_default();
+
+    let water_params = ScMapWaterParams {
+        surface_color: [wf[0], wf[1], wf[2]],
+        color_lerp: [wf[3], wf[4]],
+        fresnel_bias: if wf[6].is_finite() { wf[6] } else { 0.06 },
+        fresnel_power: if wf[7].is_finite() && wf[7] > 0.0 { wf[7] } else { 1.8 },
+        water_cubemap,
+        water_ramp,
+        wave_textures,
+    };
+
     Some(TerrainTextures {
         strata_albedo,
         strata_normal,
         texturemap0_dds,
         texturemap1_dds,
+        normal_map_dds,
+        water_params,
+        props,
     })
+}
+
+fn parse_props_tail(r: &mut Reader<'_>, hm_w: u32, hm_h: u32) -> Option<Vec<ScMapProp>> {
+    // Unknown v60 u32 (usually 1) + watermap DDS length/payload
+    r.skip(4).ok()?;
+    let wmap_len = usize::try_from(r.read_u32().ok()?).ok()?;
+    r.skip(wmap_len).ok()?;
+
+    // Half-res water foam/flatness/depthbias + full-res terrain-type bytes
+    let half = ((hm_w as usize) / 2).checked_mul((hm_h as usize) / 2)?;
+    let terrain_masks_len = half
+        .checked_mul(3)?
+        .checked_add((hm_w as usize).checked_mul(hm_h as usize)?)?;
+    r.skip(terrain_masks_len).ok()?;
+
+    // SkyBox + Planets + Cirrus layers (v2.60)
+    r.skip(64).ok()?;
+    let _sky_albedo = r.read_cstr().ok()?;
+    let _sky_glow = r.read_cstr().ok()?;
+    let planet_count = usize::try_from(r.read_u32().ok()?).ok()?;
+    let planets_bytes = planet_count.checked_mul(40)?;
+    r.skip(planets_bytes).ok()?;
+    r.skip(19).ok()?;
+    let _cirrus_tex = r.read_cstr().ok()?;
+    let cirrus_count = usize::try_from(r.read_u32().ok()?).ok()?;
+    let cirrus_bytes = cirrus_count.checked_mul(20)?;
+    r.skip(cirrus_bytes).ok()?;
+    r.skip(4).ok()?;
+
+    let prop_count = usize::try_from(r.read_u32().ok()?).ok()?;
+    if prop_count > r.remaining() / 61 {
+        return None;
+    }
+    let mut props = Vec::with_capacity(prop_count);
+    for _ in 0..prop_count {
+        let blueprint_path = r.read_cstr().ok()?;
+        let mut vals = [0.0_f32; 15];
+        for v in &mut vals {
+            *v = r.read_f32().ok()?;
+        }
+        props.push(ScMapProp {
+            blueprint_path,
+            position: [vals[0], vals[1], vals[2]],
+            rot_x: [vals[3], vals[4], vals[5]],
+            rot_y: [vals[6], vals[7], vals[8]],
+            rot_z: [vals[9], vals[10], vals[11]],
+            scale: [vals[12], vals[13], vals[14]],
+        });
+    }
+    Some(props)
 }
 
 impl ScMap {
@@ -318,14 +467,29 @@ impl ScMap {
         };
 
         // 23 f32 lighting/fog parameters.
-        r.skip(92)?;
+        let mut lf = [0.0_f32; 23];
+        for slot in &mut lf {
+            *slot = r.read_f32()?;
+        }
+        let lighting = ScMapLighting {
+            lighting_multiplier: lf[0],
+            sun_direction: [lf[1], lf[2], lf[3]],
+            sun_ambience: [lf[4], lf[5], lf[6]],
+            sun_color: [lf[7], lf[8], lf[9]],
+            shadow_fill_color: [lf[10], lf[11], lf[12]],
+            specular_color: [lf[13], lf[14], lf[15], lf[16]],
+            bloom: lf[17],
+            fog_color: [lf[18], lf[19], lf[20]],
+            fog_start: lf[21],
+            fog_end: lf[22],
+        };
 
         let has_water = r.read_u8()? != 0;
         let elevation = r.read_f32()?;
         let elevation_deep = r.read_f32()?;
         let elevation_abyss = r.read_f32()?;
 
-        let terrain_textures = parse_terrain_textures(&data[r.pos..]);
+        let terrain_textures = parse_terrain_textures(&data[r.pos..], hm_w as u32, hm_h as u32);
 
         Ok(ScMap {
             version_major,
@@ -341,6 +505,7 @@ impl ScMap {
             background_path,
             sky_cubemap_path,
             cubemaps,
+            lighting,
             water: WaterInfo {
                 has_water,
                 elevation,
@@ -711,6 +876,7 @@ mod tests {
             background_path: String::new(),
             sky_cubemap_path: String::new(),
             cubemaps: Vec::new(),
+            lighting: ScMapLighting::default(),
             water: WaterInfo {
                 has_water: false,
                 elevation: 0.0,
@@ -738,5 +904,14 @@ mod tests {
         assert_eq!(map.height_stats(), (5.0, 45.0, 25.0));
 
         assert!(ScMap::parse_file(&path).is_err());
+    }
+
+    #[test]
+    fn parses_lighting_parameters() {
+        let bytes = valid_v2_60_bytes();
+        let map = ScMap::parse(&bytes).expect("parse synthetic");
+        assert!((map.lighting.lighting_multiplier - 0.0).abs() < 1e-6);
+        assert!((map.lighting.sun_direction[0] - 0.25).abs() < 1e-6);
+        assert!((map.lighting.fog_end - 5.5).abs() < 1e-6);
     }
 }
