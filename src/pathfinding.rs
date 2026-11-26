@@ -160,6 +160,7 @@ fn octile_h(ax: u32, az: u32, bx: u32, bz: u32) -> u64 {
 }
 
 pub fn find_path(grid: &PathGrid, req: &PathRequest) -> PathResult {
+    let _p = crate::profiler::scope("astar.find_path");
     let start_cell = grid.world_to_cell(req.start.0, req.start.1);
     let goal_cell = grid.world_to_cell(req.goal.0, req.goal.1);
 

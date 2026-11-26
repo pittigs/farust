@@ -193,40 +193,99 @@ pub struct NormalizedMesh {
 pub struct UnitMeshCache {
     by_type: BTreeMap<String, NormalizedMesh>,
     fallback: Vec<(Role, NormalizedMesh)>,
+    /// Phase 11 render-only rigs/clips, LOD1 meshes, VFX director, FoW mask & strategic icons.
+    pub(crate) living: crate::render_prep::LivingBattlefield,
 }
 
 impl UnitMeshCache {
-    /// Loads normalized `.scm` meshes (`LOD1`/`LOD0`) and `_Albedo`+`_SpecTeam` textures from `units.scd`.
+    /// Loads normalized `.scm` meshes (`LOD1`/`LOD0`) and `_Albedo`+`_SpecTeam` textures from
+    /// `units.scd` (with `textures.scd` fallback) in parallel, concurrently with [`LivingBattlefield::load`].
     pub fn load(game_dir: Option<&Path>, catalog: &Catalog) -> Self {
-        let mut by_type = BTreeMap::new();
-        let units_scd = game_dir.map(|d| scd::gamedata_dir(d).join("units.scd"));
+        let entries: Vec<(String, Role, f32)> = catalog
+            .types
+            .iter()
+            .map(|(id, utype)| {
+                let target_span = (utype.size[0].max(utype.size[2]) as f32 / SCALE as f32).max(1.6);
+                (id.clone(), utype.role, target_span)
+            })
+            .collect();
 
-        for (id, utype) in &catalog.types {
-            let target_span = (utype.size[0].max(utype.size[2]) as f32 / SCALE as f32).max(1.6);
-            if let Some(ref scd_path) = units_scd {
-                let candidates = [
-                    format!("units/{id}/{id}_lod0.scm"),
-                    format!("units/{id}/{id}_lod1.scm"),
-                ];
-                let mut loaded = None;
-                for inner in &candidates {
-                    if let Ok((_, bytes)) = scd::read_scd_file_ci(scd_path, inner)
-                        && let Ok(scm) = ScmMesh::parse(&bytes)
-                        && let Some(mut norm) = normalize_scm(&scm, target_span)
-                    {
-                        norm.albedo = game_dir
-                            .and_then(|d| scene::load_unit_albedo_and_team_mask(d, id));
-                        loaded = Some(norm);
-                        break;
+        let (by_type, living) = std::thread::scope(|scope| {
+            let living_job = scope.spawn(|| crate::render_prep::LivingBattlefield::load(game_dir, catalog));
+
+            let by_type: BTreeMap<String, NormalizedMesh> = if let Some(dir) = game_dir {
+                let gamedata = scd::gamedata_dir(dir);
+                let units_scd = gamedata.join("units.scd");
+                let norm_key = |n: &str| n.replace('\\', "/").trim_start_matches('/').to_ascii_lowercase();
+                let mut wanted = std::collections::HashSet::with_capacity(entries.len() * 4);
+                for (id, _, _) in &entries {
+                    let l = id.to_ascii_lowercase();
+                    for suf in ["_lod0.scm", "_lod1.scm", "_albedo.dds", "_specteam.dds"] {
+                        wanted.insert(format!("units/{l}/{l}{suf}"));
                     }
                 }
-                if let Some(norm) = loaded {
-                    by_type.insert(id.clone(), norm);
-                    continue;
+                let mut files: std::collections::HashMap<String, Vec<u8>> =
+                    scd::read_scd_matching(&units_scd, |n| wanted.contains(&norm_key(n)))
+                        .map(|v| v.into_iter().map(|(k, b)| (norm_key(&k), b)).collect())
+                        .unwrap_or_default();
+
+                let missing_albedo: std::collections::HashSet<String> = entries
+                    .iter()
+                    .filter_map(|(id, _, _)| {
+                        let l = id.to_ascii_lowercase();
+                        let p = format!("units/{l}/{l}_albedo.dds");
+                        (!files.contains_key(&p)).then_some(p)
+                    })
+                    .collect();
+                if !missing_albedo.is_empty() {
+                    let textures_scd = gamedata.join("textures.scd");
+                    if let Ok(extra) =
+                        scd::read_scd_matching(&textures_scd, |n| missing_albedo.contains(&norm_key(n)))
+                    {
+                        for (k, b) in extra {
+                            files.entry(norm_key(&k)).or_insert(b);
+                        }
+                    }
                 }
-            }
-            by_type.insert(id.clone(), procedural_role_mesh(utype.role, target_span));
-        }
+
+                let threads = crate::jobs::default_thread_count();
+                crate::jobs::par_map_ordered(&entries, threads, |_, (id, role, target_span)| {
+                    let l = id.to_ascii_lowercase();
+                    let mut loaded = None;
+                    for suf in ["_lod0.scm", "_lod1.scm"] {
+                        if let Some(bytes) = files.get(&format!("units/{l}/{l}{suf}"))
+                            && let Ok(scm) = ScmMesh::parse(bytes)
+                            && let Some(mut norm) = normalize_scm(&scm, *target_span)
+                        {
+                            norm.albedo = files
+                                .get(&format!("units/{l}/{l}_albedo.dds"))
+                                .and_then(|b| crate::dds_decode::decode_dds_rgba8(b).ok())
+                                .map(|albedo| {
+                                    let spec = files
+                                        .get(&format!("units/{l}/{l}_specteam.dds"))
+                                        .and_then(|b| crate::dds_decode::decode_dds_rgba8(b).ok());
+                                    scene::pack_albedo_team_mask(albedo, spec.as_ref())
+                                });
+                            loaded = Some(norm);
+                            break;
+                        }
+                    }
+                    (id.clone(), loaded.unwrap_or_else(|| procedural_role_mesh(*role, *target_span)))
+                })
+                .into_iter()
+                .collect()
+            } else {
+                entries
+                    .iter()
+                    .map(|(id, role, target_span)| (id.clone(), procedural_role_mesh(*role, *target_span)))
+                    .collect()
+            };
+
+            let living = living_job
+                .join()
+                .unwrap_or_else(|_| crate::render_prep::LivingBattlefield::load(None, catalog));
+            (by_type, living)
+        });
 
         let fallback = [
             Role::Commander,
@@ -242,16 +301,23 @@ impl UnitMeshCache {
         .map(|r| (r, procedural_role_mesh(r, if r == Role::Factory { 5.0 } else { 1.8 })))
         .collect();
 
-        Self { by_type, fallback }
+        Self { by_type, fallback, living }
     }
 
     pub fn mesh_for(&self, type_id: &str, role: Role) -> &NormalizedMesh {
         self.by_type.get(type_id).unwrap_or_else(|| {
+            let target = match role {
+                Role::AirFactory | Role::NavalFactory => Role::Factory,
+                Role::Hydro | Role::MassStorage | Role::EnergyStorage => Role::Generator,
+                Role::Shield | Role::AntiAir | Role::MissileSilo | Role::MissileDefense => Role::PointDefense,
+                Role::Experimental => Role::Mobile,
+                r => r,
+            };
             &self
                 .fallback
                 .iter()
-                .find(|(r, _)| *r == role)
-                .expect("all roles present in fallback")
+                .find(|(r, _)| *r == target)
+                .unwrap_or(&self.fallback[0])
                 .1
         })
     }
@@ -330,9 +396,13 @@ fn procedural_role_mesh(role: Role, span: f32) -> NormalizedMesh {
             append_local_box(&mut positions, &mut normals, &mut uvs, &mut indices, [0.0, 0.0, 0.0], [half * 0.75, span * 0.32, half * 0.85]);
             append_local_box(&mut positions, &mut normals, &mut uvs, &mut indices, [0.0, span * 0.32, half * 0.3], [half * 0.35, span * 0.35, half * 0.35]);
         }
-        Role::Mobile => {
+        Role::Mobile | Role::Experimental => {
             append_local_box(&mut positions, &mut normals, &mut uvs, &mut indices, [0.0, 0.0, 0.0], [half * 0.75, span * 0.35, half]);
             append_local_box(&mut positions, &mut normals, &mut uvs, &mut indices, [0.0, span * 0.35, half * 0.1], [half * 0.4, span * 0.25, half * 0.65]);
+        }
+        Role::AirFactory | Role::NavalFactory | Role::Hydro | Role::MassStorage | Role::EnergyStorage | Role::Shield | Role::AntiAir | Role::MissileSilo | Role::MissileDefense => {
+            append_local_box(&mut positions, &mut normals, &mut uvs, &mut indices, [0.0, 0.0, 0.0], [half * 0.75, span * 0.55, half * 0.75]);
+            append_local_box(&mut positions, &mut normals, &mut uvs, &mut indices, [0.0, span * 0.55, 0.0], [half * 0.45, span * 0.35, half * 0.45]);
         }
     }
     NormalizedMesh {
@@ -397,15 +467,37 @@ pub struct PlaySession {
     pub attack_move_mode: bool,
     pub paused: bool,
     pub speed: u32,
+    /// Start with audio muted (`--mute`); F3 toggles at runtime.
+    pub muted: bool,
+    /// Phase 14 audio (started lazily by the window loop; clones are silent).
+    pub audio: crate::audio_play::SessionAudio,
     pub hover_world: Option<[f32; 3]>,
     pub drag_box_world: Option<([f32; 3], [f32; 3])>,
     pub status_banner: String,
-    replay: Option<(Replay, usize)>,
+    pub(crate) replay: Option<(Replay, usize)>,
+    pub ui: crate::controls::UiState,
+    /// Phase 15 lockstep: when set, `step_sim` is gated on network turn bundles.
+    pub net: Option<crate::net::NetHandle>,
+    /// Phase 21: in-memory record of every command applied (human, AI, network) — the
+    /// source of saves and the automatic match replay. `None` for replay playback.
+    pub recorder: Option<crate::savegame::MatchRecorder>,
+    /// Phase 21: pending time-sliced re-simulation of a loaded save.
+    pub load: Option<Box<crate::savegame::LoadJob>>,
+    /// Phase 21: UI-side score sampler (read-only on the world).
+    pub stats: crate::stats::ScoreSampler,
+    /// Phase 21: chat log + input line.
+    pub chat: crate::chat::ChatState,
+    /// Phase 21: modal overlay (pause menu, load list, score screen).
+    pub menu: hud::MatchMenu,
+    /// The end-of-game screen was shown (or dismissed with "continue watching").
+    pub end_shown: bool,
+    /// Write the automatic replay on exit / game end (`--no-record` disables).
+    pub auto_record: bool,
 }
 
 impl PlaySession {
     pub fn new(world: Skirmish, human_army: ArmyId, spectate: bool, speed: u32) -> Self {
-        let ais = world
+        let ais: Vec<ScriptedAi> = world
             .armies()
             .iter()
             .filter(|a| spectate || a.id != human_army)
@@ -415,6 +507,12 @@ impl PlaySession {
         if !spectate && let Some(acu) = world.commander_of(human_army) {
             selected.push(acu.id);
         }
+        let mut recorder = crate::savegame::MatchRecorder::default();
+        for ai in &ais {
+            recorder.ai_event(world.tick(), ai.army, true);
+        }
+        let mut stats = crate::stats::ScoreSampler::default();
+        stats.prime(&world);
         Self {
             world,
             ais,
@@ -426,6 +524,8 @@ impl PlaySession {
             attack_move_mode: false,
             paused: false,
             speed: speed.clamp(1, 8),
+            muted: false,
+            audio: Default::default(),
             hover_world: None,
             drag_box_world: None,
             status_banner: if spectate {
@@ -434,10 +534,22 @@ impl PlaySession {
                 "B:Fac M:Mex P:PGen D:PD N:Rad | G/T/Y/U:Build | F1:AI F2:FOW".to_string()
             },
             replay: None,
+            ui: crate::controls::UiState::default(),
+            net: None,
+            recorder: Some(recorder),
+            load: None,
+            stats,
+            chat: Default::default(),
+            menu: Default::default(),
+            end_shown: false,
+            auto_record: !crate::savegame::recording_disabled(),
         }
     }
 
     pub fn new_replay(world: Skirmish, replay: Replay, speed: u32) -> Self {
+        let ui = crate::controls::UiState::for_replay(&world);
+        let mut stats = crate::stats::ScoreSampler::default();
+        stats.prime(&world);
         Self {
             world,
             ais: Vec::new(),
@@ -449,10 +561,21 @@ impl PlaySession {
             attack_move_mode: false,
             paused: false,
             speed: speed.clamp(1, 8),
+            muted: false,
+            audio: Default::default(),
             hover_world: None,
             drag_box_world: None,
             status_banner: format!("REPLAY ({} cmds)", replay.commands.len()),
             replay: Some((replay, 0)),
+            ui,
+            net: None,
+            recorder: None,
+            load: None,
+            stats,
+            chat: Default::default(),
+            menu: Default::default(),
+            end_shown: false,
+            auto_record: false,
         }
     }
 
@@ -461,22 +584,120 @@ impl PlaySession {
             return;
         }
         self.spectate = !self.spectate;
+        let tick = self.world.tick();
         if self.spectate {
             if !self.ais.iter().any(|ai| ai.army == self.human_army) {
                 self.ais.push(ScriptedAi::new(self.human_army));
                 self.ais.sort_by_key(|ai| ai.army);
+                if let Some(rec) = self.recorder.as_mut() {
+                    rec.ai_event(tick, self.human_army, true);
+                }
             }
             self.build_mode = None;
             self.attack_move_mode = false;
             self.status_banner = "AI assisting Army 0 (F1 to take back control)".to_string();
         } else {
+            if self.ais.iter().any(|ai| ai.army == self.human_army)
+                && let Some(rec) = self.recorder.as_mut()
+            {
+                rec.ai_event(tick, self.human_army, false);
+            }
             self.ais.retain(|ai| ai.army != self.human_army);
             self.status_banner = "Manual command active".to_string();
         }
     }
 
+    /// Whether the window loop should advance the simulation right now. Networked matches
+    /// always run (the lockstep core applies synchronized pauses); single player stops for
+    /// the pause key, modal menus and pending loads.
+    pub fn sim_active(&self) -> bool {
+        if self.world.result().is_some() || self.loading() {
+            return false;
+        }
+        if self.net.is_some() {
+            return true;
+        }
+        !self.paused && !self.menu.blocks_sim()
+    }
+
+    /// `Space` / HUD pause button: local pause in single player, synchronized pause request
+    /// in networked matches.
+    pub fn toggle_pause(&mut self) {
+        if let Some(net) = self.net.clone() {
+            let want = !net.is_paused();
+            match net.request_pause(want) {
+                Ok(()) => {
+                    self.status_banner = if want { "PAUSE REQUESTED" } else { "RESUME REQUESTED" }.to_string()
+                }
+                Err(e) => self.chat.system(&e.to_uppercase()),
+            }
+            return;
+        }
+        self.paused = !self.paused;
+    }
+
+    /// `+`/`-`: local speed, or a host-only synchronized speed request when networked.
+    pub fn change_speed(&mut self, faster: bool) {
+        let target = if faster { self.speed * 2 } else { self.speed / 2 }.clamp(1, self.max_speed());
+        if let Some(net) = self.net.clone() {
+            match net.request_speed(target) {
+                Ok(()) => self.status_banner = format!("SPEED {target}X REQUESTED"),
+                Err(e) => self.chat.system(&e.to_uppercase()),
+            }
+            return;
+        }
+        self.speed = target;
+    }
+
+    /// Sends queued chat lines: over the network when connected, else echoed locally.
+    pub fn flush_local_chat(&mut self) {
+        if self.net.is_some() {
+            return;
+        }
+        let name = self
+            .world
+            .army(self.human_army)
+            .map(|a| a.name.clone())
+            .unwrap_or_else(|| "YOU".to_string());
+        for (allies, text) in std::mem::take(&mut self.chat.outbox) {
+            self.chat.push(Some(self.human_army), &name, &text, allies);
+        }
+    }
+
+    /// True once the match is over for this player (victory/defeat/draw) and the score
+    /// screen has not been shown yet.
+    pub fn end_of_game_due(&self) -> bool {
+        if self.end_shown || self.is_replay() || self.loading() {
+            return false;
+        }
+        self.world.result().is_some()
+            || (!self.spectate && self.world.army(self.human_army).is_some_and(|a| a.defeated))
+    }
+
+    /// Single-player bookkeeping around one `world.step()`: record the commands about to be
+    /// applied (all sources), step, then checkpoint + score sampling.
+    fn step_recorded(&mut self) {
+        let counts = match self.recorder.as_mut() {
+            Some(rec) => rec.record_pending(&self.world),
+            None => Vec::new(),
+        };
+        self.world.step();
+        if let Some(rec) = self.recorder.as_mut() {
+            rec.after_step(&self.world);
+        }
+        self.stats.observe(&self.world, &counts);
+    }
+
     pub fn step_sim(&mut self) {
         if self.world.result().is_some() {
+            return;
+        }
+        if self.loading() {
+            return;
+        }
+        if let Some(net) = self.net.clone() {
+            let _p = crate::profiler::scope("net.step_session");
+            net.step_session(self);
             return;
         }
         if let Some((ref rep, ref mut cursor)) = self.replay {
@@ -494,10 +715,13 @@ impl PlaySession {
             self.selected.retain(|id| self.world.unit(*id).is_some());
             return;
         }
-        for ai in &mut self.ais {
-            ai.think(&mut self.world);
+        {
+            let _p = crate::profiler::scope("ai.think");
+            for ai in &mut self.ais {
+                ai.think(&mut self.world);
+            }
         }
-        self.world.step();
+        self.step_recorded();
         self.selected.retain(|id| self.world.unit(*id).is_some());
     }
 
@@ -564,40 +788,38 @@ impl PlaySession {
             .collect();
     }
 
-    fn selected_or_commander_builder(&self) -> Option<UnitId> {
-        self.selected
-            .iter()
-            .copied()
-            .find(|&id| {
-                self.world
-                    .unit(id)
-                    .is_some_and(|u| u.army == self.human_army && u.role.is_builder())
-            })
-            .or_else(|| self.world.commander_of(self.human_army).map(|u| u.id))
-    }
-
     pub fn issue_left_click_action(
         &mut self,
         world_xz: (i64, i64),
         queue: bool,
-        _pick_radius: i64,
+        pick_radius: i64,
     ) -> bool {
+        if self.handle_left_click_unload(world_xz, queue) {
+            return true;
+        }
+        if self.handle_left_click_order(world_xz, queue, pick_radius) {
+            return true;
+        }
         if let Some(ref btype) = self.build_mode.clone() {
-            let Some(builder_id) = self.selected_or_commander_builder() else {
+            let Some(builder_id) = self.builder_for(btype) else {
                 self.build_mode = None;
                 self.status_banner = "No builder alive".to_string();
                 return true;
             };
-            let is_mex = self
-                .world
-                .catalog()
-                .get(btype)
-                .is_some_and(|t| t.role == Role::Extractor);
-            let target = if is_mex {
+            let target_role = self.world.catalog().get(btype).map(|t| t.role);
+            let target = if target_role == Some(Role::Extractor) {
                 match self.world.snap_extractor(world_xz.0, world_xz.1) {
                     Some((_, p)) => p,
                     None => {
                         self.status_banner = "No free mass point nearby".to_string();
+                        return true;
+                    }
+                }
+            } else if target_role == Some(Role::Hydro) {
+                match self.world.snap_hydro(world_xz.0, world_xz.1) {
+                    Some((_, p)) => p,
+                    None => {
+                        self.status_banner = "No free hydrocarbon point nearby".to_string();
                         return true;
                     }
                 }
@@ -618,6 +840,11 @@ impl PlaySession {
                     queue,
                 },
             );
+            // Phase 23: the other selected builders assist the primary one.
+            let helpers: Vec<UnitId> = self.selected_builders().into_iter().filter(|&b| b != builder_id).collect();
+            if !helpers.is_empty() {
+                self.world.issue(self.human_army, Command::Assist { units: helpers, target: builder_id, queue: true });
+            }
             self.status_banner = format!("Ordered build: {btype}");
             if !queue {
                 self.build_mode = None;
@@ -627,7 +854,11 @@ impl PlaySession {
 
         if self.attack_move_mode {
             let units = self.selected_mobiles();
-            if !units.is_empty() {
+            let enemy = self.world.unit_at(world_xz, pick_radius, None, Some(self.human_army));
+            if let (false, Some(target)) = (units.is_empty(), enemy) {
+                self.world.issue(self.human_army, Command::Attack { units, target, queue });
+                self.status_banner = format!("Attack target #{target}");
+            } else if !units.is_empty() {
                 self.world.issue(
                     self.human_army,
                     Command::AttackMove {
@@ -649,9 +880,9 @@ impl PlaySession {
     }
 
     pub fn issue_right_click(&mut self, world_xz: (i64, i64), queue: bool, pick_radius: i64) {
-        if self.build_mode.is_some() || self.attack_move_mode {
+        if self.build_mode.is_some() || self.attack_move_mode || self.ui.unload_mode || self.ui.order_mode.is_some() {
             self.build_mode = None;
-            self.attack_move_mode = false;
+            self.clear_order_mode();
             self.status_banner = "Cancelled active mode".to_string();
             return;
         }
@@ -709,6 +940,10 @@ impl PlaySession {
                 },
             );
             self.status_banner = format!("Attack target #{target}");
+            return;
+        }
+
+        if self.handle_right_click_board(world_xz, queue, pick_radius) {
             return;
         }
 
@@ -783,6 +1018,7 @@ impl PlaySession {
             _ => return,
         };
         self.attack_move_mode = false;
+        self.ui.unload_mode = false;
         self.build_mode = Some(tid.clone());
         self.status_banner = format!("Place {tid} (LMB place, Shift+LMB queue, RMB cancel)");
     }
@@ -863,6 +1099,7 @@ impl PlaySession {
     pub fn trigger_stop(&mut self) {
         self.build_mode = None;
         self.attack_move_mode = false;
+        self.ui.unload_mode = false;
         if !self.selected.is_empty() {
             let units = self.selected.clone();
             self.world.issue(self.human_army, Command::Stop { units });
@@ -884,15 +1121,17 @@ impl PlaySession {
             HudAction::ProduceArtillery => self.trigger_produce(2, count),
             HudAction::AttackMove => {
                 self.build_mode = None;
+                self.ui.unload_mode = false;
+                self.ui.order_mode = None;
                 self.attack_move_mode = !self.attack_move_mode;
                 self.status_banner = if self.attack_move_mode {
-                    "Attack-Move: LMB target location".to_string()
+                    "Attack: LMB enemy = attack, ground = attack-move".to_string()
                 } else {
                     "Cancelled Attack-Move".to_string()
                 };
             }
             HudAction::Stop => self.trigger_stop(),
-            HudAction::TogglePause => self.paused = !self.paused,
+            HudAction::TogglePause => self.toggle_pause(),
             HudAction::ToggleFog => {
                 self.fog_of_war = !self.fog_of_war;
                 self.status_banner = if self.fog_of_war {
@@ -902,6 +1141,37 @@ impl PlaySession {
                 };
             }
             HudAction::ToggleAi => self.toggle_spectate(),
+            HudAction::IdleEngineer => {
+                self.cycle_idle_engineer();
+            }
+            HudAction::UnloadTransport => self.trigger_unload_mode(),
+            HudAction::ToggleRepeat => self.trigger_toggle_repeat(),
+            HudAction::EnhanceNext => self.trigger_enhance_selected(shift),
+            HudAction::ToggleShield => self.trigger_toggle_shield(),
+            HudAction::Order(kind) => self.trigger_order(kind),
+            HudAction::CardItem(idx) => self.trigger_card_item(idx as usize, shift, false),
+            HudAction::CardTab(t) => self.set_card_tab(t),
+            HudAction::CardGroup(g) => self.set_card_group(g),
+            HudAction::CardPage => self.next_card_page(),
+            HudAction::QueueItem(idx) => self.trigger_queue_cancel(idx as usize, shift),
+            HudAction::Upgrade => self.trigger_upgrade(),
+            HudAction::EnhanceRow(idx) => self.trigger_enhance_row(idx as usize),
+        }
+    }
+
+    /// Right-click on a HUD element (card entry: dequeue one, queue entry: cancel one).
+    /// Returns `true` if the element reacts to RMB.
+    pub fn trigger_hud_secondary(&mut self, action: HudAction, shift: bool) -> bool {
+        match action {
+            HudAction::CardItem(idx) => {
+                self.trigger_card_item(idx as usize, shift, true);
+                true
+            }
+            HudAction::QueueItem(idx) => {
+                self.trigger_queue_cancel(idx as usize, shift);
+                true
+            }
+            _ => false,
         }
     }
 
@@ -976,6 +1246,14 @@ fn army_color(world: &Skirmish, army: ArmyId) -> [f32; 4] {
 }
 
 fn unit_yaw(world: &Skirmish, u: &crate::skirmish::Unit) -> f32 {
+    // Walking units face their path; turrets (GPU-skinned) track the target independently.
+    if u.moving
+        && let Some(UnitOrder::Move { x, y } | UnitOrder::AttackMove { x, y } | UnitOrder::Patrol { x, y }) =
+            u.orders.front()
+        && (*x != u.pos.x || *y != u.pos.y)
+    {
+        return ((x - u.pos.x) as f32).atan2((y - u.pos.y) as f32);
+    }
     if let Some((tid, _)) = u.last_shot
         && let Some(t) = world.unit(tid)
     {
@@ -984,6 +1262,8 @@ fn unit_yaw(world: &Skirmish, u: &crate::skirmish::Unit) -> f32 {
     match u.orders.front() {
         Some(UnitOrder::Move { x, y })
         | Some(UnitOrder::AttackMove { x, y })
+        | Some(UnitOrder::Patrol { x, y })
+        | Some(UnitOrder::LaunchMissile { x, y })
         | Some(UnitOrder::Build { x, y, .. })
         | Some(UnitOrder::Reclaim { x, y }) => {
             ((x - u.pos.x) as f32).atan2((y - u.pos.y) as f32)
@@ -995,7 +1275,9 @@ fn unit_yaw(world: &Skirmish, u: &crate::skirmish::Unit) -> f32 {
             .unit(*tid)
             .map(|t| ((t.pos.x - u.pos.x) as f32).atan2((t.pos.y - u.pos.y) as f32))
             .unwrap_or(0.0),
-        None => 0.0,
+        Some(UnitOrder::Unload { x, y }) => ((x - u.pos.x) as f32).atan2((y - u.pos.y) as f32),
+        Some(UnitOrder::Board(_) | UnitOrder::Enhance(_)) => 0.0,
+        Some(UnitOrder::Upgrade(_)) | None => 0.0,
     }
 }
 
@@ -1005,6 +1287,7 @@ pub(crate) fn build_skirmish_render_frame(
     meshes: &UnitMeshCache,
     camera: &OrbitCamera,
 ) -> (BTreeMap<String, Vec<GpuUnitInstance>>, Vec<GpuVertex>, Vec<u32>) {
+    let _p = crate::profiler::scope("render.build_frame");
     let mut batches: BTreeMap<String, Vec<GpuUnitInstance>> = BTreeMap::new();
     let mut verts = Vec::with_capacity(8192);
     let mut indices = Vec::with_capacity(16384);
@@ -1013,6 +1296,38 @@ pub(crate) fn build_skirmish_render_frame(
     let strategic_zoom = camera.distance > 340.0;
     let world = &session.world;
     let selected_set = &session.selected;
+    let fow_viewer = session.fog_of_war.then_some(session.human_army);
+    {
+        let _p = crate::profiler::scope("render.begin_frame");
+        meshes.living.begin_frame(world, scmap, fow_viewer, zoom_boost);
+    }
+    let frame_time = meshes.living.frame_time();
+    let eye = camera.eye_position();
+    // CPU frustum culling of unit/wreck mesh instances, bone poses and bars (generous margin so
+    // shadows of units just off-screen still land in view).
+    let frustum = viewer::Frustum::from_view_proj(&camera.view_proj_matrix());
+
+    let mut army_colors = [[0.7, 0.7, 0.7, 0.85]; 8];
+    let mut army_is_cybran = [false; 8];
+    for idx in 0..8usize {
+        let a = idx as ArmyId;
+        army_colors[idx] = army_color(world, a);
+        army_is_cybran[idx] = world
+            .army(a)
+            .and_then(|ar| world.catalog().factions.get(ar.faction))
+            .is_some_and(|f| f.key == "cybran");
+    }
+    let sel_lookup: Option<std::collections::HashSet<UnitId>> =
+        (selected_set.len() > 8).then(|| selected_set.iter().copied().collect());
+    let is_unit_selected = |id: UnitId| -> bool {
+        if selected_set.is_empty() {
+            false
+        } else if let Some(ref set) = sel_lookup {
+            set.contains(&id)
+        } else {
+            selected_set.contains(&id)
+        }
+    };
 
     // 1. Unclaimed mass deposit pads + emerald locator rings
     for (idx, &(mx, mz)) in world.mass_points().iter().enumerate() {
@@ -1037,9 +1352,12 @@ pub(crate) fn build_skirmish_render_frame(
 
     // 2. Reclaimable wrecks (charred real unit .scm meshes; box fallback in strategic zoom or missing type)
     for w in world.wrecks() {
+        let Some((sink_dy, sink_tilt)) = meshes.living.wreck_pose(w, scmap) else {
+            continue;
+        };
         let wx = w.pos.x as f32 / scale;
         let wz = w.pos.y as f32 / scale;
-        let wy = sample_terrain_y(scmap, wx, wz);
+        let wy = sample_terrain_y(scmap, wx, wz) + sink_dy;
         if strategic_zoom || w.type_id.is_empty() {
             let sz = 0.48 * zoom_boost.sqrt();
             append_box_world(&mut verts, &mut indices, [wx, wy, wz], sz, sz * 0.35, [0.05, 0.045, 0.042, 0.25]);
@@ -1050,8 +1368,11 @@ pub(crate) fn build_skirmish_render_frame(
                 0.0
             };
             let yaw = ((w.id.wrapping_mul(2654435761) & 1023) as f32 / 1024.0) * std::f32::consts::TAU;
-            let tilt = (((w.id % 5) as f32) - 2.0) * 0.07;
+            let tilt = (((w.id % 5) as f32) - 2.0) * 0.07 + sink_tilt;
             let render_scale = zoom_boost * 1.10;
+            if !frustum.sphere_visible([wx, wy, wz], 6.0 * render_scale + 4.0) {
+                continue;
+            }
             batches.entry(w.type_id.clone()).or_default().push(
                 GpuUnitInstance::from_pos_yaw_scale(
                     [wx, wy - 0.12 * render_scale, wz],
@@ -1066,6 +1387,34 @@ pub(crate) fn build_skirmish_render_frame(
     }
 
     // 3. Units (instanced real .scm meshes at close/mid zoom, crisp strategic icons when zoomed far out)
+    struct TypeBatchCache {
+        use_tex: f32,
+        lod_cutoff_sq: f32,
+        lod0_idx: usize,
+        lod1_idx: Option<usize>,
+    }
+    fn intern_batch(
+        key: &str,
+        keys: &mut Vec<String>,
+        vecs: &mut Vec<Vec<GpuUnitInstance>>,
+        map: &mut std::collections::HashMap<String, usize>,
+    ) -> usize {
+        if let Some(&idx) = map.get(key) {
+            idx
+        } else {
+            let idx = keys.len();
+            keys.push(key.to_string());
+            vecs.push(Vec::new());
+            map.insert(key.to_string(), idx);
+            idx
+        }
+    }
+    let mut batch_keys: Vec<String> = Vec::with_capacity(32);
+    let mut batch_vecs: Vec<Vec<GpuUnitInstance>> = Vec::with_capacity(32);
+    let mut batch_key_to_idx: std::collections::HashMap<String, usize> = std::collections::HashMap::with_capacity(32);
+    let mut type_cache: std::collections::HashMap<&str, TypeBatchCache> = std::collections::HashMap::with_capacity(32);
+
+    let units_span = crate::profiler::scope("render.units");
     for u in world.units() {
         let vis = if session.fog_of_war {
             world.intel_visibility(session.human_army, u)
@@ -1077,8 +1426,11 @@ pub(crate) fn build_skirmish_render_frame(
         }
         let wx = u.pos.x as f32 / scale;
         let wz = u.pos.y as f32 / scale;
-        let wy = sample_terrain_y(scmap, wx, wz);
-        let color = army_color(world, u.army);
+        let wy = sample_terrain_y(scmap, wx, wz) + crate::render_prep::LivingBattlefield::unit_lift_with_time(u, frame_time);
+        let color = army_colors
+            .get(usize::from(u.army))
+            .copied()
+            .unwrap_or_else(|| army_color(world, u.army));
 
         if vis == IntelVisibility::RadarBlip {
             let r = 1.8 * zoom_boost.sqrt();
@@ -1091,32 +1443,78 @@ pub(crate) fn build_skirmish_render_frame(
         } else {
             zoom_boost * 1.15
         };
+        let cull_r = (u.radius as f32 / scale).max(1.0) * render_scale * 2.5 + 6.0;
+        let on_screen = frustum.sphere_visible([wx, wy, wz], cull_r);
+        let is_sel = is_unit_selected(u.id);
 
-        if strategic_zoom {
+        if strategic_zoom
+            && !meshes.living.push_strategic_icon(
+                u,
+                [wx, wy + 0.5, wz],
+                [color[0], color[1], color[2]],
+                is_sel,
+            )
+        {
             let s = (u.radius as f32 / scale).max(1.2) * (zoom_boost * 0.75);
             let h = if u.role == Role::Commander { s * 1.6 } else if u.role.is_structure() { s * 0.9 } else { s * 1.1 };
             append_box_world(&mut verts, &mut indices, [wx, wy + 0.3, wz], s, h, color);
-        } else {
+        } else if !strategic_zoom {
             let yaw = if u.role.is_structure() { 0.0 } else { unit_yaw(world, u) };
-            let use_tex = if meshes.mesh_for(&u.type_id, u.role).albedo.is_some() {
-                1.0
-            } else {
-                0.0
-            };
-            batches
-                .entry(u.type_id.clone())
-                .or_default()
-                .push(GpuUnitInstance::from_pos_yaw_scale(
+            if on_screen {
+                let (use_tex, lod_cutoff_sq, lod0_idx, lod1_idx) = if let Some(c) = type_cache.get(u.type_id.as_str()) {
+                    (c.use_tex, c.lod_cutoff_sq, c.lod0_idx, c.lod1_idx)
+                } else {
+                    let use_tex = if meshes.mesh_for(&u.type_id, u.role).albedo.is_some() {
+                        1.0
+                    } else {
+                        0.0
+                    };
+                    let lod0_idx = intern_batch(&u.type_id, &mut batch_keys, &mut batch_vecs, &mut batch_key_to_idx);
+                    let (lod_cutoff_sq, lod1_idx) = match meshes.living.asset_lod_info(&u.type_id) {
+                        Some((_, cutoff_sq, Some(l1_key))) => (
+                            cutoff_sq,
+                            Some(intern_batch(l1_key, &mut batch_keys, &mut batch_vecs, &mut batch_key_to_idx)),
+                        ),
+                        _ => (f32::INFINITY, None),
+                    };
+                    type_cache.insert(
+                        u.type_id.as_str(),
+                        TypeBatchCache { use_tex, lod_cutoff_sq, lod0_idx, lod1_idx },
+                    );
+                    (use_tex, lod_cutoff_sq, lod0_idx, lod1_idx)
+                };
+                let batch_idx = if let Some(l1) = lod1_idx {
+                    let dx = wx - eye[0];
+                    let dy = wy - eye[1];
+                    let dz = wz - eye[2];
+                    if dx * dx + dy * dy + dz * dz > lod_cutoff_sq { l1 } else { lod0_idx }
+                } else {
+                    lod0_idx
+                };
+                let inst = GpuUnitInstance::from_pos_yaw_scale(
                     [wx, wy, wz],
                     yaw,
                     0.0,
                     render_scale,
                     color,
                     [use_tex, 0.0, 0.0, 0.85],
-                ));
+                );
+                let slot = batch_vecs[batch_idx].len();
+                let inst = meshes.living.skin_instance(u, yaw, inst, Some((batch_idx, slot)));
+                batch_vecs[batch_idx].push(inst);
+            } else {
+                let inst = GpuUnitInstance::from_pos_yaw_scale(
+                    [wx, wy, wz],
+                    yaw,
+                    0.0,
+                    render_scale,
+                    color,
+                    [0.0, 0.0, 0.0, 0.85],
+                );
+                meshes.living.skin_instance(u, yaw, inst, None);
+            }
         }
 
-        let is_sel = selected_set.contains(&u.id);
         let radius_m = (u.radius as f32 / scale) * render_scale;
 
         if is_sel {
@@ -1131,7 +1529,7 @@ pub(crate) fn build_skirmish_render_frame(
             );
         }
 
-        if is_sel || u.hp < u.max_hp || u.role == Role::Commander {
+        if on_screen && (is_sel || u.hp < u.max_hp || u.role == Role::Commander) {
             let bar_y = wy + (radius_m * 1.25).max(2.4) + 1.2;
             let bar_w = (radius_m * 1.6).clamp(2.2, 8.0);
             let bar_h = 0.45 * zoom_boost.sqrt();
@@ -1180,8 +1578,9 @@ pub(crate) fn build_skirmish_render_frame(
         {
             let tx = t.pos.x as f32 / scale;
             let tz = t.pos.y as f32 / scale;
-            let ty = sample_terrain_y(scmap, tx, tz) + 1.2;
-            let tracer_col = if world.army(u.army).and_then(|a| world.catalog().factions.get(a.faction)).is_some_and(|f| f.key == "cybran") {
+            let ty = sample_terrain_y(scmap, tx, tz) + 1.2 + crate::render_prep::LivingBattlefield::unit_lift_with_time(t, frame_time);
+            let is_cybran = army_is_cybran.get(usize::from(u.army)).copied().unwrap_or(false);
+            let tracer_col = if is_cybran {
                 [1.0, 0.28, 0.22, 0.95]
             } else {
                 [0.45, 0.88, 1.0, 0.95]
@@ -1202,8 +1601,13 @@ pub(crate) fn build_skirmish_render_frame(
                 let (dest, col) = match ord {
                     UnitOrder::Move { x, y } => ((*x, *y), [0.25, 0.95, 0.45, 0.2]),
                     UnitOrder::AttackMove { x, y } => ((*x, *y), [1.0, 0.55, 0.15, 0.2]),
+                    UnitOrder::Patrol { x, y } => ((*x, *y), [0.40, 0.70, 1.0, 0.2]),
+                    UnitOrder::LaunchMissile { x, y } => ((*x, *y), [1.0, 0.35, 0.20, 0.2]),
                     UnitOrder::Build { x, y, .. } => ((*x, *y), [1.0, 0.88, 0.25, 0.2]),
                     UnitOrder::Reclaim { x, y } => ((*x, *y), [0.25, 0.90, 0.78, 0.2]),
+                    UnitOrder::Upgrade(_) => continue,
+                    UnitOrder::Unload { x, y } => ((*x, *y), [0.85, 0.80, 0.30, 0.2]),
+                    UnitOrder::Board(_) | UnitOrder::Enhance(_) => continue,
                     UnitOrder::Attack(tid) | UnitOrder::Overcharge(tid) => {
                         if let Some(t) = world.unit(*tid) {
                             ((t.pos.x, t.pos.y), [1.0, 0.22, 0.22, 0.2])
@@ -1244,23 +1648,35 @@ pub(crate) fn build_skirmish_render_frame(
         }
     }
 
-    // 4. Ballistic projectiles & Overcharge bolts
-    for p in world.projectiles() {
-        let px = p.pos.x as f32 / scale;
-        let pz = p.pos.y as f32 / scale;
-        let t = (p.ticks_lived as f32 / p.total_ticks.max(1) as f32).clamp(0.0, 1.0);
-        let arc_y = 4.0 * t * (1.0 - t) * (p.arc_height as f32 / scale);
-        let py = sample_terrain_y(scmap, px, pz) + 1.2 + arc_y;
-        let (sz, col) = if p.is_overcharge {
-            (1.1 * zoom_boost.sqrt(), [0.35, 0.92, 1.0, 0.95])
-        } else {
-            (0.45 * zoom_boost.sqrt(), [1.0, 0.72, 0.20, 0.95])
-        };
-        append_box_world(&mut verts, &mut indices, [px, py, pz], sz, sz, col);
+    // 4. Death clips, construction build-up ghosts & projectile meshes (glows/trails: VFX pass)
+    drop(units_span);
+    meshes.living.resolve_pose_jobs(&mut batch_vecs);
+    for (key, vec) in batch_keys.into_iter().zip(batch_vecs) {
+        if vec.is_empty() {
+            continue;
+        }
+        match batches.entry(key) {
+            std::collections::btree_map::Entry::Vacant(e) => {
+                e.insert(vec);
+            }
+            std::collections::btree_map::Entry::Occupied(mut e) => {
+                e.get_mut().extend(vec);
+            }
+        }
     }
+    let _pfi = crate::profiler::scope("render.frame_instances");
+    meshes.living.append_frame_instances(
+        world,
+        scmap,
+        fow_viewer,
+        zoom_boost,
+        strategic_zoom,
+        &mut batches,
+        &|id| meshes.mesh_for(id, Role::Mobile).albedo.is_some(),
+    );
 
     // 5. Build placement ghost
-    if let (Some(btype), Some(hover)) = (&session.build_mode, session.hover_world) {
+    if let (Some(btype), Some(hover), None) = (&session.build_mode, session.hover_world, session.ui.build_drag) {
         let mut hx = world_f32_to_milli(hover);
         let is_mex = world
             .catalog()
@@ -1312,6 +1728,9 @@ pub(crate) fn build_skirmish_render_frame(
         }
     }
 
+    // 7. Phase 13 overlays: range rings, formation preview, area circle, drag-line ghosts
+    crate::controls::append_ui_overlays(session, scmap, &mut verts, &mut indices, zoom_boost);
+
     (batches, verts, indices)
 }
 
@@ -1358,7 +1777,7 @@ fn append_box_world(
     indices.extend(idx.into_iter().map(|i| base + i));
 }
 
-fn append_ring(
+pub(crate) fn append_ring(
     verts: &mut Vec<GpuVertex>,
     indices: &mut Vec<u32>,
     center: [f32; 3],
@@ -1435,7 +1854,7 @@ fn append_bar_billboard(
     }
 }
 
-fn append_beam(
+pub(crate) fn append_beam(
     verts: &mut Vec<GpuVertex>,
     indices: &mut Vec<u32>,
     a: [f32; 3],
@@ -1558,7 +1977,7 @@ pub fn battle_snapshot_camera(world: &Skirmish, scmap: &ScMap, aspect: f32) -> O
     cam
 }
 
-fn build_terrain_loaded_scene(
+pub(crate) fn build_terrain_loaded_scene(
     game_dir: Option<&Path>,
     map: &MapContext,
     camera: OrbitCamera,
@@ -1568,6 +1987,9 @@ fn build_terrain_loaded_scene(
     let sky_cube = game_dir.and_then(|d| scene::load_sky_cubemap(d, &map.scmap));
     let prop_batches = game_dir
         .map(|d| scene::load_map_props(d, &map.scmap))
+        .unwrap_or_default();
+    let decal_batches = game_dir
+        .map(|d| scene::load_map_decals(d, &map.scmap))
         .unwrap_or_default();
 
     let baked = if terrain_splat.is_some() {
@@ -1605,11 +2027,12 @@ fn build_terrain_loaded_scene(
         water,
         sky_cube,
         prop_batches,
+        decal_batches,
     };
     (scene, minimap_img)
 }
 
-fn upload_unit_templates(
+pub(crate) fn upload_unit_templates(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     resources: &GpuSceneResources,
@@ -1622,11 +2045,12 @@ fn upload_unit_templates(
             .iter()
             .zip(nm.normals.iter())
             .zip(nm.uvs.iter())
-            .map(|((&p, &n), &uv)| GpuVertex {
+            .enumerate()
+            .map(|(vi, ((&p, &n), &uv))| GpuVertex {
                 position: p,
                 normal: n,
                 uv,
-                color: [1.0, 1.0, 1.0, 0.5],
+                color: [1.0, 1.0, 1.0, meshes.living.vertex_bone(id, vi)],
             })
             .collect();
         let tpl = resources.create_mesh_template(
@@ -1639,10 +2063,11 @@ fn upload_unit_templates(
         );
         templates.insert(id.clone(), tpl);
     }
+    meshes.living.create_lod_templates(device, queue, resources, &mut templates);
     templates
 }
 
-fn upload_frame_resources(
+pub(crate) fn upload_frame_resources(
     device: &wgpu::Device,
     resources: &mut GpuSceneResources,
     templates: &BTreeMap<String, GpuMeshTemplate>,
@@ -1653,33 +2078,49 @@ fn upload_frame_resources(
     width: u32,
     height: u32,
 ) {
+    let _p = crate::profiler::scope("render.prep_upload");
     let (batches, dyn_v, dyn_i) = build_skirmish_render_frame(session, &map.scmap, meshes, camera);
-    let gpu_batches: Vec<(&GpuMeshTemplate, &[GpuUnitInstance])> = batches
-        .iter()
-        .filter_map(|(tid, insts)| templates.get(tid).map(|tpl| (tpl, insts.as_slice())))
-        .collect();
-    resources.set_unit_batches(device, gpu_batches);
-    resources.set_dynamic(device, &dyn_v, &dyn_i);
+    {
+        let _p = crate::profiler::scope("render.upload_units");
+        let gpu_batches: Vec<(&GpuMeshTemplate, &[GpuUnitInstance])> = batches
+            .iter()
+            .filter_map(|(tid, insts)| templates.get(tid).map(|tpl| (tpl, insts.as_slice())))
+            .collect();
+        resources.set_unit_batches(device, gpu_batches);
+        resources.set_dynamic(device, &dyn_v, &dyn_i);
+    }
+    let fow_viewer = session.fog_of_war.then_some(session.human_army);
+    {
+        let _p = crate::profiler::scope("render.upload_living");
+        meshes.living.upload(device, resources, &session.world, &map.scmap, fow_viewer, camera, width, height);
+    }
 
-    let (mm_v, mm_i, bg_v, bg_i, ic_v, ic_i, fg_v, fg_i) =
+    let _p = crate::profiler::scope("render.hud");
+    let (mm_v, mm_i, mut bg_v, mut bg_i, ic_v, ic_i, mut fg_v, mut fg_i) =
         hud::build_hud_geometry(session, map, camera, width, height);
+    crate::profiler::append_overlay(&mut bg_v, &mut bg_i, &mut fg_v, &mut fg_i, width as f32, height as f32);
     resources.set_hud(device, &mm_v, &mm_i, &bg_v, &bg_i, &ic_v, &ic_i, &fg_v, &fg_i);
 }
 
-fn upload_hud_icons(
+pub(crate) fn upload_hud_icons(
     game_dir: Option<&Path>,
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     resources: &mut GpuSceneResources,
     session: &PlaySession,
 ) {
+    // Phase 23: grid atlas of every catalog unit icon (command card, queue panel).
     let Some(dir) = game_dir else {
+        crate::command_card::set_atlas_ids(None);
         return;
     };
-    let ids = hud::human_faction_icon_ids(session);
-    let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
-    if let Some(atlas) = scene::load_hud_icon_atlas(dir, &refs) {
-        resources.set_hud_icons_texture(device, queue, &atlas);
+    let ids = crate::command_card::atlas_icon_ids(session.world.catalog());
+    match crate::command_card::load_icon_atlas(dir, &ids) {
+        Some((atlas, found_ids)) => {
+            resources.set_hud_icons_texture(device, queue, &atlas);
+            crate::command_card::set_atlas_ids(Some(found_ids));
+        }
+        None => crate::command_card::set_atlas_ids(None),
     }
 }
 
@@ -1704,6 +2145,46 @@ pub fn render_skirmish_snapshot(
     let mut camera = camera_override
         .unwrap_or_else(|| initial_army_camera(&session.world, &map.scmap, session.human_army, aspect));
     camera.set_aspect(width, height);
+    // Test hook: `FARUST_SNAPSHOT_SELECT=1` pre-selects the human army so selection overlays
+    // (range rings, stats card) appear in offscreen snapshots. Phase 23: `=acu`, `=engineer`,
+    // `=factory` (with a queue) or `=enhance` (ACU mid-enhancement) select one unit class for
+    // the command card / queue / enhancement panels; `FARUST_SNAPSHOT_HOVER=card` hovers the
+    // first card entry (tooltip), `FARUST_SNAPSHOT_TAB=N` picks the card tech tab.
+    let preselected;
+    let session = if let Ok(sel) = std::env::var("FARUST_SNAPSHOT_SELECT") {
+        let mut s = session.clone();
+        if !crate::command_card::snapshot_select(&mut s, sel.trim()) {
+            s.preselect_army_for_snapshot();
+        }
+        if let Some(t) = std::env::var("FARUST_SNAPSHOT_TAB").ok().and_then(|v| v.trim().parse::<u8>().ok()) {
+            s.set_card_tab(t);
+        }
+        if std::env::var("FARUST_SNAPSHOT_HOVER").is_ok_and(|v| v.trim() == "card") {
+            let layout = HudLayout::compute(&s, width, height);
+            if let Some(r) = layout.card.slots.first() {
+                s.ui.cursor_px = Some((r[0] + r[2] * 0.5, r[1] + r[3] * 0.5));
+                s.ui.hud_hover = layout.hit_test_button(r[0] + r[2] * 0.5, r[1] + r[3] * 0.5);
+            }
+        }
+        let scale = SCALE as f32;
+        let pts: Vec<(f32, f32)> = s
+            .selected
+            .iter()
+            .filter_map(|id| s.world.unit(*id))
+            .map(|u| (u.pos.x as f32 / scale, u.pos.y as f32 / scale))
+            .collect();
+        if !pts.is_empty() {
+            let n = pts.len() as f32;
+            let cx = pts.iter().map(|p| p.0).sum::<f32>() / n;
+            let cz = pts.iter().map(|p| p.1).sum::<f32>() / n;
+            camera.target = [cx, sample_terrain_y(&map.scmap, cx, cz), cz];
+            camera.distance = camera.distance.max(110.0);
+        }
+        preselected = s;
+        &preselected
+    } else {
+        session
+    };
     let (scene, minimap_img) = build_terrain_loaded_scene(game_dir, map, camera.clone());
 
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
@@ -1862,15 +2343,7 @@ pub fn run_play_window(
     height: u32,
 ) -> Result<(), String> {
     let event_loop = EventLoop::new().map_err(|e| format!("failed to create event loop: {e}"))?;
-    let mut app = PlayApp {
-        game_dir: game_dir.map(Path::to_path_buf),
-        session,
-        map,
-        meshes,
-        init_size: (width.max(480), height.max(360)),
-        state: None,
-        init_err: None,
-    };
+    let mut app = PlayApp::new(game_dir, session, map, meshes, width, height);
     event_loop
         .run_app(&mut app)
         .map_err(|e| format!("event loop error: {e}"))?;
@@ -1903,9 +2376,23 @@ struct PlayGpuState {
     last_step: Instant,
     accum_secs: f64,
     dirty_dynamic: bool,
+    /// Phase 23: window focus (edge scrolling) and the OS cursor currently shown.
+    focused: bool,
+    cursor_icon: winit::window::CursorIcon,
 }
 
-struct PlayApp {
+/// How the player asked to leave a running match (pause menu / end-of-game screen).
+/// A host shell (main menu, lobby) polls [`PlayApp::take_exit`] after each event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum PlayExit {
+    /// Return to the main menu / lobby (standalone windows simply exit).
+    ToMenu,
+    /// Quit the program.
+    Quit,
+}
+
+pub(crate) struct PlayApp {
     game_dir: Option<std::path::PathBuf>,
     session: PlaySession,
     map: MapContext,
@@ -1913,14 +2400,54 @@ struct PlayApp {
     init_size: (u32, u32),
     state: Option<PlayGpuState>,
     init_err: Option<String>,
+    /// Set when the player asked to leave the match; see [`PlayExit`].
+    pub(crate) exit: Option<PlayExit>,
+    /// True when hosted inside another app (menu/lobby) on the same event loop: a
+    /// `PlayExit::ToMenu` request must then NOT call `event_loop.exit()`.
+    pub(crate) embedded: bool,
 }
 
 impl PlayApp {
+    /// Builds the windowed play app (window is created on `resumed`); also used by the
+    /// in-window lobby (`lobby.rs`) to switch into the game on the same event loop.
+    pub(crate) fn new(
+        game_dir: Option<&Path>,
+        session: PlaySession,
+        map: MapContext,
+        meshes: UnitMeshCache,
+        width: u32,
+        height: u32,
+    ) -> Self {
+        meshes.living.enable_wall_clock();
+        PlayApp {
+            game_dir: game_dir.map(Path::to_path_buf),
+            session,
+            map,
+            meshes,
+            init_size: (width.max(480), height.max(360)),
+            state: None,
+            init_err: None,
+            exit: None,
+            embedded: false,
+        }
+    }
+
+    /// Takes the pending exit request, if the player asked to leave the match.
+    #[allow(dead_code)]
+    pub(crate) fn take_exit(&mut self) -> Option<PlayExit> {
+        self.exit.take()
+    }
+
+    pub(crate) fn take_init_err(&mut self) -> Option<String> {
+        self.init_err.take()
+    }
+
     fn init_window(&mut self, event_loop: &ActiveEventLoop) -> Result<PlayGpuState, String> {
         let title = self.session.window_title(&self.map.map_name);
         let attrs = Window::default_attributes()
             .with_title(title)
             .with_inner_size(PhysicalSize::new(self.init_size.0, self.init_size.1));
+        let attrs = crate::settings::apply_window_attrs(attrs);
         let window = Arc::new(
             event_loop
                 .create_window(attrs)
@@ -1938,9 +2465,13 @@ impl PlayApp {
         }))
         .ok_or_else(|| "no compatible GPU adapter for window surface".to_string())?;
 
-        let (device, queue) = pollster::block_on(
-            adapter.request_device(&wgpu::DeviceDescriptor::default(), None),
-        )
+        let (device, queue) = pollster::block_on(adapter.request_device(
+            &wgpu::DeviceDescriptor {
+                required_features: adapter.features() & wgpu::Features::TIMESTAMP_QUERY,
+                ..wgpu::DeviceDescriptor::default()
+            },
+            None,
+        ))
         .map_err(|e| format!("failed to request GPU device: {e}"))?;
 
         let size = window.inner_size();
@@ -1959,7 +2490,7 @@ impl PlayApp {
             format,
             width,
             height,
-            present_mode: wgpu::PresentMode::Fifo,
+            present_mode: crate::settings::present_mode(),
             alpha_mode: caps.alpha_modes[0],
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
@@ -1979,6 +2510,7 @@ impl PlayApp {
 
         let mut resources =
             GpuSceneResources::new(&device, &queue, &terrain_scene, format, MSAA_SAMPLES, &camera);
+        resources.enable_gpu_timer(&device, &queue);
         if let Some(ref mm) = minimap_img {
             resources.set_minimap_texture(&device, &queue, mm);
         }
@@ -2044,6 +2576,8 @@ impl PlayApp {
             last_step: Instant::now(),
             accum_secs: 0.0,
             dirty_dynamic: false,
+            focused: true,
+            cursor_icon: winit::window::CursorIcon::Default,
         })
     }
 
@@ -2052,19 +2586,144 @@ impl PlayApp {
             return;
         };
         let scale = SCALE as f32;
-        let pos = self
+        let sel: Vec<(f32, f32)> = self
             .session
             .selected
-            .first()
-            .and_then(|id| self.session.world.unit(*id))
-            .or_else(|| self.session.world.commander_of(self.session.human_army))
-            .map(|u| (u.pos.x as f32 / scale, u.pos.y as f32 / scale));
+            .iter()
+            .filter_map(|id| self.session.world.unit(*id))
+            .map(|u| (u.pos.x as f32 / scale, u.pos.y as f32 / scale))
+            .collect();
+        let pos = if sel.is_empty() {
+            self.session
+                .world
+                .commander_of(self.session.human_army)
+                .map(|u| (u.pos.x as f32 / scale, u.pos.y as f32 / scale))
+        } else {
+            let n = sel.len() as f32;
+            Some((sel.iter().map(|p| p.0).sum::<f32>() / n, sel.iter().map(|p| p.1).sum::<f32>() / n))
+        };
         if let Some((wx, wz)) = pos {
             let wy = sample_terrain_y(&self.map.scmap, wx, wz);
             st.camera.target = [wx, wy, wz];
             st.resources.update_camera(&st.queue, &st.camera);
             st.dirty_dynamic = true;
             st.window.request_redraw();
+        }
+    }
+
+    fn leave_match(&mut self, event_loop: &ActiveEventLoop, target: PlayExit) {
+        let _ = self.session.write_auto_replay(&self.map.map_id);
+        self.exit = Some(target);
+        if !self.embedded || target == PlayExit::Quit {
+            event_loop.exit();
+        }
+    }
+
+    fn quick_save(&mut self) {
+        let path = crate::savegame::data_dir("saves").join(crate::savegame::QUICKSAVE_FILE);
+        match self.session.save_game(&self.map.map_id, &self.map.map_name, &path) {
+            Ok(_) => {
+                let msg = format!("SAVED QUICKSAVE ({})", crate::controls::fmt_ticks(self.session.world.tick()));
+                self.session.status_banner = msg.clone();
+                self.session.chat.system(&msg);
+            }
+            Err(e) => {
+                let msg = format!("SAVE FAILED: {e}");
+                self.session.status_banner = msg.clone();
+                self.session.chat.system(&msg);
+            }
+        }
+    }
+
+    fn load_save_file(&mut self, path: &Path) {
+        if self.session.net.is_some() {
+            self.session.status_banner = "LOAD DISABLED IN NETWORKED MATCHES".to_string();
+            return;
+        }
+        match crate::savegame::SaveGame::read(path).and_then(|save| {
+            let origin = crate::savegame::origin_world(self.session.world.catalog().clone(), &self.map, &save.replay)?;
+            save.into_session(origin)
+        }) {
+            Ok(mut loaded) => {
+                loaded.muted = self.session.muted;
+                loaded.auto_record = self.session.auto_record;
+                self.session = loaded;
+            }
+            Err(e) => {
+                let msg = format!("LOAD FAILED: {e}");
+                self.session.status_banner = msg.clone();
+                self.session.chat.system(&msg);
+            }
+        }
+    }
+
+    fn switch_to_replay(&mut self, path: &Path) {
+        match Replay::load(path).and_then(|rep| {
+            let origin = crate::savegame::origin_world(self.session.world.catalog().clone(), &self.map, &rep)?;
+            Ok((origin, rep))
+        }) {
+            Ok((origin, rep)) => {
+                let muted = self.session.muted;
+                let mut sess = PlaySession::new_replay(origin, rep, 1);
+                sess.muted = muted;
+                self.session = sess;
+            }
+            Err(e) => {
+                self.session.status_banner = format!("REPLAY ERROR: {e}");
+            }
+        }
+    }
+
+    fn handle_match_menu_action(&mut self, event_loop: &ActiveEventLoop, act: hud::MatchMenuAction) {
+        match act {
+            hud::MatchMenuAction::Resume => {
+                self.session.menu = hud::MatchMenu::None;
+            }
+            hud::MatchMenuAction::QuickSave => {
+                self.quick_save();
+                self.session.menu = hud::MatchMenu::None;
+            }
+            hud::MatchMenuAction::OpenLoadList => {
+                let entries = crate::savegame::list_saves(Some(&self.map.map_id), 24);
+                self.session.menu = hud::MatchMenu::LoadList { entries, selected: 0 };
+            }
+            hud::MatchMenuAction::OpenScore => {
+                self.session.menu = hud::MatchMenu::Score {
+                    series: crate::stats::Series::MassIncome,
+                };
+            }
+            hud::MatchMenuAction::SelectLoad(idx) => {
+                if let hud::MatchMenu::LoadList { selected, .. } = &mut self.session.menu {
+                    *selected = idx;
+                }
+            }
+            hud::MatchMenuAction::LoadSelected(path) => {
+                self.load_save_file(&path);
+            }
+            hud::MatchMenuAction::SwitchScoreSeries(series) => {
+                if let hud::MatchMenu::Score { series: s } = &mut self.session.menu {
+                    *s = series;
+                }
+            }
+            hud::MatchMenuAction::WatchReplay => {
+                match self.session.write_auto_replay(&self.map.map_id) {
+                    Ok(Some(p)) => self.switch_to_replay(&p),
+                    Ok(None) => {
+                        if let Some(p) = self.session.recorder.as_ref().and_then(|r| r.replay_path.clone()) {
+                            self.switch_to_replay(&p);
+                        } else {
+                            self.session.status_banner = "NO REPLAY RECORDED".to_string();
+                        }
+                    }
+                    Err(e) => self.session.status_banner = format!("REPLAY ERROR: {e}"),
+                }
+            }
+            hud::MatchMenuAction::ContinueWatching => {
+                self.session.end_shown = true;
+                self.session.menu = hud::MatchMenu::None;
+            }
+            hud::MatchMenuAction::QuitToMenu => self.leave_match(event_loop, PlayExit::ToMenu),
+            hud::MatchMenuAction::QuitGame => self.leave_match(event_loop, PlayExit::Quit),
         }
     }
 }
@@ -2086,6 +2745,10 @@ impl ApplicationHandler for PlayApp {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if let Some(st) = self.state.as_ref() {
+            let _p = crate::profiler::scope("audio.frame");
+            crate::audio_play::frame(&mut self.session, self.game_dir.as_deref(), &st.camera);
+        }
         let Some(st) = self.state.as_mut() else {
             return;
         };
@@ -2093,18 +2756,50 @@ impl ApplicationHandler for PlayApp {
         let dt = now.duration_since(st.last_step).as_secs_f64().min(0.25);
         st.last_step = now;
 
-        if !self.session.paused && self.session.world.result().is_none() {
+        if self.session.loading() {
+            self.session.pump_load(Duration::from_millis(24));
+            st.accum_secs = 0.0;
+            st.dirty_dynamic = true;
+            st.window
+                .set_title(&self.session.window_title(&self.map.map_name));
+            st.window.request_redraw();
+            event_loop.set_control_flow(ControlFlow::Poll);
+            return;
+        }
+
+        if self.session.seeking() {
+            self.session.pump_replay_seek(Duration::from_millis(24));
+            st.accum_secs = 0.0;
+            st.dirty_dynamic = true;
+            st.window
+                .set_title(&self.session.window_title(&self.map.map_name));
+            st.window.request_redraw();
+            event_loop.set_control_flow(ControlFlow::Poll);
+            return;
+        }
+
+        if self.session.sim_active() {
             let step_interval = 1.0 / (TICK_HZ as f64 * self.session.speed as f64);
             st.accum_secs += dt;
             let mut stepped = false;
             let mut steps = 0;
             while st.accum_secs >= step_interval && steps < 8 {
                 st.accum_secs -= step_interval;
-                self.session.step_sim();
+                {
+                    let _p = crate::profiler::scope("sim.step_sim");
+                    self.session.step_sim();
+                }
                 stepped = true;
                 steps += 1;
             }
             if stepped {
+                if self.session.end_of_game_due() {
+                    self.session.end_shown = true;
+                    self.session.menu = hud::MatchMenu::Score {
+                        series: crate::stats::Series::MassIncome,
+                    };
+                    let _ = self.session.write_auto_replay(&self.map.map_id);
+                }
                 st.dirty_dynamic = true;
                 st.window
                     .set_title(&self.session.window_title(&self.map.map_name));
@@ -2112,6 +2807,51 @@ impl ApplicationHandler for PlayApp {
             }
         } else {
             st.accum_secs = 0.0;
+        }
+        if self.session.end_of_game_due() {
+            self.session.end_shown = true;
+            self.session.menu = hud::MatchMenu::Score {
+                series: crate::stats::Series::MassIncome,
+            };
+            let _ = self.session.write_auto_replay(&self.map.map_id);
+            st.dirty_dynamic = true;
+            st.window.request_redraw();
+        }
+        if self.meshes.living.wants_continuous_redraw() {
+            st.dirty_dynamic = true;
+            st.window.request_redraw();
+        }
+        // Phase 23: animated map pings keep redrawing until they expire.
+        if !self.session.chat.pings.is_empty() {
+            self.session.chat.prune_pings(now);
+            st.dirty_dynamic = true;
+            st.window.request_redraw();
+        }
+        // Phase 23: edge scrolling (Options -> Edge Scroll).
+        if st.focused
+            && !self.session.menu.is_open()
+            && !self.session.chat.is_typing()
+            && !st.mmb_drag
+            && st.rmb_down_px.is_none()
+            && crate::settings::edge_scroll_enabled()
+            && let Some((cx, cy)) = st.cursor_px
+        {
+            let (dx, dy) = crate::command_card::edge_scroll_dir(
+                cx as f32,
+                cy as f32,
+                st.config.width as f32,
+                st.config.height as f32,
+                4.0,
+            );
+            if dx != 0.0 || dy != 0.0 {
+                let speed = 1.1 * dt as f32;
+                st.camera.pan(dx * speed, dy * speed);
+                st.camera.target[0] = st.camera.target[0].clamp(0.0, self.map.scmap.map_width);
+                st.camera.target[2] = st.camera.target[2].clamp(0.0, self.map.scmap.map_height);
+                st.resources.update_camera(&st.queue, &st.camera);
+                st.dirty_dynamic = true;
+                st.window.request_redraw();
+            }
         }
 
         event_loop.set_control_flow(ControlFlow::WaitUntil(now + Duration::from_millis(16)));
@@ -2123,6 +2863,7 @@ impl ApplicationHandler for PlayApp {
         window_id: WindowId,
         event: WindowEvent,
     ) {
+        crate::audio_play::window_event(&mut self.session, &event);
         let Some(st) = self.state.as_mut() else {
             return;
         };
@@ -2131,9 +2872,22 @@ impl ApplicationHandler for PlayApp {
         }
 
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                self.leave_match(event_loop, PlayExit::Quit);
+            }
             WindowEvent::ModifiersChanged(mods) => {
                 st.modifiers = mods.state();
+            }
+            WindowEvent::Focused(f) => {
+                st.focused = f;
+            }
+            WindowEvent::CursorLeft { .. } => {
+                st.cursor_px = None;
+                self.session.ui.cursor_px = None;
+                if self.session.ui.hud_hover.take().is_some() {
+                    st.dirty_dynamic = true;
+                    st.window.request_redraw();
+                }
             }
             WindowEvent::Resized(new_size) => {
                 if new_size.width > 0 && new_size.height > 0 {
@@ -2161,6 +2915,9 @@ impl ApplicationHandler for PlayApp {
                     st.msaa_view = msaa_view;
                     st.depth_view = depth_view;
                     st.camera.set_aspect(new_size.width, new_size.height);
+                    // Window re-config: apply the active shadow quality live.
+                    st.resources
+                        .set_shadow_quality(&st.device, crate::settings::shadow_quality());
                     st.resources.update_camera(&st.queue, &st.camera);
                     st.dirty_dynamic = true;
                     st.window.request_redraw();
@@ -2177,10 +2934,50 @@ impl ApplicationHandler for PlayApp {
                     st.config.width,
                     st.config.height,
                 );
+                let hud_layout =
+                    HudLayout::compute(&self.session, st.config.width, st.config.height);
+                if let Some(ref mut rui) = self.session.ui.replay
+                    && rui.dragging
+                    && let Some(ref tl) = hud_layout.timeline
+                {
+                    let fin = self.session.replay_progress().map(|p| p.1).unwrap_or(0);
+                    if let Some(ref mut rui) = self.session.ui.replay {
+                        rui.drag_tick = Some(crate::controls::seek_target_tick(tl.frac_at(cur.0 as f32), fin));
+                    }
+                    st.dirty_dynamic = true;
+                    st.window.request_redraw();
+                    return;
+                }
+                let over_hud = hud_layout.over_hud(cur.0 as f32, cur.1 as f32);
+                // Phase 23: tooltips / cursor-mode label follow the cursor.
+                self.session.ui.cursor_px = Some((cur.0 as f32, cur.1 as f32));
+                let hud_hover = hud_layout.hit_test_button(cur.0 as f32, cur.1 as f32);
+                if hud_hover != self.session.ui.hud_hover
+                    || self.session.current_order_mode().is_some()
+                    || self.session.build_mode.is_some()
+                {
+                    self.session.ui.hud_hover = hud_hover;
+                    st.dirty_dynamic = true;
+                    st.window.request_redraw();
+                }
+                let hover_xz = if over_hud { None } else { hit.map(world_f32_to_milli) };
+                if self
+                    .session
+                    .update_hover_unit(hover_xz, pick_radius_for_camera(&st.camera))
+                {
+                    st.dirty_dynamic = true;
+                    st.window.request_redraw();
+                }
                 if self.session.build_mode.is_some() || st.lmb_down_px.is_some() {
                     self.session.hover_world = hit;
                     if let (Some(start_px), Some(cur_w)) = (st.lmb_down_px, hit) {
                         let d = (cur.0 - start_px.0).hypot(cur.1 - start_px.1);
+                        if d > 6.0
+                            && self.session.build_mode.is_some()
+                            && let Some(start_xz) = self.session.ui.lmb_down_world
+                        {
+                            self.session.ui.build_drag = Some((start_xz, world_f32_to_milli(cur_w)));
+                        }
                         if d > 6.0
                             && self.session.build_mode.is_none()
                             && !self.session.attack_move_mode
@@ -2203,8 +3000,42 @@ impl ApplicationHandler for PlayApp {
                 if let Some(down) = st.rmb_down_px {
                     if (cur.0 - down.0).hypot(cur.1 - down.1) > 6.0 {
                         st.rmb_dragged = true;
+                        if self.session.ui.rmb_drag.is_none() {
+                            let free_mode = self.session.build_mode.is_none()
+                                && !self.session.attack_move_mode
+                                && !self.session.is_replay()
+                                && !st.modifiers.alt_key()
+                                && self.session.ui.rmb_down_world.is_some();
+                            let has_builder = self.session.selected.iter().any(|id| {
+                                self.session.world.unit(*id).is_some_and(|u| {
+                                    u.army == self.session.human_army && u.role.is_builder()
+                                })
+                            });
+                            self.session.ui.rmb_drag = Some(if free_mode && st.modifiers.control_key() && has_builder {
+                                crate::controls::RmbDrag::Area
+                            } else if free_mode && self.session.has_mobile_selection() {
+                                crate::controls::RmbDrag::Formation
+                            } else {
+                                crate::controls::RmbDrag::Pan
+                            });
+                        }
                     }
-                    if st.rmb_dragged
+                    let drag_mode = self.session.ui.rmb_drag;
+                    if matches!(
+                        drag_mode,
+                        Some(crate::controls::RmbDrag::Formation | crate::controls::RmbDrag::Area)
+                    ) {
+                        if let (Some(a), Some(cur_w)) = (self.session.ui.rmb_down_world, hit) {
+                            let b = world_f32_to_milli(cur_w);
+                            if drag_mode == Some(crate::controls::RmbDrag::Formation) {
+                                self.session.update_formation_drag(a, b);
+                            } else {
+                                self.session.ui.area_drag = Some((a, b));
+                            }
+                            st.dirty_dynamic = true;
+                            st.window.request_redraw();
+                        }
+                    } else if st.rmb_dragged
                         && let Some((px, py)) = st.rmb_last_px
                     {
                         let dx = (cur.0 - px) as f32;
@@ -2238,9 +3069,93 @@ impl ApplicationHandler for PlayApp {
                 let shift = st.modifiers.shift_key();
                 let hud_layout =
                     HudLayout::compute(&self.session, st.config.width, st.config.height);
+                if self.session.loading() {
+                    return;
+                }
+                if pressed && button == MouseButton::Left
+                    && let Some(ml) = hud::MatchMenuLayout::compute(&self.session, st.config.width, st.config.height)
+                {
+                    if let Some(act) = ml.hit(cur.0 as f32, cur.1 as f32) {
+                        self.handle_match_menu_action(event_loop, act);
+                    }
+                    if let Some(st) = self.state.as_mut() {
+                        st.dirty_dynamic = true;
+                        st.window.set_title(&self.session.window_title(&self.map.map_name));
+                        st.window.request_redraw();
+                    }
+                    return;
+                }
+
+                // Phase 23 map pings: Alt+LMB alert, Alt+Shift+LMB attack, Alt+RMB move.
+                if pressed
+                    && st.modifiers.alt_key()
+                    && matches!(button, MouseButton::Left | MouseButton::Right)
+                    && !self.session.is_replay()
+                {
+                    let (px, py) = (cur.0 as f32, cur.1 as f32);
+                    let target = if let Some((u, v)) = hud_layout.hit_test_minimap(px, py) {
+                        Some(((u as f64 * self.map.size.0 as f64) as i64, (v as f64 * self.map.size.1 as f64) as i64))
+                    } else if hud_layout.over_hud(px, py) {
+                        None
+                    } else {
+                        pick_terrain_point(&st.camera, &self.map.scmap, px, py, st.config.width, st.config.height)
+                            .map(world_f32_to_milli)
+                    };
+                    if let Some((x, z)) = target {
+                        let kind = match (button, shift) {
+                            (MouseButton::Right, _) => crate::chat::PingKind::Move,
+                            (_, true) => crate::chat::PingKind::Attack,
+                            _ => crate::chat::PingKind::Alert,
+                        };
+                        self.session.chat.send_ping(kind, x, z);
+                        self.session.flush_local_chat();
+                        self.session.status_banner = format!("{} ping sent to allies", kind.label());
+                        st.dirty_dynamic = true;
+                        st.window.request_redraw();
+                        return;
+                    }
+                }
 
                 match button {
                     MouseButton::Left => {
+                        if !pressed
+                            && let Some(ref mut rui) = self.session.ui.replay
+                            && rui.dragging
+                        {
+                            rui.dragging = false;
+                            if let Some(t) = rui.drag_tick.take() {
+                                self.session.request_seek_tick(t);
+                            }
+                            st.dirty_dynamic = true;
+                            st.window.request_redraw();
+                            return;
+                        }
+                        if pressed
+                            && let Some(ref tl) = hud_layout.timeline
+                            && let Some(th) = tl.hit(cur.0 as f32, cur.1 as f32)
+                        {
+                            let max_speed = self.session.max_speed();
+                            match th {
+                                hud::TimelineHit::Seek(frac) => {
+                                    let fin = self.session.replay_progress().map(|p| p.1).unwrap_or(0);
+                                    if let Some(ref mut rui) = self.session.ui.replay {
+                                        rui.dragging = true;
+                                        rui.drag_tick = Some(crate::controls::seek_target_tick(frac, fin));
+                                    }
+                                }
+                                hud::TimelineHit::TogglePause => self.session.paused = !self.session.paused,
+                                hud::TimelineHit::Slower => {
+                                    self.session.speed = (self.session.speed / 2).clamp(1, max_speed)
+                                }
+                                hud::TimelineHit::Faster => {
+                                    self.session.speed = (self.session.speed * 2).clamp(1, max_speed)
+                                }
+                                hud::TimelineHit::Perspective => self.session.cycle_replay_perspective(),
+                            }
+                            st.dirty_dynamic = true;
+                            st.window.request_redraw();
+                            return;
+                        }
                         if pressed {
                             if let Some(act) = hud_layout.hit_test_button(cur.0 as f32, cur.1 as f32) {
                                 self.session.trigger_hud_action(act, shift);
@@ -2258,10 +3173,41 @@ impl ApplicationHandler for PlayApp {
                                 st.window.request_redraw();
                                 return;
                             }
+                            if hud_layout.over_hud(cur.0 as f32, cur.1 as f32) {
+                                return;
+                            }
                             st.lmb_down_px = Some(cur);
+                            self.session.ui.lmb_down_world = pick_terrain_point(
+                                &st.camera,
+                                &self.map.scmap,
+                                cur.0 as f32,
+                                cur.1 as f32,
+                                st.config.width,
+                                st.config.height,
+                            )
+                            .map(world_f32_to_milli);
                         } else if let Some(down) = st.lmb_down_px.take() {
                             self.session.drag_box_world = None;
+                            self.session.ui.lmb_down_world = None;
                             let drag_dist = (cur.0 - down.0).hypot(cur.1 - down.1);
+                            if self.session.ui.build_drag.is_some() {
+                                if !self.session.finish_build_drag(shift)
+                                    && let Some(hit) = pick_terrain_point(
+                                        &st.camera,
+                                        &self.map.scmap,
+                                        cur.0 as f32,
+                                        cur.1 as f32,
+                                        st.config.width,
+                                        st.config.height,
+                                    )
+                                {
+                                    let pick_r = pick_radius_for_camera(&st.camera);
+                                    self.session.issue_left_click_action(world_f32_to_milli(hit), shift, pick_r);
+                                }
+                                st.dirty_dynamic = true;
+                                st.window.request_redraw();
+                                return;
+                            }
                             if let Some(hit) = pick_terrain_point(
                                 &st.camera,
                                 &self.map.scmap,
@@ -2272,9 +3218,20 @@ impl ApplicationHandler for PlayApp {
                             ) {
                                 let pick_r = pick_radius_for_camera(&st.camera);
                                 let world_xz = world_f32_to_milli(hit);
-                                if drag_dist <= 6.0 {
+                                if drag_dist <= 6.0 || self.session.build_mode.is_some() || self.session.attack_move_mode {
                                     if !self.session.issue_left_click_action(world_xz, shift, pick_r) {
-                                        self.session.select_at(world_xz, shift, pick_r);
+                                        let now = self.session.ui.now_secs();
+                                        self.session.click_select(
+                                            world_xz,
+                                            shift,
+                                            st.modifiers.control_key(),
+                                            pick_r,
+                                            now,
+                                            &st.camera,
+                                            &self.map.scmap,
+                                            st.config.width as f32,
+                                            st.config.height as f32,
+                                        );
                                     }
                                 } else if let Some(start_hit) = pick_terrain_point(
                                     &st.camera,
@@ -2299,6 +3256,12 @@ impl ApplicationHandler for PlayApp {
                     }
                     MouseButton::Right => {
                         if pressed {
+                            if let Some(act) = hud_layout.hit_test_button(cur.0 as f32, cur.1 as f32) {
+                                self.session.trigger_hud_secondary(act, shift);
+                                st.dirty_dynamic = true;
+                                st.window.request_redraw();
+                                return;
+                            }
                             if let Some((u, v)) = hud_layout.hit_test_minimap(cur.0 as f32, cur.1 as f32) {
                                 let wx = (u as f64 * self.map.size.0 as f64).round() as i64;
                                 let wz = (v as f64 * self.map.size.1 as f64).round() as i64;
@@ -2307,14 +3270,48 @@ impl ApplicationHandler for PlayApp {
                                 st.window.request_redraw();
                                 return;
                             }
+                            if hud_layout.over_hud(cur.0 as f32, cur.1 as f32) {
+                                return;
+                            }
                             st.rmb_down_px = Some(cur);
                             st.rmb_last_px = Some(cur);
                             st.rmb_dragged = false;
+                            self.session.ui.rmb_drag = None;
+                            self.session.ui.rmb_down_world = pick_terrain_point(
+                                &st.camera,
+                                &self.map.scmap,
+                                cur.0 as f32,
+                                cur.1 as f32,
+                                st.config.width,
+                                st.config.height,
+                            )
+                            .map(world_f32_to_milli);
                         } else {
                             let was_drag = st.rmb_dragged;
-                            st.rmb_down_px = None;
+                            // A release without a world press (HUD / minimap) issues nothing.
+                            if st.rmb_down_px.take().is_none() {
+                                return;
+                            }
                             st.rmb_last_px = None;
                             st.rmb_dragged = false;
+                            self.session.ui.rmb_down_world = None;
+                            match self.session.ui.rmb_drag.take() {
+                                Some(crate::controls::RmbDrag::Formation) => {
+                                    self.session.finish_formation_drag(shift);
+                                    st.dirty_dynamic = true;
+                                    st.window.request_redraw();
+                                    return;
+                                }
+                                Some(crate::controls::RmbDrag::Area) => {
+                                    if let Some((c, e)) = self.session.ui.area_drag.take() {
+                                        self.session.issue_area_command(c, e, shift);
+                                    }
+                                    st.dirty_dynamic = true;
+                                    st.window.request_redraw();
+                                    return;
+                                }
+                                _ => {}
+                            }
                             if !was_drag
                                 && let Some(hit) = pick_terrain_point(
                                     &st.camera,
@@ -2359,38 +3356,173 @@ impl ApplicationHandler for PlayApp {
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 let shift = st.modifiers.shift_key();
-                let count = if shift { 5 } else { 1 };
-                let mut cam_changed = false;
-                let mut ui_changed = false;
-                match event.physical_key {
-                    PhysicalKey::Code(KeyCode::Escape) => {
-                        if self.session.build_mode.is_some() || self.session.attack_move_mode {
-                            self.session.build_mode = None;
-                            self.session.attack_move_mode = false;
-                            self.session.status_banner = "Cancelled active mode".to_string();
-                            ui_changed = true;
-                        } else {
-                            event_loop.exit();
-                            return;
+                let ctrl = st.modifiers.control_key();
+                if self.session.chat.is_typing() {
+                    match event.physical_key {
+                        PhysicalKey::Code(KeyCode::Escape) => {
+                            self.session.chat.input = None;
+                        }
+                        PhysicalKey::Code(KeyCode::Enter | KeyCode::NumpadEnter) => {
+                            self.session.chat.submit();
+                            self.session.flush_local_chat();
+                        }
+                        PhysicalKey::Code(KeyCode::Backspace) => {
+                            self.session.chat.backspace();
+                        }
+                        _ => {
+                            if let Some(text) = &event.text {
+                                self.session.chat.type_text(text.as_str());
+                            }
                         }
                     }
-                    PhysicalKey::Code(KeyCode::Digit1) => {
+                    st.dirty_dynamic = true;
+                    st.window.request_redraw();
+                    return;
+                }
+                let mut cam_changed = false;
+                let mut ui_changed = false;
+                // Phase 23: every binding goes through the (remappable) key map.
+                let PhysicalKey::Code(code) = event.physical_key else {
+                    return;
+                };
+                let keymap = crate::keymap::active();
+                let card_active = crate::settings::card_hotkeys_enabled() && self.session.card_active();
+                let Some(action) = keymap.lookup(code, ctrl, shift, st.modifiers.alt_key(), card_active) else {
+                    return;
+                };
+                use crate::command_card::OrderKind as OK;
+                use crate::keymap::Action as KA;
+                match action {
+                    KA::CancelOrMenu => {
+                        if self.session.build_mode.is_some() || self.session.current_order_mode().is_some() {
+                            self.session.build_mode = None;
+                            self.session.clear_order_mode();
+                            self.session.ui.build_drag = None;
+                            self.session.status_banner = "Cancelled active mode".to_string();
+                            ui_changed = true;
+                        } else if self.session.ui.formation_drag.is_some() || self.session.ui.area_drag.is_some() {
+                            self.session.ui.formation_drag = None;
+                            self.session.ui.formation_preview.clear();
+                            self.session.ui.area_drag = None;
+                            self.session.ui.rmb_drag = Some(crate::controls::RmbDrag::Pan);
+                            ui_changed = true;
+                        } else {
+                            self.session.menu = match &self.session.menu {
+                                hud::MatchMenu::None => hud::MatchMenu::Pause,
+                                hud::MatchMenu::LoadList { .. } => hud::MatchMenu::Pause,
+                                hud::MatchMenu::Score { .. } => {
+                                    self.session.end_shown = true;
+                                    hud::MatchMenu::None
+                                }
+                                hud::MatchMenu::Pause => hud::MatchMenu::None,
+                            };
+                            ui_changed = true;
+                        }
+                    }
+                    KA::ChatAll | KA::ChatAllies if !self.session.menu.is_open() => {
+                        self.session.chat.open(action == KA::ChatAllies);
+                        ui_changed = true;
+                    }
+                    KA::ChatAll | KA::ChatAllies => {}
+                    KA::ScoreScreen => {
+                        self.session.menu = if matches!(self.session.menu, hud::MatchMenu::Score { .. }) {
+                            hud::MatchMenu::None
+                        } else {
+                            hud::MatchMenu::Score { series: crate::stats::Series::MassIncome }
+                        };
+                        ui_changed = true;
+                    }
+                    KA::QuickSave => {
+                        self.quick_save();
+                        if let Some(st) = self.state.as_mut() {
+                            st.dirty_dynamic = true;
+                            st.window.set_title(&self.session.window_title(&self.map.map_name));
+                            st.window.request_redraw();
+                        }
+                        return;
+                    }
+                    KA::QuickLoad => {
+                        let path = crate::savegame::data_dir("saves").join(crate::savegame::QUICKSAVE_FILE);
+                        if path.is_file() {
+                            self.load_save_file(&path);
+                        } else {
+                            let entries = crate::savegame::list_saves(Some(&self.map.map_id), 24);
+                            self.session.menu = hud::MatchMenu::LoadList { entries, selected: 0 };
+                        }
+                        if let Some(st) = self.state.as_mut() {
+                            st.dirty_dynamic = true;
+                            st.window.set_title(&self.session.window_title(&self.map.map_name));
+                            st.window.request_redraw();
+                        }
+                        return;
+                    }
+                    KA::Group(digit) => {
+                        let slot = crate::controls::digit_slot(digit);
+                        if st.modifiers.control_key() {
+                            self.session.assign_control_group(slot, shift);
+                        } else {
+                            let now = self.session.ui.now_secs();
+                            if self.session.recall_control_group(slot, shift, now) {
+                                self.center_on_selection_or_commander();
+                            }
+                        }
+                        let Some(st) = self.state.as_mut() else {
+                            return;
+                        };
+                        st.dirty_dynamic = true;
+                        st.window
+                            .set_title(&self.session.window_title(&self.map.map_name));
+                        st.window.request_redraw();
+                        return;
+                    }
+                    KA::SelectAcu => {
                         self.session.select_commander();
                         ui_changed = true;
                     }
-                    PhysicalKey::Code(KeyCode::Digit2) => {
+                    KA::SelectFactories => {
                         self.session.select_factories();
                         ui_changed = true;
                     }
-                    PhysicalKey::Code(KeyCode::Digit3) => {
+                    KA::SelectArmy => {
                         self.session.select_army();
                         ui_changed = true;
                     }
-                    PhysicalKey::Code(KeyCode::KeyC) => {
+                    KA::IdleEngineer => {
+                        if self.session.cycle_idle_engineer().is_some() {
+                            self.center_on_selection_or_commander();
+                        }
+                        let Some(st) = self.state.as_mut() else {
+                            return;
+                        };
+                        st.dirty_dynamic = true;
+                        st.window.request_redraw();
+                        return;
+                    }
+                    KA::ReplayPerspective => {
+                        self.session.cycle_replay_perspective();
+                        ui_changed = true;
+                    }
+                    KA::ReplayBack | KA::ReplayForward | KA::ReplayStart if self.session.is_replay() => {
+                        let cur = self.session.world.tick();
+                        let jump = 30 * TICK_HZ;
+                        let target = match action {
+                            KA::ReplayBack => cur.saturating_sub(jump),
+                            KA::ReplayForward => cur + jump,
+                            _ => 0,
+                        };
+                        self.session.request_seek_tick(target);
+                        ui_changed = true;
+                    }
+                    KA::ReplayBack | KA::ReplayForward | KA::ReplayStart => {}
+                    KA::CenterSelection => {
                         self.center_on_selection_or_commander();
                         return;
                     }
-                    PhysicalKey::Code(KeyCode::KeyR) => {
+                    KA::ToggleRepeat => {
+                        self.session.trigger_hud_action(HudAction::ToggleRepeat, shift);
+                        ui_changed = true;
+                    }
+                    KA::ResetCamera => {
                         let aspect = st.camera.aspect;
                         let (_, _, avg_h) = self.map.scmap.height_stats();
                         let fy = if self.map.scmap.water.has_water {
@@ -2406,99 +3538,150 @@ impl ApplicationHandler for PlayApp {
                         );
                         cam_changed = true;
                     }
-                    PhysicalKey::Code(KeyCode::ArrowUp | KeyCode::KeyW) => {
+                    KA::PanUp => {
                         st.camera.pan(0.0, 0.06);
                         cam_changed = true;
                     }
-                    PhysicalKey::Code(KeyCode::ArrowDown) => {
+                    KA::PanDown => {
                         st.camera.pan(0.0, -0.06);
                         cam_changed = true;
                     }
-                    PhysicalKey::Code(KeyCode::ArrowLeft) => {
+                    KA::PanLeft => {
                         st.camera.pan(-0.06, 0.0);
                         cam_changed = true;
                     }
-                    PhysicalKey::Code(KeyCode::ArrowRight) => {
+                    KA::PanRight => {
                         st.camera.pan(0.06, 0.0);
                         cam_changed = true;
                     }
-                    PhysicalKey::Code(KeyCode::KeyQ) => {
+                    KA::OrbitLeft => {
                         st.camera.orbit(-0.10, 0.0);
                         cam_changed = true;
                     }
-                    PhysicalKey::Code(KeyCode::KeyE) => {
+                    KA::OrbitRight => {
                         st.camera.orbit(0.10, 0.0);
                         cam_changed = true;
                     }
-                    PhysicalKey::Code(KeyCode::KeyA) => {
+                    KA::AttackMove => {
                         self.session.trigger_hud_action(HudAction::AttackMove, shift);
                         ui_changed = true;
                     }
-                    PhysicalKey::Code(KeyCode::KeyS) => {
-                        self.session.trigger_stop();
+                    KA::Stop => {
+                        self.session.trigger_hud_action(HudAction::Stop, shift);
                         ui_changed = true;
                     }
-                    PhysicalKey::Code(KeyCode::KeyB) => {
-                        self.session.trigger_build_mode(Role::Factory);
+                    KA::BuildFactory => {
+                        self.session.trigger_hud_action(HudAction::BuildFactory, shift);
                         ui_changed = true;
                     }
-                    PhysicalKey::Code(KeyCode::KeyM) => {
-                        self.session.trigger_build_mode(Role::Extractor);
+                    KA::BuildExtractor => {
+                        self.session.trigger_hud_action(HudAction::BuildExtractor, shift);
                         ui_changed = true;
                     }
-                    PhysicalKey::Code(KeyCode::KeyP) => {
-                        self.session.trigger_build_mode(Role::Generator);
+                    KA::BuildGenerator => {
+                        self.session.trigger_hud_action(HudAction::BuildGenerator, shift);
                         ui_changed = true;
                     }
-                    PhysicalKey::Code(KeyCode::KeyD) => {
-                        self.session.trigger_build_mode(Role::PointDefense);
+                    KA::BuildPointDefense => {
+                        self.session.trigger_hud_action(HudAction::BuildPointDefense, shift);
                         ui_changed = true;
                     }
-                    PhysicalKey::Code(KeyCode::KeyN) => {
-                        self.session.trigger_build_mode(Role::Radar);
+                    KA::BuildRadar => {
+                        self.session.trigger_hud_action(HudAction::BuildRadar, shift);
                         ui_changed = true;
                     }
-                    PhysicalKey::Code(KeyCode::KeyG) => {
-                        self.session.trigger_produce_engineer(count);
+                    KA::ProduceEngineer => {
+                        self.session.trigger_hud_action(HudAction::ProduceEngineer, shift);
                         ui_changed = true;
                     }
-                    PhysicalKey::Code(KeyCode::KeyT) => {
-                        self.session.trigger_produce(0, count);
+                    KA::ProduceTank => {
+                        self.session.trigger_hud_action(HudAction::ProduceTank, shift);
                         ui_changed = true;
                     }
-                    PhysicalKey::Code(KeyCode::KeyY) => {
-                        self.session.trigger_produce(1, count);
+                    KA::ProduceBot => {
+                        self.session.trigger_hud_action(HudAction::ProduceBot, shift);
                         ui_changed = true;
                     }
-                    PhysicalKey::Code(KeyCode::KeyU) => {
-                        self.session.trigger_produce(2, count);
+                    KA::ProduceArtillery => {
+                        self.session.trigger_hud_action(HudAction::ProduceArtillery, shift);
                         ui_changed = true;
                     }
-                    PhysicalKey::Code(KeyCode::KeyO) => {
+                    KA::OverchargeNearest => {
                         self.session.trigger_overcharge_nearest();
                         ui_changed = true;
                     }
-                    PhysicalKey::Code(KeyCode::Space) => {
-                        self.session.paused = !self.session.paused;
+                    KA::UnloadMode => {
+                        self.session.trigger_hud_action(HudAction::UnloadTransport, shift);
                         ui_changed = true;
                     }
-                    PhysicalKey::Code(KeyCode::Equal | KeyCode::NumpadAdd) => {
-                        self.session.speed = (self.session.speed * 2).clamp(1, 8);
+                    KA::Enhance | KA::EnhanceCycle => {
+                        self.session.trigger_hud_action(HudAction::EnhanceNext, action == KA::EnhanceCycle);
                         ui_changed = true;
                     }
-                    PhysicalKey::Code(KeyCode::Minus | KeyCode::NumpadSubtract) => {
-                        self.session.speed = (self.session.speed / 2).clamp(1, 8);
+                    KA::ToggleShield => {
+                        self.session.trigger_hud_action(HudAction::ToggleShield, shift);
                         ui_changed = true;
                     }
-                    PhysicalKey::Code(KeyCode::F1) => {
-                        self.session.toggle_spectate();
+                    KA::Pause => {
+                        self.session.trigger_hud_action(HudAction::TogglePause, shift);
                         ui_changed = true;
                     }
-                    PhysicalKey::Code(KeyCode::F2) => {
+                    KA::SpeedUp | KA::SpeedDown => {
+                        self.session.change_speed(action == KA::SpeedUp);
+                        ui_changed = true;
+                    }
+                    KA::ToggleAi => {
+                        self.session.trigger_hud_action(HudAction::ToggleAi, false);
+                        ui_changed = true;
+                    }
+                    KA::ToggleFog => {
                         self.session.trigger_hud_action(HudAction::ToggleFog, false);
                         ui_changed = true;
                     }
-                    _ => {}
+                    KA::ToggleProfiler => {
+                        crate::profiler::toggle_overlay();
+                        ui_changed = true;
+                    }
+                    KA::OrderMove
+                    | KA::OrderPatrol
+                    | KA::OrderAssist
+                    | KA::OrderGuard
+                    | KA::OrderRepair
+                    | KA::OrderReclaim
+                    | KA::OrderLoad
+                    | KA::OrderOvercharge
+                    | KA::OrderLaunchMissile => {
+                        let kind = match action {
+                            KA::OrderMove => OK::Move,
+                            KA::OrderPatrol => OK::Patrol,
+                            KA::OrderAssist => OK::Assist,
+                            KA::OrderGuard => OK::Guard,
+                            KA::OrderRepair => OK::Repair,
+                            KA::OrderReclaim => OK::Reclaim,
+                            KA::OrderLoad => OK::Load,
+                            KA::OrderOvercharge => OK::Overcharge,
+                            _ => OK::LaunchMissile,
+                        };
+                        if !self.session.is_replay() {
+                            self.session.trigger_order(kind);
+                        }
+                        ui_changed = true;
+                    }
+                    KA::CardNextTab => {
+                        self.session.cycle_card_tab();
+                        ui_changed = true;
+                    }
+                    KA::CardSlot(i) => {
+                        self.session.trigger_card_item(i as usize, shift, false);
+                        ui_changed = true;
+                    }
+                    KA::BookmarkSave(i) | KA::BookmarkRecall(i) => {
+                        let save = matches!(action, KA::BookmarkSave(_));
+                        if self.session.apply_bookmark(i as usize, save, &mut st.camera) {
+                            cam_changed = true;
+                        }
+                        ui_changed = true;
+                    }
                 }
                 if cam_changed {
                     st.resources.update_camera(&st.queue, &st.camera);
@@ -2513,6 +3696,26 @@ impl ApplicationHandler for PlayApp {
                 }
             }
             WindowEvent::RedrawRequested => {
+                // Phase 23: OS cursor follows the targeting mode.
+                use winit::window::CursorIcon as CI;
+                use crate::command_card::OrderKind as OK;
+                let want = match (self.session.current_order_mode(), self.session.build_mode.is_some()) {
+                    (Some(OK::Attack | OK::Overcharge | OK::LaunchMissile), _) => CI::Crosshair,
+                    (Some(OK::Move | OK::Patrol | OK::Load | OK::Unload), _) => CI::Move,
+                    (Some(OK::Assist | OK::Guard | OK::Repair), _) => CI::Copy,
+                    (Some(OK::Reclaim), _) => CI::Grab,
+                    (None, true) => CI::Cell,
+                    _ => CI::Default,
+                };
+                if want != st.cursor_icon {
+                    st.cursor_icon = want;
+                    st.window.set_cursor(want);
+                }
+                st.device.poll(wgpu::Maintain::Poll);
+                st.resources.poll_gpu_timer();
+                if crate::profiler::overlay_visible() {
+                    st.dirty_dynamic = true;
+                }
                 if st.dirty_dynamic {
                     upload_frame_resources(
                         &st.device,
@@ -2543,15 +3746,26 @@ impl ApplicationHandler for PlayApp {
                         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                             label: Some("play_win_encoder"),
                         });
-                st.resources.encode_draw(
-                    &mut encoder,
-                    &st.msaa_view,
-                    Some(&resolve_view),
-                    &st.depth_view,
-                    st.clear_color,
-                );
-                st.queue.submit(Some(encoder.finish()));
-                frame.present();
+                {
+                    let _p = crate::profiler::scope("render.encode_submit");
+                    st.resources.encode_draw(
+                        &mut encoder,
+                        &st.msaa_view,
+                        Some(&resolve_view),
+                        &st.depth_view,
+                        st.clear_color,
+                    );
+                    st.queue.submit(Some(encoder.finish()));
+                    st.resources.gpu_timer_after_submit();
+                }
+                {
+                    let _p = crate::profiler::scope("render.present");
+                    frame.present();
+                }
+                crate::profiler::end_frame(None);
+                if crate::profiler::overlay_visible() {
+                    st.window.request_redraw();
+                }
             }
             _ => {}
         }

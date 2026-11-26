@@ -10,13 +10,15 @@ const INDEX_SIZE: usize = 2;
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct ScmBone {
+    /// Inverse bind pose 4x4 matrix (row-major DX layout `[r0, r1, r2, r3]`).
+    pub inv_bind_pose: [f32; 16],
     /// Bone name decoded from the file's NUL-terminated ASCII/Latin-1 string pool.
     pub name: String,
     /// Index of the parent bone, or `-1` for a root bone.
     pub parent_index: i32,
     /// Local bone translation `[x, y, z]`.
     pub position: [f32; 3],
-    /// Local bone rotation quaternion `[x, y, z, w]`.
+    /// Local bone rotation quaternion `[w, x, y, z]`.
     pub rotation: [f32; 4],
 }
 
@@ -93,6 +95,50 @@ impl ScmMesh {
     pub fn triangle_count(&self) -> usize {
         self.indices.len() / 3
     }
+
+    /// Case-insensitive skeleton bone lookup by name.
+    #[allow(dead_code)]
+    pub fn bone_index_ci(&self, name: &str) -> Option<usize> {
+        self.bones
+            .iter()
+            .position(|b| b.name.eq_ignore_ascii_case(name))
+    }
+
+    /// Identifies primary yaw and pitch turret bone indices if present.
+    #[allow(dead_code)]
+    pub fn find_turret_bones(&self) -> (Option<usize>, Option<usize>) {
+        let yaw_names = [
+            "Turret",
+            "Turret_Yaw",
+            "Main_Turret",
+            "Center_Turret",
+            "Torso",
+        ];
+        let pitch_names = [
+            "Turret_Barrel",
+            "Turret_Pitch",
+            "Main_Turret_Barrel",
+            "Center_Turret_Barrel",
+            "Barrel",
+        ];
+        let yaw = yaw_names
+            .iter()
+            .find_map(|n| self.bone_index_ci(n))
+            .or_else(|| {
+                self.bones
+                    .iter()
+                    .position(|b| b.name.to_ascii_lowercase().contains("turret"))
+            });
+        let pitch = pitch_names
+            .iter()
+            .find_map(|n| self.bone_index_ci(n))
+            .or_else(|| {
+                self.bones
+                    .iter()
+                    .position(|b| b.name.to_ascii_lowercase().contains("barrel"))
+            });
+        (yaw, pitch)
+    }
 }
 
 struct ScmHeader {
@@ -149,13 +195,15 @@ fn parse_bones(data: &[u8], offset: u32, count: u32) -> Result<Vec<ScmBone>, Str
     let mut bones = Vec::with_capacity(bytes.len() / BONE_SIZE);
     for chunk in bytes.chunks_exact(BONE_SIZE) {
         // 0..64 holds the 16-f32 inverse bind pose matrix; 100..108 is reserved.
+        let inv_bind_pose = read_f32_array::<16>(chunk, 0)?;
         let position = read_f32_array::<3>(chunk, 64)?;
         let rotation = read_f32_array::<4>(chunk, 76)?;
-        let name_offset = read_u32(chunk, 92)?;
+        let name_offset = read_f32_name_off_or_u32(chunk)?;
         let parent_index = read_i32(chunk, 96)?;
         let name = read_latin1_cstring(data, name_offset)?;
 
         bones.push(ScmBone {
+            inv_bind_pose,
             name,
             parent_index,
             position,
@@ -163,6 +211,11 @@ fn parse_bones(data: &[u8], offset: u32, count: u32) -> Result<Vec<ScmBone>, Str
         });
     }
     Ok(bones)
+}
+
+#[inline]
+fn read_f32_name_off_or_u32(chunk: &[u8]) -> Result<u32, String> {
+    read_u32(chunk, 92)
 }
 
 fn parse_vertices(data: &[u8], offset: u32, count: u32) -> Result<Vec<ScmVertex>, String> {
@@ -453,6 +506,12 @@ mod tests {
         assert_eq!(mesh.bones.len(), 1);
         assert_eq!(mesh.bones[0].name, "pelvis");
         assert_eq!(mesh.bones[0].parent_index, -1);
+        assert_f32_slice_eq(
+            &mesh.bones[0].inv_bind_pose,
+            &[
+                1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+            ],
+        );
         assert_f32_slice_eq(&mesh.bones[0].position, &[0.25, 1.5, -0.75]);
         assert_f32_slice_eq(&mesh.bones[0].rotation, &[0.0, 0.0, 0.70710677, 0.70710677]);
 

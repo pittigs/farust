@@ -28,6 +28,17 @@ pub fn decode_payload_rgba8(header: &DdsHeader, payload: &[u8]) -> Result<RgbaIm
         .checked_mul(height as usize)
         .and_then(|n| n.checked_mul(4))
         .ok_or_else(|| "image dimensions overflow".to_string())?;
+    // Validate the payload covers the image *before* allocating the output, so corrupt
+    // dimensions can never trigger a huge allocation.
+    let required = dds_mip_byte_len(&header.format, width, height)
+        .map_err(|_| format!("unsupported DDS format for RGBA8 decode: {}", header.format))?;
+    if payload.len() < required {
+        return Err(format!(
+            "truncated DDS payload: expected at least {required} bytes for {width}x{height} {}, got {}",
+            header.format,
+            payload.len()
+        ));
+    }
     let mut pixels = vec![0u8; total_bytes];
 
     match header.format {
@@ -125,16 +136,17 @@ pub fn decode_payload_rgba8(header: &DdsHeader, payload: &[u8]) -> Result<RgbaIm
 }
 
 fn dds_mip_byte_len(format: &DdsFormat, w: u32, h: u32) -> Result<usize, String> {
-    match format {
-        DdsFormat::Dxt1 => Ok((w.div_ceil(4) as usize) * (h.div_ceil(4) as usize) * 8),
-        DdsFormat::Dxt3 | DdsFormat::Dxt5 => {
-            Ok((w.div_ceil(4) as usize) * (h.div_ceil(4) as usize) * 16)
-        }
-        DdsFormat::Bgra8 | DdsFormat::Rgba8 => Ok((w as usize) * (h as usize) * 4),
-        DdsFormat::Bgr8 => Ok((w as usize) * (h as usize) * 3),
-        DdsFormat::A8 | DdsFormat::L8 => Ok((w as usize) * (h as usize)),
-        _ => Err(format!("unsupported cubemap DDS format: {format}")),
-    }
+    let (bw, bh, unit) = match format {
+        DdsFormat::Dxt1 => (w.div_ceil(4) as usize, h.div_ceil(4) as usize, 8),
+        DdsFormat::Dxt3 | DdsFormat::Dxt5 => (w.div_ceil(4) as usize, h.div_ceil(4) as usize, 16),
+        DdsFormat::Bgra8 | DdsFormat::Rgba8 => (w as usize, h as usize, 4),
+        DdsFormat::Bgr8 => (w as usize, h as usize, 3),
+        DdsFormat::A8 | DdsFormat::L8 => (w as usize, h as usize, 1),
+        _ => return Err(format!("unsupported cubemap DDS format: {format}")),
+    };
+    bw.checked_mul(bh)
+        .and_then(|n| n.checked_mul(unit))
+        .ok_or_else(|| "DDS mip byte size overflow".to_string())
 }
 
 /// Decodes all 6 cubemap faces (`+X, -X, +Y, -Y, +Z, -Z` at mip 0) from a DDS cubemap file.
@@ -146,21 +158,22 @@ pub fn decode_dds_cubemap_rgba8(data: &[u8]) -> Result<[RgbaImage; 6], String> {
     let payload = data
         .get(header.data_offset..)
         .ok_or_else(|| "DDS cubemap data offset out of bounds".to_string())?;
-    let mips = header.mip_count.max(1);
+    // A u32 mip chain is at most 32 levels deep; corrupt counts must not loop for billions.
+    let mips = header.mip_count.clamp(1, 32);
     let mut face_bytes: usize = 0;
     for m in 0..mips {
-        let mw = (header.width >> m).max(1);
-        let mh = (header.height >> m).max(1);
+        let mw = header.width.checked_shr(m).unwrap_or(0).max(1);
+        let mh = header.height.checked_shr(m).unwrap_or(0).max(1);
         face_bytes = face_bytes
             .checked_add(dds_mip_byte_len(&header.format, mw, mh)?)
             .ok_or_else(|| "cubemap face byte size overflow".to_string())?;
     }
     let single_face_payload = |face_idx: usize| -> Result<&[u8], String> {
-        let start = face_idx * face_bytes;
+        let truncated = || format!("truncated cubemap face {face_idx}");
+        let start = face_idx.checked_mul(face_bytes).ok_or_else(truncated)?;
         let mip0 = dds_mip_byte_len(&header.format, header.width, header.height)?;
-        payload
-            .get(start..start + mip0)
-            .ok_or_else(|| format!("truncated cubemap face {face_idx}"))
+        let end = start.checked_add(mip0).ok_or_else(truncated)?;
+        payload.get(start..end).ok_or_else(truncated)
     };
     let mut faces = Vec::with_capacity(6);
     for f in 0..6 {

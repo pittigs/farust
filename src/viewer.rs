@@ -4,7 +4,7 @@
 //! Renders real Forged Alliance assets:
 //! - 6-face skybox cubemap (`SkyCube_*.dds`) + atmospheric fog
 //! - Per-pixel multi-stratum terrain splatting (10 albedo + 9 tangent-normal strata + tm0/tm1)
-//! - Soft 3x3 PCF directional shadow map (`2048x2048` Depth32Float)
+//! - Soft 3x3 PCF directional shadow map (Depth32Float, size from `ShadowQuality`)
 //! - Hardware-instanced `.scm` props (alpha-cutout pines, rocks, logs) and `_LOD0` units/wrecks
 //! - Depth-faded transparent water surface with animated dual-layer wave normals + sky reflections
 //! - Layered 2D HUD (minimap, unit icon atlas, bitmap font labels)
@@ -28,10 +28,19 @@ use crate::camera::OrbitCamera;
 use crate::dds_decode::RgbaImage;
 use crate::scmap::ScMapLighting;
 use crate::scene::{GpuVertex, LoadedScene, TerrainSplatData, WaterGpuData};
+use crate::settings::ShadowQuality;
+use crate::vfx::VfxVertex;
 
 pub(crate) const MSAA_SAMPLES: u32 = 4;
 pub(crate) const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
-const SHADOW_MAP_SIZE: u32 = 2048;
+
+/// `[texel, enabled, 0, 0]` for [`Uniforms::shadow_params`]: PCF tap size in UV
+/// space plus a kill-switch so `Off` renders fully lit without a shadow pass.
+fn shadow_uniform_params(quality: ShadowQuality) -> [f32; 4] {
+    let edge = quality.map_size().max(1) as f32;
+    let enabled = if quality.map_size() > 0 { 1.0 } else { 0.0 };
+    [1.0 / edge, enabled, 0.0, 0.0]
+}
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
@@ -44,6 +53,7 @@ struct Uniforms {
     ambient_color: [f32; 4], // rgb + w=map_width
     fog_color: [f32; 4],     // rgb + w=map_height
     fog_params: [f32; 4],    // fog_start, fog_end, water_deep, water_abyss
+    shadow_params: [f32; 4], // PCF texel, shadows-enabled flag, unused, unused
 }
 
 #[repr(C)]
@@ -72,6 +82,7 @@ pub struct GpuUnitInstance {
     pub row2: [f32; 4],       // [m20, m21, m22, tz]
     pub team_color: [f32; 4], // rgb = team/tint color, a = spec strength
     pub flags: [f32; 4],      // x = use_tex, y = alpha_cutout, z = wreck_char, w = team_mask_strength
+    pub extra: [f32; 4],      // x = bone_base+1 (0=static), y = lod_fade, z = vet_glow, w = build_progress
 }
 
 impl GpuUnitInstance {
@@ -91,6 +102,7 @@ impl GpuUnitInstance {
             row2: [-scale * sy, scale * cy * sp, scale * cy * cp, pos[2]],
             team_color,
             flags,
+            extra: [0.0; 4],
         }
     }
 
@@ -109,7 +121,14 @@ impl GpuUnitInstance {
             row2: [rx[2] * scale[0], ry[2] * scale[1], rz[2] * scale[2], pos[2]],
             team_color,
             flags,
+            extra: [0.0; 4],
         }
+    }
+
+    #[allow(dead_code)]
+    pub fn with_extra(mut self, extra: [f32; 4]) -> Self {
+        self.extra = extra;
+        self
     }
 }
 
@@ -216,6 +235,7 @@ struct Uniforms {
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
+@group(1) @binding(0) var<storage, read> bone_mats: array<mat4x4<f32>>;
 
 struct VsIn {
     @location(0) position: vec3<f32>,
@@ -227,11 +247,26 @@ struct VsIn {
     @location(6) row2: vec4<f32>,
     @location(7) team_color: vec4<f32>,
     @location(8) flags: vec4<f32>,
+    @location(9) extra: vec4<f32>,
+};
+
+struct VsOut {
+    @builtin(position) clip_pos: vec4<f32>,
 };
 
 @vertex
 fn vs_main(in: VsIn) -> @builtin(position) vec4<f32> {
-    let p = vec4<f32>(in.position, 1.0);
+    var lpos = in.position;
+    if (in.extra.x >= 0.5) {
+        let base_i = u32(in.extra.x - 0.75);
+        let bone_off = u32(max(in.color.w, 0.0) + 0.5);
+        let bm = bone_mats[base_i + bone_off];
+        lpos = (bm * vec4<f32>(in.position, 1.0)).xyz;
+    }
+    if (in.extra.w > 0.01 && in.extra.w < 0.99) {
+        lpos.y = min(lpos.y, in.extra.w * max(in.extra.y, 0.25));
+    }
+    let p = vec4<f32>(lpos, 1.0);
     let world_p = vec3<f32>(dot(in.row0, p), dot(in.row1, p), dot(in.row2, p));
     return u.shadow_view_proj * vec4<f32>(world_p, 1.0);
 }
@@ -292,6 +327,7 @@ struct Uniforms {
     ambient_color: vec4<f32>,
     fog_color: vec4<f32>,
     fog_params: vec4<f32>,
+    shadow_params: vec4<f32>,
 };
 
 struct TerrainParams {
@@ -311,6 +347,7 @@ struct TerrainParams {
 @group(0) @binding(5) var t_norm: texture_2d_array<f32>;
 @group(0) @binding(6) var s_clamp: sampler;
 @group(0) @binding(7) var s_repeat: sampler;
+@group(0) @binding(8) var t_fow: texture_2d<f32>;
 
 @group(1) @binding(0) var t_shadow: texture_depth_2d;
 @group(1) @binding(1) var s_shadow: sampler_comparison;
@@ -344,9 +381,12 @@ fn sample_shadow_pcf(world_pos: vec3<f32>) -> f32 {
     let ndc = sc.xyz / sc.w;
     let suv = vec2<f32>(ndc.x * 0.5 + 0.5, ndc.y * -0.5 + 0.5);
     let depth_ref = clamp(ndc.z - 0.0018, 0.0, 1.0);
-    let step = 1.0 / 2048.0;
+    let step = u.shadow_params.x;
 
     var sum = 0.0;
+    if (u.shadow_params.y < 0.5) {
+        return 1.0;
+    }
     sum += textureSampleCompare(t_shadow, s_shadow, suv + vec2<f32>(-step, -step), depth_ref);
     sum += textureSampleCompare(t_shadow, s_shadow, suv + vec2<f32>(0.0, -step), depth_ref);
     sum += textureSampleCompare(t_shadow, s_shadow, suv + vec2<f32>(step, -step), depth_ref);
@@ -427,6 +467,9 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let depth_under = max(u.sun_color.w - in.world_pos.y, 0.0);
     let wet = smoothstep(0.0, 0.9, depth_under);
     lit = mix(lit, lit * vec3<f32>(0.48, 0.58, 0.65), wet);
+
+    let fow = textureSample(t_fow, s_clamp, in.uv).r;
+    lit = lit * mix(0.32, 1.0, fow);
 
     let dist = length(u.eye_pos.xyz - in.world_pos);
     let fog_start = max(u.fog_params.x, max(u.eye_pos.y, 40.0) * 1.35 + 280.0);
@@ -536,6 +579,7 @@ struct Uniforms {
     ambient_color: vec4<f32>,
     fog_color: vec4<f32>,
     fog_params: vec4<f32>,
+    shadow_params: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -544,6 +588,7 @@ struct Uniforms {
 
 @group(1) @binding(0) var t_shadow: texture_depth_2d;
 @group(1) @binding(1) var s_shadow: sampler_comparison;
+@group(2) @binding(0) var<storage, read> bone_mats: array<mat4x4<f32>>;
 
 struct VsIn {
     @location(0) position: vec3<f32>,
@@ -555,6 +600,7 @@ struct VsIn {
     @location(6) row2: vec4<f32>,
     @location(7) team_color: vec4<f32>,
     @location(8) flags: vec4<f32>,
+    @location(9) extra: vec4<f32>,
 };
 
 struct VsOut {
@@ -564,16 +610,27 @@ struct VsOut {
     @location(2) uv: vec2<f32>,
     @location(3) team_color: vec4<f32>,
     @location(4) flags: vec4<f32>,
+    @location(5) extra: vec4<f32>,
+    @location(6) local_y: f32,
 };
 
 @vertex
 fn vs_main(in: VsIn) -> VsOut {
-    let p = vec4<f32>(in.position, 1.0);
+    var lpos = in.position;
+    var lnrm = in.normal;
+    if (in.extra.x >= 0.5) {
+        let base_i = u32(in.extra.x - 0.75);
+        let bone_off = u32(max(in.color.w, 0.0) + 0.5);
+        let bm = bone_mats[base_i + bone_off];
+        lpos = (bm * vec4<f32>(in.position, 1.0)).xyz;
+        lnrm = (bm * vec4<f32>(in.normal, 0.0)).xyz;
+    }
+    let p = vec4<f32>(lpos, 1.0);
     let world_p = vec3<f32>(dot(in.row0, p), dot(in.row1, p), dot(in.row2, p));
     let world_n = normalize(vec3<f32>(
-        dot(in.row0.xyz, in.normal),
-        dot(in.row1.xyz, in.normal),
-        dot(in.row2.xyz, in.normal)
+        dot(in.row0.xyz, lnrm),
+        dot(in.row1.xyz, lnrm),
+        dot(in.row2.xyz, lnrm)
     ));
     var out: VsOut;
     out.clip_pos = u.view_proj * vec4<f32>(world_p, 1.0);
@@ -582,6 +639,8 @@ fn vs_main(in: VsIn) -> VsOut {
     out.uv = in.uv;
     out.team_color = in.team_color;
     out.flags = in.flags;
+    out.extra = in.extra;
+    out.local_y = lpos.y;
     return out;
 }
 
@@ -590,9 +649,12 @@ fn sample_shadow_pcf(world_pos: vec3<f32>) -> f32 {
     let ndc = sc.xyz / sc.w;
     let suv = vec2<f32>(ndc.x * 0.5 + 0.5, ndc.y * -0.5 + 0.5);
     let depth_ref = clamp(ndc.z - 0.0018, 0.0, 1.0);
-    let step = 1.0 / 2048.0;
+    let step = u.shadow_params.x;
 
     var sum = 0.0;
+    if (u.shadow_params.y < 0.5) {
+        return 1.0;
+    }
     sum += textureSampleCompare(t_shadow, s_shadow, suv + vec2<f32>(-step, 0.0), depth_ref);
     sum += textureSampleCompare(t_shadow, s_shadow, suv + vec2<f32>(step, 0.0), depth_ref);
     sum += textureSampleCompare(t_shadow, s_shadow, suv, depth_ref);
@@ -631,6 +693,23 @@ fn fs_main(in: VsOut, @builtin(front_facing) front_facing: bool) -> @location(0)
     let sun = u.sun_color.rgb * (u.sun_dir.w * 0.72) * ndotl * mix(0.40, 1.0, shadow);
     let spec = pow(max(dot(n, h), 0.0), 32.0) * in.team_color.a * (0.25 + 0.75 * ndotl) * shadow;
     var lit = base_rgb * (ambient + sun) + vec3<f32>(spec);
+
+    if (in.extra.z > 0.01) {
+        let rim = pow(clamp(1.0 - max(dot(n, v), 0.0), 0.0, 1.0), 2.2);
+        lit = lit + vec3<f32>(1.0, 0.84, 0.28) * (rim * in.extra.z * 0.75);
+    }
+    if (in.extra.w > 0.01 && in.extra.w < 0.99) {
+        // Construction build-up: geometry above `progress * height` (template units) is cut away,
+        // a bright scan seam rides the cut and the built part keeps a cyan nano-lattice tint.
+        let h = max(in.extra.y, 0.25);
+        let cut = in.extra.w * h;
+        if (in.local_y > cut) {
+            discard;
+        }
+        let seam = 1.0 - smoothstep(0.0, 0.06 * h, cut - in.local_y);
+        let lattice = 0.5 + 0.5 * sin(in.local_y * 40.0 / h);
+        lit = mix(lit, vec3<f32>(0.25, 0.85, 1.0), 0.30 + 0.10 * lattice) + vec3<f32>(0.55, 0.95, 1.0) * seam * 1.4;
+    }
 
     let dist = length(u.eye_pos.xyz - in.world_pos);
     let fog_start = max(u.fog_params.x, max(u.eye_pos.y, 40.0) * 1.35 + 280.0);
@@ -685,13 +764,226 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 }
 "#;
 
+const DECAL_SHADER_WGSL: &str = r#"
+struct Uniforms {
+    view_proj: mat4x4<f32>,
+    shadow_view_proj: mat4x4<f32>,
+    eye_pos: vec4<f32>,
+    sun_dir: vec4<f32>,
+    sun_color: vec4<f32>,
+    ambient_color: vec4<f32>,
+    fog_color: vec4<f32>,
+    fog_params: vec4<f32>,
+};
+
+@group(0) @binding(0) var<uniform> u: Uniforms;
+@group(0) @binding(1) var t_albedo: texture_2d<f32>;
+@group(0) @binding(2) var s_albedo: sampler;
+
+struct VsIn {
+    @location(0) position: vec3<f32>,
+    @location(1) normal: vec3<f32>,
+    @location(2) uv: vec2<f32>,
+    @location(3) color: vec4<f32>,
+};
+
+struct VsOut {
+    @builtin(position) clip_pos: vec4<f32>,
+    @location(0) world_pos: vec3<f32>,
+    @location(1) normal: vec3<f32>,
+    @location(2) uv: vec2<f32>,
+    @location(3) color: vec4<f32>,
+};
+
+@vertex
+fn vs_main(in: VsIn) -> VsOut {
+    var out: VsOut;
+    out.clip_pos = u.view_proj * vec4<f32>(in.position, 1.0);
+    out.world_pos = in.position;
+    out.normal = in.normal;
+    out.uv = in.uv;
+    out.color = in.color;
+    return out;
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    let tex = textureSample(t_albedo, s_albedo, in.uv);
+    if (tex.a < 0.04) {
+        discard;
+    }
+    let n = normalize(in.normal);
+    let l = normalize(u.sun_dir.xyz);
+    let hemi = clamp(n.y * 0.5 + 0.5, 0.0, 1.0);
+    let ambient = mix(u.ambient_color.rgb * 0.55 + vec3<f32>(0.12, 0.13, 0.16), u.ambient_color.rgb + vec3<f32>(0.24, 0.27, 0.34), hemi);
+    let ndotl = max(dot(n, l), 0.0);
+    let sun = u.sun_color.rgb * (u.sun_dir.w * 0.55) * ndotl;
+    var lit = tex.rgb * in.color.rgb * (ambient + sun);
+
+    let dist = length(u.eye_pos.xyz - in.world_pos);
+    let fog_start = max(u.fog_params.x, max(u.eye_pos.y, 40.0) * 1.35 + 280.0);
+    let fog_end = max(u.fog_params.y + 800.0, fog_start + 1800.0);
+    let fog_t = clamp((dist - fog_start) / (fog_end - fog_start), 0.0, 0.35);
+    lit = mix(lit, u.fog_color.rgb, fog_t);
+    return vec4<f32>(lit, tex.a * 0.90);
+}
+"#;
+
+const SHIELD_SHADER_WGSL: &str = r#"
+struct Uniforms {
+    view_proj: mat4x4<f32>,
+    shadow_view_proj: mat4x4<f32>,
+    eye_pos: vec4<f32>,
+    sun_dir: vec4<f32>,
+    sun_color: vec4<f32>,
+    ambient_color: vec4<f32>,
+    fog_color: vec4<f32>,
+    fog_params: vec4<f32>,
+};
+
+@group(0) @binding(0) var<uniform> u: Uniforms;
+
+struct VsIn {
+    @location(0) position: vec3<f32>,
+    @location(1) normal: vec3<f32>,
+    @location(2) uv: vec2<f32>,
+    @location(3) color: vec4<f32>,
+    @location(4) row0: vec4<f32>,
+    @location(5) row1: vec4<f32>,
+    @location(6) row2: vec4<f32>,
+    @location(7) team_color: vec4<f32>,
+    @location(8) flags: vec4<f32>,
+    @location(9) extra: vec4<f32>,
+};
+
+struct VsOut {
+    @builtin(position) clip_pos: vec4<f32>,
+    @location(0) world_pos: vec3<f32>,
+    @location(1) normal: vec3<f32>,
+    @location(2) team_color: vec4<f32>,
+    @location(3) local_pos: vec3<f32>,
+    @location(4) flags: vec4<f32>,
+    @location(5) extra: vec4<f32>,
+};
+
+@vertex
+fn vs_main(in: VsIn) -> VsOut {
+    let p = vec4<f32>(in.position, 1.0);
+    let world_p = vec3<f32>(dot(in.row0, p), dot(in.row1, p), dot(in.row2, p));
+    let world_n = normalize(vec3<f32>(
+        dot(in.row0.xyz, in.normal),
+        dot(in.row1.xyz, in.normal),
+        dot(in.row2.xyz, in.normal)
+    ));
+    var out: VsOut;
+    out.clip_pos = u.view_proj * vec4<f32>(world_p, 1.0);
+    out.world_pos = world_p;
+    out.normal = world_n;
+    out.team_color = in.team_color;
+    out.local_pos = in.position;
+    out.flags = in.flags;
+    out.extra = in.extra;
+    return out;
+}
+
+// Instance: team_color = faction tint (a = overall opacity), flags = (hp ratio, hit intensity,
+// personal, _), extra = (impact direction xyz in world axes, seconds since impact).
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    let n = normalize(in.normal);
+    let v = normalize(u.eye_pos.xyz - in.world_pos);
+    let fresnel = pow(clamp(1.0 - abs(dot(n, v)), 0.0, 1.0), 2.4);
+    let lp = normalize(in.local_pos);
+    let t = u.eye_pos.w;
+    let bands = 0.5 + 0.5 * sin(lp.y * 22.0 - t * 2.4) * sin(atan2(lp.z, lp.x) * 11.0 + t * 0.6);
+    let hp = clamp(in.flags.x, 0.0, 1.0);
+    var col = in.team_color.rgb * (0.55 + 1.15 * fresnel) * (0.84 + 0.16 * bands);
+    var alpha = 0.05 + 0.48 * fresnel + 0.05 * bands * mix(1.6, 1.0, hp);
+    let k = in.flags.y;
+    if (k > 0.001) {
+        let ang = acos(clamp(dot(lp, normalize(in.extra.xyz)), -1.0, 1.0));
+        let front = in.extra.w * 2.6;
+        let ring = exp(-pow((ang - front) * 8.0, 2.0)) * k;
+        let spot = exp(-ang * ang * 16.0) * k;
+        col = col + vec3<f32>(0.85, 0.95, 1.0) * (ring * 1.3 + spot * 1.6);
+        alpha = alpha + ring * 0.5 + spot * 0.55 + k * 0.10;
+    }
+    alpha = alpha * in.team_color.a;
+    return vec4<f32>(col, clamp(alpha, 0.0, 0.92));
+}
+"#;
+
+const VFX_SHADER_WGSL: &str = r#"
+struct Uniforms {
+    view_proj: mat4x4<f32>,
+    shadow_view_proj: mat4x4<f32>,
+    eye_pos: vec4<f32>,
+    sun_dir: vec4<f32>,
+    sun_color: vec4<f32>,
+    ambient_color: vec4<f32>,
+    fog_color: vec4<f32>,
+    fog_params: vec4<f32>,
+};
+
+@group(0) @binding(0) var<uniform> u: Uniforms;
+
+struct VsIn {
+    @location(0) position: vec3<f32>,
+    @location(1) uv: vec2<f32>,
+    @location(2) color: vec4<f32>,
+    @location(3) mode: f32,
+};
+
+struct VsOut {
+    @builtin(position) clip_pos: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) color: vec4<f32>,
+    @location(2) mode: f32,
+};
+
+@vertex
+fn vs_main(in: VsIn) -> VsOut {
+    var out: VsOut;
+    out.clip_pos = u.view_proj * vec4<f32>(in.position, 1.0);
+    out.uv = in.uv;
+    out.color = in.color;
+    out.mode = in.mode;
+    return out;
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    let centered = in.uv * 2.0 - vec2<f32>(1.0, 1.0);
+    let d = length(centered);
+    var mask = 0.0;
+    if (in.mode >= 2.5) {
+        mask = (1.0 - smoothstep(0.55, 1.0, d)) * (0.45 + 0.55 * smoothstep(0.15, 0.8, d));
+    } else if (in.mode >= 1.5) {
+        let ring = exp(-pow((d - 0.78) * 7.5, 2.0));
+        mask = ring * (1.0 - smoothstep(0.90, 1.0, d));
+    } else if (in.mode >= 0.5) {
+        mask = exp(-d * d * 3.0) * (1.0 - smoothstep(0.65, 1.0, d));
+    } else {
+        mask = pow(clamp(1.0 - d, 0.0, 1.0), 1.5);
+    }
+    let a = mask * in.color.a;
+    if (a < 0.01) {
+        discard;
+    }
+    return vec4<f32>(in.color.rgb, a);
+}
+"#;
+
 pub(crate) struct GpuSceneResources {
     pipeline: wgpu::RenderPipeline,
+    decal_pipeline: wgpu::RenderPipeline,
     shadow_pipeline: wgpu::RenderPipeline,
     sky_pipeline: wgpu::RenderPipeline,
     terrain_pipeline: wgpu::RenderPipeline,
     water_pipeline: wgpu::RenderPipeline,
     instanced_pipeline: wgpu::RenderPipeline,
+    shield_pipeline: wgpu::RenderPipeline,
+    vfx_pipeline: wgpu::RenderPipeline,
     hud_pipeline: wgpu::RenderPipeline,
 
     bind_group_layout: wgpu::BindGroupLayout,
@@ -699,10 +991,26 @@ pub(crate) struct GpuSceneResources {
     overlay_bind_group: wgpu::BindGroup,
     minimap_bind_group: wgpu::BindGroup,
     hud_icons_bind_group: wgpu::BindGroup,
+    strat_icons_bind_group: wgpu::BindGroup,
     uniform_only_bg: wgpu::BindGroup,
+
+    bone_bgl: wgpu::BindGroupLayout,
+    #[allow(dead_code)]
+    bone_buf: wgpu::Buffer,
+    bone_buf_cap: usize,
+    bone_bind_group: wgpu::BindGroup,
+
+    fow_tex: wgpu::Texture,
 
     shadow_view: wgpu::TextureView,
     shadow_bind_group: wgpu::BindGroup,
+    shadow_bgl: wgpu::BindGroupLayout,
+    /// Actual shadow-map edge length in texels (`1` = placeholder when `Off`).
+    shadow_size: u32,
+    /// `false` skips the shadow pass and forces PCF to return fully lit.
+    shadows_enabled: bool,
+    /// Cached [`shadow_uniform_params`] output, written into uniforms each frame.
+    shadow_params: [f32; 4],
     sky_vb: wgpu::Buffer,
     sky_bind_group: Option<wgpu::BindGroup>,
     sky_fallback_bg: wgpu::BindGroup,
@@ -717,11 +1025,25 @@ pub(crate) struct GpuSceneResources {
     terrain_bind_group: Option<wgpu::BindGroup>,
 
     water_draw: Option<(wgpu::Buffer, wgpu::Buffer, u32, wgpu::BindGroup)>,
+    decal_batches: Vec<(wgpu::Buffer, wgpu::Buffer, u32, wgpu::BindGroup)>,
     static_overlay: Option<(wgpu::Buffer, wgpu::Buffer, u32)>,
-    prop_batches: Vec<(wgpu::Buffer, wgpu::Buffer, u32, wgpu::BindGroup, wgpu::Buffer, u32)>,
+    prop_batches: Vec<(
+        wgpu::Buffer,
+        wgpu::Buffer,
+        u32,
+        wgpu::BindGroup,
+        wgpu::Buffer,
+        u32,
+        [f32; 3],
+        [f32; 3],
+    )>,
     unit_batches: Vec<(wgpu::Buffer, wgpu::Buffer, u32, wgpu::BindGroup, wgpu::Buffer, u32)>,
+    shield_mesh: (wgpu::Buffer, wgpu::Buffer, u32),
+    shield_instances: Option<(wgpu::Buffer, u32)>,
+    vfx_draw: Option<(wgpu::Buffer, wgpu::Buffer, u32)>,
     dynamic: Option<(wgpu::Buffer, wgpu::Buffer, u32)>,
 
+    hud_strat_icons: Option<(wgpu::Buffer, wgpu::Buffer, u32)>,
     hud_minimap: Option<(wgpu::Buffer, wgpu::Buffer, u32)>,
     hud_bg: Option<(wgpu::Buffer, wgpu::Buffer, u32)>,
     hud_icons: Option<(wgpu::Buffer, wgpu::Buffer, u32)>,
@@ -730,7 +1052,85 @@ pub(crate) struct GpuSceneResources {
     lighting: ScMapLighting,
     map_size: [f32; 2],
     water_levels: [f32; 3],
+    last_view_proj: [[f32; 4]; 4],
+    last_shadow_view_proj: [[f32; 4]; 4],
     start_time: Instant,
+    queue: wgpu::Queue,
+    /// Counters of the last [`GpuSceneResources::encode_draw`] call.
+    draw_stats: std::cell::Cell<DrawStats>,
+    /// Optional render-pass timestamp queries (needs `Features::TIMESTAMP_QUERY`).
+    gpu_timer: Option<GpuTimer>,
+}
+
+/// Per-frame draw counters (for `bench-render` and the F10 overlay).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct DrawStats {
+    pub draw_calls: u32,
+    pub instances: u64,
+    pub triangles: u64,
+    /// Unit/wreck/projectile instanced batches in the main pass.
+    pub unit_batches: u32,
+    pub unit_instances: u64,
+}
+
+impl DrawStats {
+    #[inline]
+    fn add(&mut self, index_count: u32, instances: u32) {
+        self.draw_calls += 1;
+        self.instances += u64::from(instances);
+        self.triangles += u64::from(index_count / 3) * u64::from(instances);
+    }
+}
+
+/// Render-pass GPU timing via timestamp queries: [shadow begin, shadow end, main begin, main end].
+/// One readback is in flight at a time; frames encoded while it is pending are not timed.
+pub(crate) struct GpuTimer {
+    query_set: wgpu::QuerySet,
+    resolve_buf: wgpu::Buffer,
+    readback: wgpu::Buffer,
+    period_ns: f32,
+    /// 0 = idle, 1 = written this frame (awaiting map request), 2 = map requested, 3 = mapped.
+    state: Arc<std::sync::atomic::AtomicU8>,
+    shadow_written: std::cell::Cell<bool>,
+    last_ms: std::cell::Cell<Option<(f64, f64)>>,
+}
+
+impl GpuTimer {
+    fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Option<Self> {
+        if !device.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
+            return None;
+        }
+        let query_set = device.create_query_set(&wgpu::QuerySetDescriptor {
+            label: Some("gpu_timer_qs"),
+            ty: wgpu::QueryType::Timestamp,
+            count: 4,
+        });
+        let resolve_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("gpu_timer_resolve"),
+            size: 32,
+            usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("gpu_timer_readback"),
+            size: 32,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        Some(Self {
+            query_set,
+            resolve_buf,
+            readback,
+            period_ns: queue.get_timestamp_period(),
+            state: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            shadow_written: std::cell::Cell::new(false),
+            last_ms: std::cell::Cell::new(None),
+        })
+    }
+
+    fn idle(&self) -> bool {
+        self.state.load(std::sync::atomic::Ordering::Acquire) == 0
+    }
 }
 
 fn upload_texture_2d(
@@ -931,6 +1331,55 @@ fn sky_cube_vertices() -> Vec<[f32; 3]> {
     ]
 }
 
+/// Builds a shadow-map render target plus its sampling bind group.
+/// `size` is clamped to at least 1 so `Off` still yields a valid (unsampled) binding.
+fn create_shadow_target(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    size: u32,
+) -> (wgpu::TextureView, wgpu::BindGroup) {
+    let edge = size.max(1);
+    let tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("shadow_map_tex"),
+        size: wgpu::Extent3d {
+            width: edge,
+            height: edge,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: DEPTH_FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("shadow_cmp_sampler"),
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        compare: Some(wgpu::CompareFunction::LessEqual),
+        ..Default::default()
+    });
+    let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("shadow_bg"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(&sampler),
+            },
+        ],
+    });
+    (view, bg)
+}
+
 impl GpuSceneResources {
     pub(crate) fn new(
         device: &wgpu::Device,
@@ -956,8 +1405,10 @@ impl GpuSceneResources {
             .map(|t| [t.water_elevation, t.water_deep, t.water_abyss])
             .unwrap_or([-1000.0, -1000.0, -1000.0]);
         let start_time = Instant::now();
+        let shadow_quality = crate::settings::shadow_quality();
+        let shadow_params = shadow_uniform_params(shadow_quality);
 
-        let uniforms = make_uniforms(camera, &lighting, map_size, water_levels, 0.0);
+        let uniforms = make_uniforms(camera, &lighting, map_size, water_levels, 0.0, shadow_params);
         let uniform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("scene_uniforms"),
             contents: bytemuck::bytes_of(&uniforms),
@@ -1039,31 +1490,9 @@ impl GpuSceneResources {
             }],
         });
 
-        // Shadow map (2048x2048 Depth32Float + comparison sampler)
-        let shadow_tex = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("shadow_map_tex"),
-            size: wgpu::Extent3d {
-                width: SHADOW_MAP_SIZE,
-                height: SHADOW_MAP_SIZE,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: DEPTH_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        });
-        let shadow_view = shadow_tex.create_view(&wgpu::TextureViewDescriptor::default());
-        let shadow_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("shadow_cmp_sampler"),
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            compare: Some(wgpu::CompareFunction::LessEqual),
-            ..Default::default()
-        });
+        // Shadow map (Depth32Float + comparison sampler, sized from settings).
+        let shadow_size = shadow_quality.map_size().max(1);
+        let shadows_enabled = shadow_quality.map_size() > 0;
         let shadow_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("shadow_bgl"),
             entries: &[
@@ -1085,20 +1514,8 @@ impl GpuSceneResources {
                 },
             ],
         });
-        let shadow_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("shadow_bg"),
-            layout: &shadow_bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&shadow_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&shadow_sampler),
-                },
-            ],
-        });
+        let (shadow_view, shadow_bind_group) =
+            create_shadow_target(device, &shadow_bgl, shadow_size);
 
         let white_img = RgbaImage {
             width: 1,
@@ -1141,6 +1558,86 @@ impl GpuSceneResources {
             &white_img,
             "hud_icons_bg",
         );
+        let strat_icons_bind_group = create_rgba_bind_group(
+            device,
+            queue,
+            &bind_group_layout,
+            &uniform_buf,
+            &sampler_clamp,
+            &white_img,
+            "strat_icons_bg",
+        );
+
+        let bone_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("bone_bgl"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let identity_mat: [[f32; 4]; 4] = [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        let bone_buf_cap = 256usize;
+        let init_bones = vec![identity_mat; bone_buf_cap];
+        let bone_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("bone_palette_buf"),
+            contents: bytemuck::cast_slice(&init_bones),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+        let bone_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("bone_bg"),
+            layout: &bone_bgl,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: bone_buf.as_entire_binding(),
+            }],
+        });
+
+        let fow_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("fow_mask_tex"),
+            size: wgpu::Extent3d {
+                width: 128,
+                height: 128,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let full_vis = vec![255u8; 128 * 128 * 4];
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &fow_tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &full_vis,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(128 * 4),
+                rows_per_image: Some(128),
+            },
+            wgpu::Extent3d {
+                width: 128,
+                height: 128,
+                depth_or_array_layers: 1,
+            },
+        );
+        let fow_view = fow_tex.create_view(&wgpu::TextureViewDescriptor::default());
 
         let vertex_layout = wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<GpuVertex>() as wgpu::BufferAddress,
@@ -1198,6 +1695,38 @@ impl GpuSceneResources {
                     shader_location: 8,
                     format: wgpu::VertexFormat::Float32x4,
                 },
+                wgpu::VertexAttribute {
+                    offset: 80,
+                    shader_location: 9,
+                    format: wgpu::VertexFormat::Float32x4,
+                },
+            ],
+        };
+
+        let vfx_vertex_layout = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<VfxVertex>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &[
+                wgpu::VertexAttribute {
+                    offset: 0,
+                    shader_location: 0,
+                    format: wgpu::VertexFormat::Float32x3,
+                },
+                wgpu::VertexAttribute {
+                    offset: 12,
+                    shader_location: 1,
+                    format: wgpu::VertexFormat::Float32x2,
+                },
+                wgpu::VertexAttribute {
+                    offset: 20,
+                    shader_location: 2,
+                    format: wgpu::VertexFormat::Float32x4,
+                },
+                wgpu::VertexAttribute {
+                    offset: 36,
+                    shader_location: 3,
+                    format: wgpu::VertexFormat::Float32,
+                },
             ],
         };
 
@@ -1238,7 +1767,7 @@ impl GpuSceneResources {
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs_main"),
-                buffers: &[vertex_layout.clone()],
+                buffers: std::slice::from_ref(&vertex_layout),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             },
             fragment: Some(wgpu::FragmentState {
@@ -1273,10 +1802,59 @@ impl GpuSceneResources {
             cache: None,
         });
 
-        // Shadow pipeline (depth-only single-sample)
+        let decal_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("farust_decal_shader"),
+            source: wgpu::ShaderSource::Wgsl(DECAL_SHADER_WGSL.into()),
+        });
+        let decal_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("decal_pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &decal_shader,
+                entry_point: Some("vs_main"),
+                buffers: std::slice::from_ref(&vertex_layout),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &decal_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: target_format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::LessEqual,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState {
+                    constant: -2,
+                    slope_scale: -1.0,
+                    clamp: 0.0,
+                },
+            }),
+            multisample: wgpu::MultisampleState {
+                count: sample_count,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            multiview: None,
+            cache: None,
+        });
+
+        // Shadow pipeline (depth-only single-sample with bone palette skinning)
         let shadow_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("shadow_pl"),
-            bind_group_layouts: &[&uniform_only_bgl],
+            bind_group_layouts: &[&uniform_only_bgl, &bone_bgl],
             push_constant_ranges: &[],
         });
         let shadow_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -1525,6 +2103,16 @@ impl GpuSceneResources {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 8,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    },
+                    count: None,
+                },
             ],
         });
         let terrain_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -1542,7 +2130,7 @@ impl GpuSceneResources {
             vertex: wgpu::VertexState {
                 module: &terrain_shader,
                 entry_point: Some("vs_main"),
-                buffers: &[vertex_layout.clone()],
+                buffers: std::slice::from_ref(&vertex_layout),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             },
             fragment: Some(wgpu::FragmentState {
@@ -1584,6 +2172,7 @@ impl GpuSceneResources {
                 &uniform_buf,
                 &sampler_clamp,
                 &sampler_repeat,
+                &fow_view,
                 ts,
             )
         });
@@ -1661,7 +2250,7 @@ impl GpuSceneResources {
             vertex: wgpu::VertexState {
                 module: &water_shader,
                 entry_point: Some("vs_main"),
-                buffers: &[vertex_layout.clone()],
+                buffers: std::slice::from_ref(&vertex_layout),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             },
             fragment: Some(wgpu::FragmentState {
@@ -1713,7 +2302,7 @@ impl GpuSceneResources {
         // Instanced props & units pipeline
         let inst_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("inst_pl"),
-            bind_group_layouts: &[&bind_group_layout, &shadow_bgl],
+            bind_group_layouts: &[&bind_group_layout, &shadow_bgl, &bone_bgl],
             push_constant_ranges: &[],
         });
         let inst_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -1726,7 +2315,7 @@ impl GpuSceneResources {
             vertex: wgpu::VertexState {
                 module: &inst_shader,
                 entry_point: Some("vs_main"),
-                buffers: &[vertex_layout, instance_layout],
+                buffers: &[vertex_layout.clone(), instance_layout.clone()],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             },
             fragment: Some(wgpu::FragmentState {
@@ -1748,6 +2337,103 @@ impl GpuSceneResources {
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: DEPTH_FORMAT,
                 depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::LessEqual,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState {
+                count: sample_count,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            multiview: None,
+            cache: None,
+        });
+
+        // Translucent bubble-shield pipeline
+        let uniform_only_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("uniform_only_pl"),
+            bind_group_layouts: &[&uniform_only_bgl],
+            push_constant_ranges: &[],
+        });
+        let shield_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("farust_shield_shader"),
+            source: wgpu::ShaderSource::Wgsl(SHIELD_SHADER_WGSL.into()),
+        });
+        let shield_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("shield_pipeline"),
+            layout: Some(&uniform_only_pl),
+            vertex: wgpu::VertexState {
+                module: &shield_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[vertex_layout, instance_layout],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shield_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: target_format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::LessEqual,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState {
+                count: sample_count,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            multiview: None,
+            cache: None,
+        });
+
+        // GPU billboard particle VFX pipeline
+        let vfx_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("farust_vfx_shader"),
+            source: wgpu::ShaderSource::Wgsl(VFX_SHADER_WGSL.into()),
+        });
+        let vfx_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("vfx_pipeline"),
+            layout: Some(&uniform_only_pl),
+            vertex: wgpu::VertexState {
+                module: &vfx_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[vfx_vertex_layout],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &vfx_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: target_format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: false,
                 depth_compare: wgpu::CompareFunction::LessEqual,
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
@@ -1829,7 +2515,38 @@ impl GpuSceneResources {
             None
         };
 
-        // Upload static environment prop batches
+        // Upload terrain decals
+        let mut decal_batches = Vec::with_capacity(scene.decal_batches.len());
+        for db in &scene.decal_batches {
+            if db.vertices.is_empty() || db.indices.is_empty() {
+                continue;
+            }
+            let Some(ref img) = db.albedo else {
+                continue;
+            };
+            let vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(&db.label),
+                contents: bytemuck::cast_slice(&db.vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+            let ib = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(&db.label),
+                contents: bytemuck::cast_slice(&db.indices),
+                usage: wgpu::BufferUsages::INDEX,
+            });
+            let bg = create_rgba_bind_group(
+                device,
+                queue,
+                &bind_group_layout,
+                &uniform_buf,
+                &sampler_clamp,
+                img,
+                &db.label,
+            );
+            decal_batches.push((vb, ib, db.indices.len() as u32, bg));
+        }
+
+        // Upload static environment prop batches (with 8x8 XZ chunk AABBs for frustum culling)
         let mut prop_batches = Vec::with_capacity(scene.prop_batches.len());
         for pb in &scene.prop_batches {
             if pb.instances.is_empty() || pb.indices.is_empty() {
@@ -1869,25 +2586,53 @@ impl GpuSceneResources {
                 bg,
                 inst_b,
                 pb.instances.len() as u32,
+                pb.bounds_min,
+                pb.bounds_max,
             ));
         }
 
+        let (sh_verts, sh_indices) = build_shield_hemisphere_mesh();
+        let sh_vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("shield_dome_vb"),
+            contents: bytemuck::cast_slice(&sh_verts),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let sh_ib = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("shield_dome_ib"),
+            contents: bytemuck::cast_slice(&sh_indices),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+        let shield_mesh = (sh_vb, sh_ib, sh_indices.len() as u32);
+
         Self {
             pipeline,
+            decal_pipeline,
             shadow_pipeline,
             sky_pipeline,
             terrain_pipeline,
             water_pipeline,
             instanced_pipeline,
+            shield_pipeline,
+            vfx_pipeline,
             hud_pipeline,
             bind_group_layout,
             bind_group,
             overlay_bind_group,
             minimap_bind_group,
             hud_icons_bind_group,
+            strat_icons_bind_group,
             uniform_only_bg,
+            bone_bgl,
+            bone_buf,
+            bone_buf_cap,
+            bone_bind_group,
+            fow_tex,
             shadow_view,
             shadow_bind_group,
+            shadow_bgl,
+            shadow_size,
+            shadows_enabled,
+            shadow_params,
             sky_vb,
             sky_bind_group,
             sky_fallback_bg,
@@ -1899,10 +2644,15 @@ impl GpuSceneResources {
             index_count: scene.indices.len() as u32,
             terrain_bind_group,
             water_draw,
+            decal_batches,
             static_overlay,
             prop_batches,
             unit_batches: Vec::new(),
+            shield_mesh,
+            shield_instances: None,
+            vfx_draw: None,
             dynamic: None,
+            hud_strat_icons: None,
             hud_minimap: None,
             hud_bg: None,
             hud_icons: None,
@@ -1910,8 +2660,73 @@ impl GpuSceneResources {
             lighting,
             map_size,
             water_levels,
+            last_view_proj: uniforms.view_proj,
+            last_shadow_view_proj: uniforms.shadow_view_proj,
             start_time,
+            queue: queue.clone(),
+            draw_stats: std::cell::Cell::new(DrawStats::default()),
+            gpu_timer: None,
         }
+    }
+
+    /// Counters recorded by the last [`Self::encode_draw`].
+    pub(crate) fn draw_stats(&self) -> DrawStats {
+        self.draw_stats.get()
+    }
+
+    /// Enables render-pass timestamp queries when the device has `TIMESTAMP_QUERY`.
+    /// Returns whether GPU timing is active.
+    pub(crate) fn enable_gpu_timer(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) -> bool {
+        if self.gpu_timer.is_none() {
+            self.gpu_timer = GpuTimer::new(device, queue);
+        }
+        self.gpu_timer.is_some()
+    }
+
+    /// Call right after `queue.submit` of a frame encoded with [`Self::encode_draw`]: requests
+    /// the timestamp readback when this frame wrote queries.
+    pub(crate) fn gpu_timer_after_submit(&self) {
+        let Some(t) = &self.gpu_timer else {
+            return;
+        };
+        use std::sync::atomic::Ordering;
+        if t.state.compare_exchange(1, 2, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            let st = Arc::clone(&t.state);
+            t.readback.slice(..).map_async(wgpu::MapMode::Read, move |res| {
+                st.store(if res.is_ok() { 3 } else { 0 }, Ordering::Release);
+            });
+        }
+    }
+
+    /// Collects a finished timestamp readback (after a `device.poll`). Returns
+    /// `(shadow_ms, main_ms)` of the most recent timed frame and feeds the profiler.
+    pub(crate) fn poll_gpu_timer(&self) -> Option<(f64, f64)> {
+        let t = self.gpu_timer.as_ref()?;
+        use std::sync::atomic::Ordering;
+        if t.state.load(Ordering::Acquire) == 3 {
+            let ts: [u64; 4] = {
+                let data = t.readback.slice(..).get_mapped_range();
+                let mut ts = [0u64; 4];
+                for (i, c) in data.chunks_exact(8).take(4).enumerate() {
+                    ts[i] = u64::from_le_bytes(c.try_into().unwrap_or([0; 8]));
+                }
+                ts
+            };
+            t.readback.unmap();
+            let ms = |a: u64, b: u64| b.saturating_sub(a) as f64 * f64::from(t.period_ns) / 1e6;
+            let shadow = if t.shadow_written.get() { ms(ts[0], ts[1]) } else { 0.0 };
+            let main = ms(ts[2], ts[3]);
+            t.last_ms.set(Some((shadow, main)));
+            crate::profiler::record_ms("gpu.shadow_pass", shadow);
+            crate::profiler::record_ms("gpu.main_pass", main);
+            t.state.store(0, Ordering::Release);
+        }
+        t.last_ms.get()
+    }
+
+    /// Cloned handle of the queue these resources were created with (render-glue uploads).
+    pub(crate) fn queue(&self) -> wgpu::Queue {
+        self.queue.clone()
     }
 
     pub(crate) fn create_mesh_template(
@@ -1958,16 +2773,35 @@ impl GpuSceneResources {
         device: &wgpu::Device,
         batches: Vec<(&GpuMeshTemplate, &[GpuUnitInstance])>,
     ) {
-        self.unit_batches.clear();
+        // Recycle last frame's instance buffers (largest first) instead of allocating new
+        // ones every frame; contents go through `queue.write_buffer`.
+        let mut free: Vec<wgpu::Buffer> = self.unit_batches.drain(..).map(|b| b.4).collect();
+        free.sort_by_key(|b| std::cmp::Reverse(b.size()));
         for (tpl, instances) in batches {
             if instances.is_empty() || tpl.index_count == 0 {
                 continue;
             }
-            let inst_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("unit_inst_buf"),
-                contents: bytemuck::cast_slice(instances),
-                usage: wgpu::BufferUsages::VERTEX,
-            });
+            let bytes: &[u8] = bytemuck::cast_slice(instances);
+            let need = bytes.len() as u64;
+            let inst_buf = match free.iter().rposition(|b| b.size() >= need) {
+                Some(i) => {
+                    let b = free.swap_remove(i);
+                    free.sort_by_key(|b| std::cmp::Reverse(b.size()));
+                    self.queue.write_buffer(&b, 0, bytes);
+                    b
+                }
+                None => {
+                    let cap = need.next_power_of_two().max(4096);
+                    let b = device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("unit_inst_buf"),
+                        size: cap,
+                        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    });
+                    self.queue.write_buffer(&b, 0, bytes);
+                    b
+                }
+            };
             self.unit_batches.push((
                 tpl.vertex_buf.clone(),
                 tpl.index_buf.clone(),
@@ -2070,9 +2904,185 @@ impl GpuSceneResources {
         self.dynamic = Some((vb, ib, indices.len() as u32));
     }
 
-    pub(crate) fn update_camera(&self, queue: &wgpu::Queue, camera: &OrbitCamera) {
+    pub(crate) fn set_bone_palette(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        mats: &[[[f32; 4]; 4]],
+    ) {
+        if mats.is_empty() {
+            return;
+        }
+        if mats.len() > self.bone_buf_cap {
+            let new_cap = mats.len().next_power_of_two().max(256);
+            let mut padded = Vec::with_capacity(new_cap);
+            padded.extend_from_slice(mats);
+            let id_m: [[f32; 4]; 4] = [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ];
+            padded.resize(new_cap, id_m);
+            let new_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("bone_palette_buf"),
+                contents: bytemuck::cast_slice(&padded),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            });
+            self.bone_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("bone_bg"),
+                layout: &self.bone_bgl,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: new_buf.as_entire_binding(),
+                }],
+            });
+            self.bone_buf = new_buf;
+            self.bone_buf_cap = new_cap;
+        } else {
+            queue.write_buffer(&self.bone_buf, 0, bytemuck::cast_slice(mats));
+        }
+    }
+
+    pub(crate) fn update_fow_texture(&self, queue: &wgpu::Queue, rgba_128x128: &[u8]) {
+        if rgba_128x128.len() != 128 * 128 * 4 {
+            return;
+        }
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.fow_tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            rgba_128x128,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(128 * 4),
+                rows_per_image: Some(128),
+            },
+            wgpu::Extent3d {
+                width: 128,
+                height: 128,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+
+    pub(crate) fn set_shield_instances(
+        &mut self,
+        device: &wgpu::Device,
+        instances: &[GpuUnitInstance],
+    ) {
+        if instances.is_empty() {
+            self.shield_instances = None;
+            return;
+        }
+        let inst_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("shield_inst_buf"),
+            contents: bytemuck::cast_slice(instances),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        self.shield_instances = Some((inst_buf, instances.len() as u32));
+    }
+
+    pub(crate) fn set_vfx(
+        &mut self,
+        device: &wgpu::Device,
+        vertices: &[VfxVertex],
+        indices: &[u32],
+    ) {
+        if vertices.is_empty() || indices.is_empty() {
+            self.vfx_draw = None;
+            return;
+        }
+        let vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("vfx_vb"),
+            contents: bytemuck::cast_slice(vertices),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let ib = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("vfx_ib"),
+            contents: bytemuck::cast_slice(indices),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+        self.vfx_draw = Some((vb, ib, indices.len() as u32));
+    }
+
+    pub(crate) fn set_strategic_icons_texture(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        img: &RgbaImage,
+    ) {
+        self.strat_icons_bind_group = create_rgba_bind_group(
+            device,
+            queue,
+            &self.bind_group_layout,
+            &self.uniform_buf,
+            &self.sampler_clamp,
+            img,
+            "strat_icons_tex",
+        );
+    }
+
+    pub(crate) fn set_hud_strategic_icons(
+        &mut self,
+        device: &wgpu::Device,
+        verts: &[HudVertex],
+        indices: &[u32],
+    ) {
+        if verts.is_empty() || indices.is_empty() {
+            self.hud_strat_icons = None;
+            return;
+        }
+        let vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("hud_strat_icons_vb"),
+            contents: bytemuck::cast_slice(verts),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let ib = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("hud_strat_icons_ib"),
+            contents: bytemuck::cast_slice(indices),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+        self.hud_strat_icons = Some((vb, ib, indices.len() as u32));
+    }
+
+    /// Applies a new shadow quality, rebuilding the shadow target when the size
+    /// or enabled state changes. Returns `true` when anything was rebuilt; call
+    /// [`Self::update_camera`] afterwards so the new PCF params reach the GPU.
+    pub(crate) fn set_shadow_quality(
+        &mut self,
+        device: &wgpu::Device,
+        quality: ShadowQuality,
+    ) -> bool {
+        let size = quality.map_size().max(1);
+        let enabled = quality.map_size() > 0;
+        if size == self.shadow_size && enabled == self.shadows_enabled {
+            return false;
+        }
+        let (view, bg) = create_shadow_target(device, &self.shadow_bgl, size);
+        self.shadow_view = view;
+        self.shadow_bind_group = bg;
+        self.shadow_size = size;
+        self.shadows_enabled = enabled;
+        self.shadow_params = shadow_uniform_params(quality);
+        true
+    }
+
+    pub(crate) fn update_camera(&mut self, queue: &wgpu::Queue, camera: &OrbitCamera) {
         let t = self.start_time.elapsed().as_secs_f32();
-        let uniforms = make_uniforms(camera, &self.lighting, self.map_size, self.water_levels, t);
+        let uniforms = make_uniforms(
+            camera,
+            &self.lighting,
+            self.map_size,
+            self.water_levels,
+            t,
+            self.shadow_params,
+        );
+        self.last_view_proj = uniforms.view_proj;
+        self.last_shadow_view_proj = uniforms.shadow_view_proj;
         queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniforms));
     }
 
@@ -2084,8 +3094,25 @@ impl GpuSceneResources {
         depth_view: &wgpu::TextureView,
         clear_color: [f64; 4],
     ) {
-        // Pass 1: Directional Shadow Map (props + units)
-        if !self.prop_batches.is_empty() || !self.unit_batches.is_empty() {
+        let mut st = DrawStats::default();
+        let timer = self.gpu_timer.as_ref().filter(|t| t.idle());
+        let shadow_ts = timer.map(|t| wgpu::RenderPassTimestampWrites {
+            query_set: &t.query_set,
+            beginning_of_pass_write_index: Some(0),
+            end_of_pass_write_index: Some(1),
+        });
+        let main_ts = timer.map(|t| wgpu::RenderPassTimestampWrites {
+            query_set: &t.query_set,
+            beginning_of_pass_write_index: Some(2),
+            end_of_pass_write_index: Some(3),
+        });
+        if let Some(t) = timer {
+            t.shadow_written.set(false);
+        }
+        // Pass 1: Directional Shadow Map (props + units), skipped when shadows are off.
+        if self.shadows_enabled
+            && (!self.prop_batches.is_empty() || !self.unit_batches.is_empty())
+        {
             let mut spass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("shadow_pass"),
                 color_attachments: &[],
@@ -2097,22 +3124,32 @@ impl GpuSceneResources {
                     }),
                     stencil_ops: None,
                 }),
-                timestamp_writes: None,
+                timestamp_writes: shadow_ts,
                 occlusion_query_set: None,
             });
+            if let Some(t) = timer {
+                t.shadow_written.set(true);
+            }
             spass.set_pipeline(&self.shadow_pipeline);
             spass.set_bind_group(0, &self.uniform_only_bg, &[]);
-            for (vb, ib, idx_n, _, inst_b, inst_n) in &self.prop_batches {
-                spass.set_vertex_buffer(0, vb.slice(..));
-                spass.set_vertex_buffer(1, inst_b.slice(..));
-                spass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
-                spass.draw_indexed(0..*idx_n, 0, 0..*inst_n);
+            spass.set_bind_group(1, &self.bone_bind_group, &[]);
+            if !self.prop_batches.is_empty() {
+                let shadow_planes = extract_frustum_planes(&self.last_shadow_view_proj);
+                for (vb, ib, idx_n, _, inst_b, inst_n, bmin, bmax) in &self.prop_batches {
+                    if !aabb_in_frustum(&shadow_planes, *bmin, *bmax) {
+                        continue;
+                    }
+                    spass.set_vertex_buffer(0, vb.slice(..));
+                    spass.set_vertex_buffer(1, inst_b.slice(..));
+                    spass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                    { st.add(*idx_n, *inst_n); spass.draw_indexed(0..*idx_n, 0, 0..*inst_n); }
+                }
             }
             for (vb, ib, idx_n, _, inst_b, inst_n) in &self.unit_batches {
                 spass.set_vertex_buffer(0, vb.slice(..));
                 spass.set_vertex_buffer(1, inst_b.slice(..));
                 spass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
-                spass.draw_indexed(0..*idx_n, 0, 0..*inst_n);
+                { st.add(*idx_n, *inst_n); spass.draw_indexed(0..*idx_n, 0, 0..*inst_n); }
             }
         }
 
@@ -2140,7 +3177,7 @@ impl GpuSceneResources {
                 }),
                 stencil_ops: None,
             }),
-            timestamp_writes: None,
+            timestamp_writes: main_ts,
             occlusion_query_set: None,
         });
 
@@ -2150,10 +3187,11 @@ impl GpuSceneResources {
             rpass.set_bind_group(0, &self.uniform_only_bg, &[]);
             rpass.set_bind_group(1, sky_bg, &[]);
             rpass.set_vertex_buffer(0, self.sky_vb.slice(..));
+            st.add(36, 1);
             rpass.draw(0..36, 0..1);
         }
 
-        // Terrain (multi-stratum splatting + shadow map, or single-texture fallback)
+        // Terrain (multi-stratum splatting + FoW + shadow map, or single-texture fallback)
         if self.index_count > 0 {
             if let Some(ref t_bg) = self.terrain_bind_group {
                 rpass.set_pipeline(&self.terrain_pipeline);
@@ -2165,26 +3203,44 @@ impl GpuSceneResources {
             }
             rpass.set_vertex_buffer(0, self.vertex_buf.slice(..));
             rpass.set_index_buffer(self.index_buf.slice(..), wgpu::IndexFormat::Uint32);
-            rpass.draw_indexed(0..self.index_count, 0, 0..1);
+            { st.add(self.index_count, 1); rpass.draw_indexed(0..self.index_count, 0, 0..1); }
         }
 
-        // Instanced Props (trees/rocks/logs) + Units & Wrecks
+        // Terrain Decals (draped albedo craters, scorch marks, roads)
+        if !self.decal_batches.is_empty() {
+            rpass.set_pipeline(&self.decal_pipeline);
+            for (vb, ib, idx_n, bg) in &self.decal_batches {
+                rpass.set_bind_group(0, bg, &[]);
+                rpass.set_vertex_buffer(0, vb.slice(..));
+                rpass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                { st.add(*idx_n, 1); rpass.draw_indexed(0..*idx_n, 0, 0..1); }
+            }
+        }
+
+        // Instanced Props (frustum-culled 8x8 XZ chunks) + Units & Wrecks (GPU skinned)
         if !self.prop_batches.is_empty() || !self.unit_batches.is_empty() {
+            let planes = extract_frustum_planes(&self.last_view_proj);
             rpass.set_pipeline(&self.instanced_pipeline);
             rpass.set_bind_group(1, &self.shadow_bind_group, &[]);
-            for (vb, ib, idx_n, bg, inst_b, inst_n) in &self.prop_batches {
+            rpass.set_bind_group(2, &self.bone_bind_group, &[]);
+            for (vb, ib, idx_n, bg, inst_b, inst_n, bmin, bmax) in &self.prop_batches {
+                if !aabb_in_frustum(&planes, *bmin, *bmax) {
+                    continue;
+                }
                 rpass.set_bind_group(0, bg, &[]);
                 rpass.set_vertex_buffer(0, vb.slice(..));
                 rpass.set_vertex_buffer(1, inst_b.slice(..));
                 rpass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
-                rpass.draw_indexed(0..*idx_n, 0, 0..*inst_n);
+                { st.add(*idx_n, *inst_n); rpass.draw_indexed(0..*idx_n, 0, 0..*inst_n); }
             }
             for (vb, ib, idx_n, bg, inst_b, inst_n) in &self.unit_batches {
+                st.unit_batches += 1;
+                st.unit_instances += u64::from(*inst_n);
                 rpass.set_bind_group(0, bg, &[]);
                 rpass.set_vertex_buffer(0, vb.slice(..));
                 rpass.set_vertex_buffer(1, inst_b.slice(..));
                 rpass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
-                rpass.draw_indexed(0..*idx_n, 0, 0..*inst_n);
+                { st.add(*idx_n, *inst_n); rpass.draw_indexed(0..*idx_n, 0, 0..*inst_n); }
             }
         }
 
@@ -2196,7 +3252,7 @@ impl GpuSceneResources {
             rpass.set_bind_group(1, sky_bg, &[]);
             rpass.set_vertex_buffer(0, wvb.slice(..));
             rpass.set_index_buffer(wib.slice(..), wgpu::IndexFormat::Uint32);
-            rpass.draw_indexed(0..*wn, 0, 0..1);
+            { st.add(*wn, 1); rpass.draw_indexed(0..*wn, 0, 0..1); }
         }
 
         // Static & Dynamic 3D Overlays (bars, mass pads, selection rings, tracers)
@@ -2206,48 +3262,81 @@ impl GpuSceneResources {
                 rpass.set_bind_group(0, &self.overlay_bind_group, &[]);
                 rpass.set_vertex_buffer(0, vb.slice(..));
                 rpass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
-                rpass.draw_indexed(0..*n, 0, 0..1);
+                { st.add(*n, 1); rpass.draw_indexed(0..*n, 0, 0..1); }
             }
             if let Some((vb, ib, n)) = &self.dynamic {
                 rpass.set_bind_group(0, &self.overlay_bind_group, &[]);
                 rpass.set_vertex_buffer(0, vb.slice(..));
                 rpass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
-                rpass.draw_indexed(0..*n, 0, 0..1);
+                { st.add(*n, 1); rpass.draw_indexed(0..*n, 0, 0..1); }
             }
         }
 
-        // 2D HUD Pass (Minimap -> Button Backgrounds/Bars -> FA Unit Icons -> Bitmap Text)
-        if self.hud_minimap.is_some()
+        // Translucent Bubble Shield Domes
+        if let Some((inst_b, inst_n)) = &self.shield_instances {
+            rpass.set_pipeline(&self.shield_pipeline);
+            rpass.set_bind_group(0, &self.uniform_only_bg, &[]);
+            rpass.set_vertex_buffer(0, self.shield_mesh.0.slice(..));
+            rpass.set_vertex_buffer(1, inst_b.slice(..));
+            rpass.set_index_buffer(self.shield_mesh.1.slice(..), wgpu::IndexFormat::Uint32);
+            { st.add(self.shield_mesh.2, *inst_n); rpass.draw_indexed(0..self.shield_mesh.2, 0, 0..*inst_n); }
+        }
+
+        // GPU Billboard Particle VFX
+        if let Some((vb, ib, n)) = &self.vfx_draw {
+            rpass.set_pipeline(&self.vfx_pipeline);
+            rpass.set_bind_group(0, &self.uniform_only_bg, &[]);
+            rpass.set_vertex_buffer(0, vb.slice(..));
+            rpass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+            { st.add(*n, 1); rpass.draw_indexed(0..*n, 0, 0..1); }
+        }
+
+        // 2D HUD Pass (Strategic Icons -> Minimap -> Button Backgrounds/Bars -> FA Unit Icons -> Bitmap Text)
+        if self.hud_strat_icons.is_some()
+            || self.hud_minimap.is_some()
             || self.hud_bg.is_some()
             || self.hud_icons.is_some()
             || self.hud_text.is_some()
         {
             rpass.set_pipeline(&self.hud_pipeline);
+            if let Some((vb, ib, n)) = &self.hud_strat_icons {
+                rpass.set_bind_group(0, &self.strat_icons_bind_group, &[]);
+                rpass.set_vertex_buffer(0, vb.slice(..));
+                rpass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                { st.add(*n, 1); rpass.draw_indexed(0..*n, 0, 0..1); }
+            }
             if let Some((vb, ib, n)) = &self.hud_minimap {
                 rpass.set_bind_group(0, &self.minimap_bind_group, &[]);
                 rpass.set_vertex_buffer(0, vb.slice(..));
                 rpass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
-                rpass.draw_indexed(0..*n, 0, 0..1);
+                { st.add(*n, 1); rpass.draw_indexed(0..*n, 0, 0..1); }
             }
             if let Some((vb, ib, n)) = &self.hud_bg {
                 rpass.set_bind_group(0, &self.overlay_bind_group, &[]);
                 rpass.set_vertex_buffer(0, vb.slice(..));
                 rpass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
-                rpass.draw_indexed(0..*n, 0, 0..1);
+                { st.add(*n, 1); rpass.draw_indexed(0..*n, 0, 0..1); }
             }
             if let Some((vb, ib, n)) = &self.hud_icons {
                 rpass.set_bind_group(0, &self.hud_icons_bind_group, &[]);
                 rpass.set_vertex_buffer(0, vb.slice(..));
                 rpass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
-                rpass.draw_indexed(0..*n, 0, 0..1);
+                { st.add(*n, 1); rpass.draw_indexed(0..*n, 0, 0..1); }
             }
             if let Some((vb, ib, n)) = &self.hud_text {
                 rpass.set_bind_group(0, &self.overlay_bind_group, &[]);
                 rpass.set_vertex_buffer(0, vb.slice(..));
                 rpass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
-                rpass.draw_indexed(0..*n, 0, 0..1);
+                { st.add(*n, 1); rpass.draw_indexed(0..*n, 0, 0..1); }
             }
         }
+        drop(rpass);
+        if let Some(t) = timer {
+            encoder.resolve_query_set(&t.query_set, 0..4, &t.resolve_buf, 0);
+            encoder.copy_buffer_to_buffer(&t.resolve_buf, 0, &t.readback, 0, 32);
+            t.state.store(1, std::sync::atomic::Ordering::Release);
+        }
+        self.draw_stats.set(st);
     }
 }
 
@@ -2258,6 +3347,7 @@ fn upload_terrain_bind_group(
     uniform_buf: &wgpu::Buffer,
     sampler_clamp: &wgpu::Sampler,
     sampler_repeat: &wgpu::Sampler,
+    fow_view: &wgpu::TextureView,
     ts: &TerrainSplatData,
 ) -> wgpu::BindGroup {
     let params = TerrainParamsUniform {
@@ -2346,8 +3436,107 @@ fn upload_terrain_bind_group(
                 binding: 7,
                 resource: wgpu::BindingResource::Sampler(sampler_repeat),
             },
+            wgpu::BindGroupEntry {
+                binding: 8,
+                resource: wgpu::BindingResource::TextureView(fow_view),
+            },
         ],
     })
+}
+
+/// Unit shield sphere (full sphere: bubble domes intersect the terrain naturally).
+fn build_shield_hemisphere_mesh() -> (Vec<GpuVertex>, Vec<u32>) {
+    const LAT: usize = 24;
+    const LON: usize = 32;
+    let mut verts = Vec::with_capacity((LAT + 1) * (LON + 1));
+    let mut indices = Vec::with_capacity(LAT * LON * 6);
+    for iy in 0..=LAT {
+        let phi = (iy as f32 / LAT as f32) * std::f32::consts::PI - std::f32::consts::FRAC_PI_2;
+        let (sin_p, cos_p) = phi.sin_cos();
+        for ix in 0..=LON {
+            let theta = (ix as f32 / LON as f32) * std::f32::consts::TAU;
+            let (sin_t, cos_t) = theta.sin_cos();
+            let nx = cos_p * cos_t;
+            let ny = sin_p;
+            let nz = cos_p * sin_t;
+            verts.push(GpuVertex {
+                position: [nx, ny, nz],
+                normal: [nx, ny, nz],
+                uv: [ix as f32 / LON as f32, iy as f32 / LAT as f32],
+                color: [1.0, 1.0, 1.0, 0.0],
+            });
+        }
+    }
+    let stride = (LON + 1) as u32;
+    for iy in 0..LAT as u32 {
+        for ix in 0..LON as u32 {
+            let a = iy * stride + ix;
+            let b = a + 1;
+            let c = a + stride;
+            let d = c + 1;
+            indices.extend_from_slice(&[a, c, b, b, c, d]);
+        }
+    }
+    (verts, indices)
+}
+
+fn extract_frustum_planes(vp: &[[f32; 4]; 4]) -> [[f32; 4]; 6] {
+    let row = |r: usize| [vp[0][r], vp[1][r], vp[2][r], vp[3][r]];
+    let r0 = row(0);
+    let r1 = row(1);
+    let r2 = row(2);
+    let r3 = row(3);
+    let add = |a: [f32; 4], b: [f32; 4]| [a[0] + b[0], a[1] + b[1], a[2] + b[2], a[3] + b[3]];
+    let sub = |a: [f32; 4], b: [f32; 4]| [a[0] - b[0], a[1] - b[1], a[2] - b[2], a[3] - b[3]];
+    [
+        add(r3, r0), // Left
+        sub(r3, r0), // Right
+        add(r3, r1), // Bottom
+        sub(r3, r1), // Top
+        r2,          // Near (WebGPU [0, 1] depth)
+        sub(r3, r2), // Far
+    ]
+}
+
+/// View frustum with normalized planes for CPU sphere culling of unit instances.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Frustum {
+    planes: [[f32; 4]; 6],
+}
+
+impl Frustum {
+    pub(crate) fn from_view_proj(vp: &[[f32; 4]; 4]) -> Self {
+        let mut planes = extract_frustum_planes(vp);
+        for p in &mut planes {
+            let l = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt();
+            if l > 1e-12 {
+                for c in p.iter_mut() {
+                    *c /= l;
+                }
+            }
+        }
+        Self { planes }
+    }
+
+    /// `true` unless the sphere lies completely outside one plane.
+    #[inline]
+    pub(crate) fn sphere_visible(&self, c: [f32; 3], r: f32) -> bool {
+        self.planes
+            .iter()
+            .all(|p| p[0] * c[0] + p[1] * c[1] + p[2] * c[2] + p[3] >= -r)
+    }
+}
+
+fn aabb_in_frustum(planes: &[[f32; 4]; 6], bmin: [f32; 3], bmax: [f32; 3]) -> bool {
+    for p in planes {
+        let px = if p[0] >= 0.0 { bmax[0] } else { bmin[0] };
+        let py = if p[1] >= 0.0 { bmax[1] } else { bmin[1] };
+        let pz = if p[2] >= 0.0 { bmax[2] } else { bmin[2] };
+        if p[0] * px + p[1] * py + p[2] * pz + p[3] < 0.0 {
+            return false;
+        }
+    }
+    true
 }
 
 fn upload_water_draw(
@@ -2502,6 +3691,7 @@ fn make_uniforms(
     map_size: [f32; 2],
     water_levels: [f32; 3],
     time_sec: f32,
+    shadow_params: [f32; 4],
 ) -> Uniforms {
     let eye = camera.eye_position();
     let sd = norm3_or(lighting.sun_direction, [0.46, 0.71, 0.53]);
@@ -2539,6 +3729,7 @@ fn make_uniforms(
             water_levels[1],
             water_levels[2],
         ],
+        shadow_params,
     }
 }
 
@@ -2899,6 +4090,9 @@ impl ApplicationHandler for ViewerApp {
                 st.msaa_view = mv;
                 st.depth_view = dv;
                 st.camera.set_aspect(w, h);
+                // Window re-config: apply the active shadow quality live.
+                st.resources
+                    .set_shadow_quality(&st.device, crate::settings::shadow_quality());
                 st.resources.update_camera(&st.queue, &st.camera);
                 st.window.request_redraw();
             }
@@ -3003,5 +4197,71 @@ impl ApplicationHandler for ViewerApp {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gpu_unit_instance_is_96_bytes_and_shield_mesh_valid() {
+        assert_eq!(std::mem::size_of::<GpuUnitInstance>(), 96);
+        let (verts, indices) = build_shield_hemisphere_mesh();
+        assert!(!verts.is_empty() && !indices.is_empty());
+        assert!(indices.iter().all(|&i| (i as usize) < verts.len()));
+    }
+
+    #[test]
+    fn shadow_uniform_params_follow_quality() {
+        // Stock behavior is Medium = 2048px (single source of truth in settings).
+        assert_eq!(ShadowQuality::Medium.map_size(), 2048);
+        let off = shadow_uniform_params(ShadowQuality::Off);
+        assert_eq!(off[0], 1.0);
+        assert_eq!(off[1], 0.0);
+        for (q, edge) in [
+            (ShadowQuality::Low, 1024.0),
+            (ShadowQuality::Medium, 2048.0),
+            (ShadowQuality::High, 4096.0),
+        ] {
+            let p = shadow_uniform_params(q);
+            assert!((p[0] - 1.0 / edge).abs() < 1e-9, "{q:?}");
+            assert_eq!(p[1], 1.0);
+            assert_eq!(&p[2..], &[0.0, 0.0]);
+        }
+    }
+
+    #[test]
+    fn prop_aabb_frustum_culling_handles_visible_and_behind_camera() {
+        let mut cam = OrbitCamera::for_map(512.0, 512.0, 10.0, 1.6);
+        cam.target = [256.0, 10.0, 256.0];
+        cam.distance = 100.0;
+        let planes = extract_frustum_planes(&cam.view_proj_matrix());
+
+        assert!(aabb_in_frustum(&planes, [250.0, 5.0, 250.0], [262.0, 25.0, 262.0]));
+        assert!(!aabb_in_frustum(
+            &planes,
+            [250.0, 5.0, 900.0],
+            [262.0, 25.0, 920.0]
+        ));
+    }
+
+    #[test]
+    fn shadow_prop_frustum_culling_handles_visible_and_outside() {
+        let shadow_vp = make_shadow_view_proj([256.0, 10.0, 256.0], [0.46, 0.71, 0.53], 100.0);
+        let planes = extract_frustum_planes(&shadow_vp);
+
+        // Inside the shadow box centered around camera target (half = 115.0).
+        assert!(aabb_in_frustum(
+            &planes,
+            [240.0, 0.0, 240.0],
+            [270.0, 30.0, 270.0]
+        ));
+        // Far outside the shadow box on the map.
+        assert!(!aabb_in_frustum(
+            &planes,
+            [600.0, 0.0, 600.0],
+            [620.0, 30.0, 620.0]
+        ));
     }
 }

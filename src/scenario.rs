@@ -38,6 +38,33 @@ pub struct MapFiles {
     pub scenario_path: PathBuf,
     pub save_path: Option<PathBuf>,
     pub scmap_path: Option<PathBuf>,
+    /// Phase 24: where the map was discovered.
+    pub source: MapSource,
+}
+
+/// Phase 24: origin of a discovered map.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum MapSource {
+    /// `<game_dir>/maps`.
+    #[default]
+    Stock,
+    /// FA's own user map folder (`Documents/My Games/.../Maps`, Proton prefix on Linux).
+    FaUser,
+    /// `$XDG_DATA_HOME/farust/maps`.
+    Farust,
+    /// `$FARUST_MAPS_DIR`.
+    Env,
+}
+
+impl MapSource {
+    pub fn label(self) -> &'static str {
+        match self {
+            MapSource::Stock => "stock",
+            MapSource::FaUser => "fa-user",
+            MapSource::Farust => "farust",
+            MapSource::Env => "env",
+        }
+    }
 }
 
 /// Resolves a Forged Alliance virtual filesystem path (e.g. `/maps/SCMP_001/SCMP_001.scmap`)
@@ -70,23 +97,101 @@ pub fn resolve_vfs_path(game_dir: &Path, vfs_path: &str) -> Option<PathBuf> {
     Some(current)
 }
 
-/// Discovers all maps under `<game_dir>/maps` and resolves their scenario, save, and `.scmap` paths.
+/// Discovers all maps: stock maps under `<game_dir>/maps` first, then the user map
+/// folders of [`user_map_dirs`] (loose folders and `.scd` / `.zip` archives). Ids are unique
+/// case-insensitively; the first source wins. Sorted by id.
 pub fn list_maps(game_dir: &Path) -> Result<Vec<MapFiles>, String> {
     let maps_dir = resolve_vfs_path(game_dir, "maps")
         .filter(|p| p.is_dir())
         .unwrap_or_else(|| game_dir.join("maps"));
+    let mut maps = list_maps_in(&maps_dir, game_dir, MapSource::Stock, None)?;
+    let cache = map_cache_dir();
+    // Unit tests must not see the developer's real user map folders.
+    let user_dirs = if cfg!(test) { Vec::new() } else { user_map_dirs(game_dir) };
+    for (source, dir) in user_dirs {
+        if dir == maps_dir || !dir.is_dir() {
+            continue;
+        }
+        if let Ok(found) = list_maps_in(&dir, game_dir, source, Some(&cache)) {
+            maps.extend(found);
+        }
+    }
+    let mut seen = HashSet::new();
+    maps.retain(|m| seen.insert(m.id.to_ascii_lowercase()));
+    maps.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(maps)
+}
 
-    let entries = std::fs::read_dir(&maps_dir)
-        .map_err(|e| format!("failed to read maps directory {}: {e}", maps_dir.display()))?;
+/// `$XDG_DATA_HOME` (absolute) or `~/.local/share`.
+pub fn xdg_data_home() -> PathBuf {
+    std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// Extraction cache for archived user maps: `$XDG_CACHE_HOME/farust/maps` (`~/.cache/...`).
+pub fn map_cache_dir() -> PathBuf {
+    std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+        .unwrap_or_else(|| std::env::temp_dir())
+        .join("farust")
+        .join("maps")
+}
+
+const FA_USER_MAPS: &str =
+    "compatdata/9420/pfx/drive_c/users/steamuser/Documents/My Games/Gas Powered Games/Supreme Commander Forged Alliance/Maps";
+
+/// User map folders in discovery order: FA's user folder (Proton prefix next to the
+/// install's `steamapps`, and under `~/.local/share/Steam`), `$XDG_DATA_HOME/farust/maps`,
+/// then `$FARUST_MAPS_DIR`. Missing folders are included (callers skip them).
+pub fn user_map_dirs(game_dir: &Path) -> Vec<(MapSource, PathBuf)> {
+    let mut out: Vec<(MapSource, PathBuf)> = Vec::new();
+    if let Some(steamapps) = game_dir.parent().and_then(Path::parent) {
+        out.push((MapSource::FaUser, steamapps.join(FA_USER_MAPS)));
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        out.push((MapSource::FaUser, PathBuf::from(home).join(".local/share/Steam/steamapps").join(FA_USER_MAPS)));
+    }
+    out.push((MapSource::Farust, xdg_data_home().join("farust").join("maps")));
+    if let Some(d) = std::env::var_os("FARUST_MAPS_DIR") {
+        out.push((MapSource::Env, PathBuf::from(d)));
+    }
+    let mut seen = HashSet::new();
+    out.retain(|(_, p)| seen.insert(p.clone()));
+    out
+}
+
+/// Maps directly inside `root`: every sub-folder holding a `*_scenario.lua`, and (when
+/// `cache` is given) every `.scd` / `.zip` archive, extracted once into `cache`.
+pub fn list_maps_in(root: &Path, game_dir: &Path, source: MapSource, cache: Option<&Path>) -> Result<Vec<MapFiles>, String> {
+    let entries = std::fs::read_dir(root)
+        .map_err(|e| format!("failed to read maps directory {}: {e}", root.display()))?;
 
     let mut subdirs = Vec::new();
+    let mut archives = Vec::new();
     for entry in entries {
         let entry = entry
-            .map_err(|e| format!("failed to read entry in {}: {e}", maps_dir.display()))?;
+            .map_err(|e| format!("failed to read entry in {}: {e}", root.display()))?;
         let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
         if path.is_dir() {
-            let id = entry.file_name().to_string_lossy().into_owned();
-            subdirs.push((id, path));
+            subdirs.push((name, path));
+        } else if ends_with_ignore_ascii_case(&name, ".scd") || ends_with_ignore_ascii_case(&name, ".zip") {
+            archives.push(path);
+        }
+    }
+    subdirs.sort();
+    archives.sort();
+    if let Some(cache) = cache {
+        for a in archives {
+            match extract_map_archive(&a, cache) {
+                Ok(dirs) => subdirs.extend(dirs),
+                Err(e) => eprintln!("warning: skipping map archive {}: {e}", a.display()),
+            }
         }
     }
 
@@ -97,15 +202,40 @@ pub fn list_maps(game_dir: &Path) -> Result<Vec<MapFiles>, String> {
             continue;
         };
 
-        let meta = parse_scenario_file(&scenario_path, &id)?;
+        let meta = match parse_scenario_file(&scenario_path, &id) {
+            Ok(m) => m,
+            Err(e) if source == MapSource::Stock => return Err(e),
+            Err(e) => {
+                eprintln!("warning: skipping user map {}: {e}", dir.display());
+                continue;
+            }
+        };
+        let local = |vfs: &str| -> Option<PathBuf> {
+            let base = vfs.replace('\\', "/");
+            let base = base.rsplit('/').next().unwrap_or("");
+            files
+                .iter()
+                .find(|(n, _)| !base.is_empty() && n.eq_ignore_ascii_case(base))
+                .map(|(_, p)| p.clone())
+        };
+        let vfs = |vfs: &str| resolve_vfs_path(game_dir, vfs).filter(|p| p.is_file());
 
-        let scmap_path = resolve_vfs_path(game_dir, &meta.map_vfs_path)
-            .filter(|p| p.is_file())
-            .or_else(|| find_file_by_suffix(&files, ".scmap"));
-
-        let save_path = resolve_vfs_path(game_dir, &meta.save_vfs_path)
-            .filter(|p| p.is_file())
-            .or_else(|| find_file_by_suffix(&files, "_save.lua"));
+        let (scmap_path, save_path) = if source == MapSource::Stock {
+            (
+                vfs(&meta.map_vfs_path).or_else(|| find_file_by_suffix(&files, ".scmap")),
+                vfs(&meta.save_vfs_path).or_else(|| find_file_by_suffix(&files, "_save.lua")),
+            )
+        } else {
+            // User maps: prefer the map's own folder over same-named stock paths.
+            (
+                local(&meta.map_vfs_path)
+                    .or_else(|| find_file_by_suffix(&files, ".scmap"))
+                    .or_else(|| vfs(&meta.map_vfs_path)),
+                local(&meta.save_vfs_path)
+                    .or_else(|| find_file_by_suffix(&files, "_save.lua"))
+                    .or_else(|| vfs(&meta.save_vfs_path)),
+            )
+        };
 
         maps.push(MapFiles {
             id,
@@ -113,6 +243,7 @@ pub fn list_maps(game_dir: &Path) -> Result<Vec<MapFiles>, String> {
             scenario_path,
             save_path,
             scmap_path,
+            source,
         });
     }
 
@@ -120,12 +251,86 @@ pub fn list_maps(game_dir: &Path) -> Result<Vec<MapFiles>, String> {
     Ok(maps)
 }
 
-/// Finds a map by folder id (case-insensitive) under `<game_dir>/maps`.
+/// Extracts a zipped map (`.scd` / `.zip`) into `cache/<archive stem>/` (re-extracting when
+/// the archive's size or mtime changed) and returns `(id, dir)` of every folder inside
+/// that holds a `*_scenario.lua`. Entry paths are sanitized (no absolute / `..` paths).
+pub fn extract_map_archive(archive: &Path, cache: &Path) -> Result<Vec<(String, PathBuf)>, String> {
+    use std::io::Read;
+    let stem = archive
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .ok_or_else(|| "archive has no name".to_string())?;
+    let meta = std::fs::metadata(archive).map_err(|e| e.to_string())?;
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let stamp = format!("{} {}", meta.len(), mtime);
+    let out = cache.join(&stem);
+    let stamp_path = out.join(".farust-source");
+    if std::fs::read_to_string(&stamp_path).ok().as_deref() != Some(stamp.as_str()) {
+        let _ = std::fs::remove_dir_all(&out);
+        std::fs::create_dir_all(&out).map_err(|e| format!("cannot create {}: {e}", out.display()))?;
+        let file = std::fs::File::open(archive).map_err(|e| e.to_string())?;
+        let mut zip = zip::ZipArchive::new(file).map_err(|e| format!("not a zip: {e}"))?;
+        for i in 0..zip.len() {
+            let mut entry = zip.by_index(i).map_err(|e| e.to_string())?;
+            let Some(rel) = entry.enclosed_name() else {
+                continue;
+            };
+            let target = out.join(rel);
+            if entry.is_dir() {
+                std::fs::create_dir_all(&target).map_err(|e| e.to_string())?;
+                continue;
+            }
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+            let mut buf = Vec::with_capacity(entry.size() as usize);
+            entry.read_to_end(&mut buf).map_err(|e| e.to_string())?;
+            std::fs::write(&target, buf).map_err(|e| e.to_string())?;
+        }
+        std::fs::write(&stamp_path, &stamp).map_err(|e| e.to_string())?;
+    }
+    let mut found = Vec::new();
+    collect_scenario_dirs(&out, &stem, 0, &mut found);
+    found.sort();
+    Ok(found)
+}
+
+fn collect_scenario_dirs(dir: &Path, name: &str, depth: usize, out: &mut Vec<(String, PathBuf)>) {
+    let Ok(files) = list_dir_files_sorted(dir) else {
+        return;
+    };
+    if find_file_by_suffix(&files, "_scenario.lua").is_some() {
+        out.push((name.to_string(), dir.to_path_buf()));
+        return;
+    }
+    if depth >= 3 {
+        return;
+    }
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut subs: Vec<(String, PathBuf)> = rd
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .map(|e| (e.file_name().to_string_lossy().into_owned(), e.path()))
+        .collect();
+    subs.sort();
+    for (n, p) in subs {
+        collect_scenario_dirs(&p, &n, depth + 1, out);
+    }
+}
+
+/// Finds a map by folder id (case-insensitive) among all discovered maps.
 pub fn find_map(game_dir: &Path, name: &str) -> Result<MapFiles, String> {
     let maps = list_maps(game_dir)?;
     maps.into_iter()
         .find(|m| m.id.eq_ignore_ascii_case(name))
-        .ok_or_else(|| format!("map '{name}' not found in {}", game_dir.display()))
+        .ok_or_else(|| format!("map '{name}' not found in {} or the user map folders", game_dir.display()))
 }
 
 pub fn parse_scenario_file(path: &Path, id: &str) -> Result<ScenarioMeta, String> {
@@ -1442,5 +1647,52 @@ Scenario = {
         assert_eq!(parsed_save.start_spots.len(), 1);
         assert_eq!(parsed_save.start_spots[0].name, "ARMY_1");
         assert_eq!(parsed_save.start_spots[0].position, [1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn discovers_user_maps_loose_and_zipped() {
+        use std::io::Write;
+        let guard = TempDirGuard::new("usermaps");
+        let root = guard.path().join("Maps");
+        let cache = guard.path().join("cache");
+        let loose = root.join("UserMap");
+        std::fs::create_dir_all(&loose).unwrap();
+        std::fs::write(
+            loose.join("UserMap_scenario.lua"),
+            b"ScenarioInfo = { name = 'User', type = 'skirmish', size = {256, 256}, map = '/maps/UserMap/UserMap.scmap', save = '/maps/UserMap/UserMap_save.lua' }",
+        )
+        .unwrap();
+        std::fs::write(loose.join("usermap.scmap"), b"x").unwrap();
+        std::fs::write(loose.join("UserMap_save.lua"), b"Scenario = {}").unwrap();
+
+        let opts = zip::write::SimpleFileOptions::default();
+        let mut zw = zip::ZipWriter::new(std::fs::File::create(root.join("Pack.zip")).unwrap());
+        zw.start_file("ZipMap/ZipMap_scenario.lua", opts).unwrap();
+        zw.write_all(b"ScenarioInfo = { name = 'Zipped', type = 'skirmish', size = {512, 512}, map = '/maps/ZipMap/ZipMap.scmap', save = '/maps/ZipMap/ZipMap_save.lua' }").unwrap();
+        zw.start_file("ZipMap/ZipMap.scmap", opts).unwrap();
+        zw.write_all(b"y").unwrap();
+        zw.start_file("../evil.txt", opts).unwrap();
+        zw.write_all(b"no").unwrap();
+        zw.finish().unwrap();
+        std::fs::write(root.join("broken.scd"), b"not a zip").unwrap();
+
+        let maps = list_maps_in(&root, guard.path(), MapSource::FaUser, Some(&cache)).unwrap();
+        let ids: Vec<&str> = maps.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["UserMap", "ZipMap"]);
+        assert!(maps.iter().all(|m| m.source == MapSource::FaUser));
+        assert_eq!(maps[0].scmap_path.as_ref().unwrap().file_name().unwrap(), "usermap.scmap");
+        assert!(maps[1].dir.starts_with(&cache));
+        assert!(maps[1].scmap_path.is_some() && maps[1].save_path.is_none());
+        assert!(!guard.path().join("evil.txt").exists() && !cache.join("evil.txt").exists());
+        // Second listing reuses the extraction.
+        let again = list_maps_in(&root, guard.path(), MapSource::FaUser, Some(&cache)).unwrap();
+        assert_eq!(again.len(), 2);
+        // Without a cache archives are ignored.
+        assert_eq!(list_maps_in(&root, guard.path(), MapSource::Env, None).unwrap().len(), 1);
+
+        let game = guard.path().join("steamapps/common/FA");
+        let dirs = user_map_dirs(&game);
+        assert_eq!(dirs[0], (MapSource::FaUser, guard.path().join("steamapps").join(FA_USER_MAPS)));
+        assert!(dirs.iter().any(|(s, p)| *s == MapSource::Farust && p.ends_with("farust/maps")));
     }
 }

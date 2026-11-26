@@ -90,12 +90,27 @@ pub struct ScMapProp {
     pub scale: [f32; 3],
 }
 
-/// Terrain strata descriptors, water params, embedded blend maps, and props parsed from `.scmap`.
+/// One terrain decal placement parsed from `.scmap`.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct ScMapDecal {
+    pub id: u32,
+    pub decal_type: u32,
+    pub textures: Vec<String>,
+    pub scale: [f32; 3],
+    pub position: [f32; 3],
+    pub rotation: [f32; 3],
+    pub cutoff_lod: f32,
+    pub near_cutoff_lod: f32,
+}
+
+/// Terrain strata descriptors, water params, embedded blend maps, decals, and props parsed from `.scmap`.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct TerrainTextures {
     pub strata_albedo: Vec<TerrainStratum>,
     pub strata_normal: Vec<TerrainStratum>,
+    pub decals: Vec<ScMapDecal>,
     pub texturemap0_dds: Vec<u8>,
     pub texturemap1_dds: Vec<u8>,
     pub normal_map_dds: Vec<u8>,
@@ -258,17 +273,34 @@ fn parse_terrain_textures(tail: &[u8], hm_w: u32, hm_h: u32) -> Option<TerrainTe
     if decal_count > r.remaining() / 60 {
         return None;
     }
+    let mut decals = Vec::with_capacity(decal_count);
     for _ in 0..decal_count {
-        r.skip(8).ok()?;
+        let id = r.read_u32().ok()?;
+        let decal_type = r.read_u32().ok()?;
         let ntex = usize::try_from(r.read_u32().ok()?).ok()?;
         if ntex > 16 {
             return None;
         }
+        let mut textures = Vec::with_capacity(ntex);
         for _ in 0..ntex {
             let tlen = usize::try_from(r.read_u32().ok()?).ok()?;
-            r.skip(tlen).ok()?;
+            let tb = r.read_bytes(tlen).ok()?;
+            textures.push(tb.iter().map(|&b| char::from(b)).collect());
         }
-        r.skip(48).ok()?;
+        let mut vals = [0.0_f32; 12];
+        for v in &mut vals {
+            *v = r.read_f32().ok()?;
+        }
+        decals.push(ScMapDecal {
+            id,
+            decal_type,
+            textures,
+            scale: [vals[0], vals[1], vals[2]],
+            position: [vals[3], vals[4], vals[5]],
+            rotation: [vals[6], vals[7], vals[8]],
+            cutoff_lod: vals[9],
+            near_cutoff_lod: vals[10],
+        });
     }
 
     let group_count = usize::try_from(r.read_u32().ok()?).ok()?;
@@ -329,6 +361,7 @@ fn parse_terrain_textures(tail: &[u8], hm_w: u32, hm_h: u32) -> Option<TerrainTe
     Some(TerrainTextures {
         strata_albedo,
         strata_normal,
+        decals,
         texturemap0_dds,
         texturemap1_dds,
         normal_map_dds,

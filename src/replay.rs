@@ -3,14 +3,25 @@
 //! Compact little-endian binary `.farust-replay` format storing initial setup,
 //! every [`Command`] keyed by `(tick, army)`, periodic FNV-1a64 checkpoints,
 //! and the final tick hash for bit-exact verification.
+//!
+//! Versions: v1 (no teams), v2 (+ team per army), v3 (Phase 18: + [`GameOptions`]
+//! victory condition and unit cap after the army table), v4 (Phase 24: + enabled mod
+//! identities after the options). All four are readable; v1-v3 mean "no mods".
 
 use std::fs;
 use std::path::Path;
 
-use crate::skirmish::{ArmyId, ArmySetup, Catalog, Command, MapContext, Skirmish, UnitId};
+use crate::mods::ModIdentity;
+use crate::skirmish::{
+    ArmyId, ArmySetup, Catalog, Command, GameOptions, MapContext, Skirmish, UnitId, VictoryCondition,
+};
 
 pub const REPLAY_MAGIC: &[u8; 8] = b"FARPL1\0\0";
-pub const REPLAY_VERSION: u32 = 1;
+pub const REPLAY_VERSION_V1: u32 = 1;
+pub const REPLAY_VERSION_V2: u32 = 2;
+pub const REPLAY_VERSION_V3: u32 = 3;
+/// Phase 24: header carries the enabled mods' identities.
+pub const REPLAY_VERSION: u32 = 4;
 pub const CHECKPOINT_INTERVAL: u64 = 300;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -18,6 +29,10 @@ pub struct ReplayHeader {
     pub map_id: String,
     pub seed: u64,
     pub setups: Vec<ArmySetup>,
+    /// Phase 18 game options (defaults when reading v1/v2 files).
+    pub options: GameOptions,
+    /// Phase 24: mods the match was played with (empty = stock content).
+    pub mods: Vec<ModIdentity>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,10 +79,17 @@ impl ReplayRecorder {
                 map_id: map_id.to_string(),
                 seed,
                 setups,
+                options: GameOptions::default(),
+                mods: crate::mods::active_identities(),
             },
             commands: Vec::new(),
             checkpoints: Vec::new(),
         }
+    }
+
+    /// Phase 18: record the game options the world was created with.
+    pub fn set_options(&mut self, options: GameOptions) {
+        self.header.options = options;
     }
 
     pub fn record(&mut self, tick: u64, army: ArmyId, command: &Command) {
@@ -234,6 +256,74 @@ pub(crate) fn encode_command(out: &mut Vec<u8>, cmd: &Command) {
             out.extend_from_slice(&unit.to_le_bytes());
             out.extend_from_slice(&target.to_le_bytes());
         }
+        Command::Upgrade { unit, target_type } => {
+            out.push(11);
+            out.extend_from_slice(&unit.to_le_bytes());
+            write_str(out, target_type);
+        }
+        Command::LaunchMissile { unit, x, y } => {
+            out.push(12);
+            out.extend_from_slice(&unit.to_le_bytes());
+            out.extend_from_slice(&x.to_le_bytes());
+            out.extend_from_slice(&y.to_le_bytes());
+        }
+        Command::FormationMove {
+            units,
+            x,
+            y,
+            facing_mrad,
+            spacing,
+            queue,
+        } => {
+            out.push(13);
+            write_ids(out, units);
+            out.extend_from_slice(&x.to_le_bytes());
+            out.extend_from_slice(&y.to_le_bytes());
+            out.extend_from_slice(&facing_mrad.to_le_bytes());
+            out.extend_from_slice(&spacing.to_le_bytes());
+            out.push(u8::from(*queue));
+        }
+        Command::Patrol { units, x, y, queue } => {
+            out.push(14);
+            write_ids(out, units);
+            out.extend_from_slice(&x.to_le_bytes());
+            out.extend_from_slice(&y.to_le_bytes());
+            out.push(u8::from(*queue));
+        }
+        Command::ToggleShield { units, enabled } => {
+            out.push(15);
+            write_ids(out, units);
+            out.push(u8::from(*enabled));
+        }
+        Command::Load { units, transport, queue } => {
+            out.push(16);
+            write_ids(out, units);
+            out.extend_from_slice(&transport.to_le_bytes());
+            out.push(u8::from(*queue));
+        }
+        Command::Unload { transports, x, y, queue } => {
+            out.push(17);
+            write_ids(out, transports);
+            out.extend_from_slice(&x.to_le_bytes());
+            out.extend_from_slice(&y.to_le_bytes());
+            out.push(u8::from(*queue));
+        }
+        Command::Enhance { unit, name } => {
+            out.push(18);
+            out.extend_from_slice(&unit.to_le_bytes());
+            write_str(out, name);
+        }
+        Command::SetRepeat { factories, enabled } => {
+            out.push(19);
+            write_ids(out, factories);
+            out.push(u8::from(*enabled));
+        }
+        Command::CancelProduce { factory, unit_type, count } => {
+            out.push(20);
+            out.extend_from_slice(&factory.to_le_bytes());
+            write_str(out, unit_type);
+            out.extend_from_slice(&count.to_le_bytes());
+        }
     }
 }
 
@@ -296,6 +386,57 @@ pub(crate) fn decode_command(data: &[u8], pos: &mut usize) -> Result<Command, St
             unit: read_u32(data, pos)?,
             target: read_u32(data, pos)?,
         }),
+        11 => Ok(Command::Upgrade {
+            unit: read_u32(data, pos)?,
+            target_type: read_str(data, pos)?,
+        }),
+        12 => Ok(Command::LaunchMissile {
+            unit: read_u32(data, pos)?,
+            x: read_i64(data, pos)?,
+            y: read_i64(data, pos)?,
+        }),
+        13 => Ok(Command::FormationMove {
+            units: read_ids(data, pos)?,
+            x: read_i64(data, pos)?,
+            y: read_i64(data, pos)?,
+            facing_mrad: read_i64(data, pos)?,
+            spacing: read_i64(data, pos)?,
+            queue: read_u8(data, pos)? != 0,
+        }),
+        14 => Ok(Command::Patrol {
+            units: read_ids(data, pos)?,
+            x: read_i64(data, pos)?,
+            y: read_i64(data, pos)?,
+            queue: read_u8(data, pos)? != 0,
+        }),
+        15 => Ok(Command::ToggleShield {
+            units: read_ids(data, pos)?,
+            enabled: read_u8(data, pos)? != 0,
+        }),
+        16 => Ok(Command::Load {
+            units: read_ids(data, pos)?,
+            transport: read_u32(data, pos)?,
+            queue: read_u8(data, pos)? != 0,
+        }),
+        17 => Ok(Command::Unload {
+            transports: read_ids(data, pos)?,
+            x: read_i64(data, pos)?,
+            y: read_i64(data, pos)?,
+            queue: read_u8(data, pos)? != 0,
+        }),
+        18 => Ok(Command::Enhance {
+            unit: read_u32(data, pos)?,
+            name: read_str(data, pos)?,
+        }),
+        19 => Ok(Command::SetRepeat {
+            factories: read_ids(data, pos)?,
+            enabled: read_u8(data, pos)? != 0,
+        }),
+        20 => Ok(Command::CancelProduce {
+            factory: read_u32(data, pos)?,
+            unit_type: read_str(data, pos)?,
+            count: read_u32(data, pos)?,
+        }),
         t => Err(format!("unknown command tag {t}")),
     }
 }
@@ -313,7 +454,11 @@ impl Replay {
             out.extend_from_slice(&(s.faction as u32).to_le_bytes());
             out.extend_from_slice(&s.start.0.to_le_bytes());
             out.extend_from_slice(&s.start.1.to_le_bytes());
+            out.push(s.team);
         }
+        out.push(self.header.options.victory.code());
+        out.extend_from_slice(&self.header.options.unit_cap.to_le_bytes());
+        crate::mods::encode_identities(&mut out, &self.header.mods);
         out.extend_from_slice(&(self.commands.len() as u32).to_le_bytes());
         for c in &self.commands {
             out.extend_from_slice(&c.tick.to_le_bytes());
@@ -336,7 +481,7 @@ impl Replay {
         }
         let mut pos = 8;
         let ver = read_u32(data, &mut pos)?;
-        if ver != REPLAY_VERSION {
+        if !(REPLAY_VERSION_V1..=REPLAY_VERSION).contains(&ver) {
             return Err(format!("unsupported replay version {ver}"));
         }
         let map_id = read_str(data, &mut pos)?;
@@ -346,17 +491,39 @@ impl Replay {
             return Err(format!("invalid replay army count {n_armies}"));
         }
         let mut setups = Vec::with_capacity(n_armies);
-        for _ in 0..n_armies {
+        for i in 0..n_armies {
             let name = read_str(data, &mut pos)?;
             let faction = read_u32(data, &mut pos)? as usize;
             let sx = read_i64(data, &mut pos)?;
             let sy = read_i64(data, &mut pos)?;
+            let team = if ver >= REPLAY_VERSION_V2 {
+                read_u8(data, &mut pos)?
+            } else {
+                i as u8
+            };
             setups.push(ArmySetup {
                 name,
                 faction,
                 start: (sx, sy),
+                team,
             });
         }
+        let options = if ver >= REPLAY_VERSION_V3 {
+            let code = read_u8(data, &mut pos)?;
+            let victory = VictoryCondition::from_code(code)
+                .ok_or_else(|| format!("unknown victory condition {code}"))?;
+            GameOptions {
+                victory,
+                unit_cap: read_u32(data, &mut pos)?,
+            }
+        } else {
+            GameOptions::default()
+        };
+        let mods = if ver >= REPLAY_VERSION {
+            crate::mods::decode_identities(data, &mut pos)?
+        } else {
+            Vec::new()
+        };
         let n_cmds = read_u32(data, &mut pos)? as usize;
         let mut commands = Vec::with_capacity(n_cmds.min(100_000));
         for _ in 0..n_cmds {
@@ -375,7 +542,7 @@ impl Replay {
         let final_tick = read_u64(data, &mut pos)?;
         let final_hash = read_u64(data, &mut pos)?;
         Ok(Replay {
-            header: ReplayHeader { map_id, seed, setups },
+            header: ReplayHeader { map_id, seed, setups, options, mods },
             commands,
             checkpoints,
             final_tick,
@@ -409,6 +576,7 @@ impl Replay {
                 self.header.map_id, map.map_id
             ));
         }
+        crate::mods::check_match(&self.header.mods, &catalog.mods, "this replay")?;
         let mut world = Skirmish::new(
             catalog,
             map.grid.clone(),
@@ -417,6 +585,12 @@ impl Replay {
             &self.header.setups,
             self.header.seed,
         )?;
+        world.set_domain_grids(
+            map.naval_grid.clone(),
+            map.amphib_grid.clone(),
+            map.hydro_points.clone(),
+        );
+        world.set_options(self.header.options);
 
         let mut cmd_idx = 0usize;
         let mut cp_idx = 0usize;
@@ -499,12 +673,16 @@ mod tests {
                 terrain_textures: None,
             },
             grid: PathGrid::new(64, 64, 4 * SCALE),
+            naval_grid: PathGrid::new(64, 64, 4 * SCALE),
+            amphib_grid: PathGrid::new(64, 64, 4 * SCALE),
             size: (256 * SCALE, 256 * SCALE),
             starts: vec![
                 ("ARMY_1".into(), (50 * SCALE, 50 * SCALE)),
                 ("ARMY_2".into(), (200 * SCALE, 200 * SCALE)),
             ],
             mass_points: vec![(40 * SCALE, 40 * SCALE), (210 * SCALE, 210 * SCALE)],
+            hydro_points: vec![],
+            has_water: false,
         }
     }
 
@@ -522,6 +700,12 @@ mod tests {
             Command::Repair { units: vec![8], target: 1, queue: true },
             Command::Assist { units: vec![8], target: 7, queue: false },
             Command::Overcharge { unit: 1, target: 99 },
+            Command::Upgrade { unit: 7, target_type: "UEB0201".into() },
+            Command::LaunchMissile { unit: 9, x: 12000, y: 13000 },
+            Command::FormationMove { units: vec![1, 2], x: 4000, y: 5000, facing_mrad: 785, spacing: 3000, queue: false },
+            Command::Patrol { units: vec![3, 4], x: 6000, y: 7000, queue: true },
+            Command::ToggleShield { units: vec![10], enabled: true },
+            Command::CancelProduce { factory: 7, unit_type: "UEL0201".into(), count: 2 },
         ];
         let mut buf = Vec::new();
         for c in &all {
@@ -539,8 +723,8 @@ mod tests {
     fn record_save_load_verify_and_detect_corruption() {
         let map = dummy_map_ctx();
         let setups = vec![
-            ArmySetup { name: "ARMY_1".into(), faction: 0, start: map.starts[0].1 },
-            ArmySetup { name: "ARMY_2".into(), faction: 1, start: map.starts[1].1 },
+            ArmySetup { name: "ARMY_1".into(), faction: 0, start: map.starts[0].1, team: 0 },
+            ArmySetup { name: "ARMY_2".into(), faction: 1, start: map.starts[1].1, team: 1 },
         ];
         let mut world = Skirmish::new(
             test_catalog(),

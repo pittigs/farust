@@ -43,6 +43,27 @@ impl Value {
             _ => None,
         }
     }
+    /// Boolean field, e.g. `Intel = { Cloak = true }`. Numbers count as truthy when non-zero.
+    pub fn get_bool(&self, key: &str) -> Option<bool> {
+        match self.get(key) {
+            Some(Value::Bool(b)) => Some(*b),
+            Some(Value::Number(n)) => Some(*n != 0.0),
+            _ => None,
+        }
+    }
+    /// Keyed sub-tables in declaration order, e.g. `Enhancements = { Shield = {..}, .. }`.
+    pub fn keyed_tables(&self) -> Vec<(&str, &Value)> {
+        match self {
+            Value::Table { entries, .. } => entries
+                .iter()
+                .filter_map(|e| match (&e.key, &e.value) {
+                    (Some(k), v @ Value::Table { .. }) => Some((k.as_str(), v)),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
     /// Positional string entries of a table, e.g. `Categories = { 'AIR', ... }`.
     pub fn string_list(&self) -> Vec<String> {
         match self {
@@ -335,6 +356,94 @@ pub fn summarize(id: &str, path: &str, root: &Value) -> UnitSummary {
     }
 }
 
+/// Phase 24 mod merge: deep-merges `patch` into `base`.
+///
+/// * keyed entries: both tables -> recurse; otherwise the patch value replaces (or is
+///   appended when the key is new);
+/// * positional entries: if the patch has positional *tables* (e.g. `Weapon = { {..} }`)
+///   they merge element-wise by index (extra ones are appended); positional scalars
+///   (e.g. `Categories = { 'A', 'B' }`) replace the base's positional list as a whole;
+/// * top-level `AddCategories` / `DelCategories` string lists edit `Categories` in place;
+/// * the control keys `Merge`, `BlueprintId`, `AddCategories`, `DelCategories` are never
+///   copied into the result.
+pub fn merge_into(base: &mut Value, patch: &Value) {
+    merge_table(base, patch, true);
+}
+
+const MERGE_CONTROL_KEYS: [&str; 4] = ["Merge", "BlueprintId", "AddCategories", "DelCategories"];
+
+fn merge_table(base: &mut Value, patch: &Value, top: bool) {
+    let Value::Table { entries: pe, .. } = patch else {
+        *base = patch.clone();
+        return;
+    };
+    if !matches!(base, Value::Table { .. }) {
+        *base = Value::Table { constructor: None, entries: Vec::new() };
+    }
+    let Value::Table { entries: be, .. } = base else {
+        return;
+    };
+    let patch_pos: Vec<&Value> = pe.iter().filter(|e| e.key.is_none()).map(|e| &e.value).collect();
+    if !patch_pos.is_empty() {
+        if patch_pos.iter().all(|v| matches!(v, Value::Table { .. })) {
+            let mut idx = 0usize;
+            for e in be.iter_mut().filter(|e| e.key.is_none()) {
+                if let Some(p) = patch_pos.get(idx) {
+                    merge_table(&mut e.value, p, false);
+                }
+                idx += 1;
+            }
+            for p in patch_pos.iter().skip(idx) {
+                be.push(Entry { key: None, value: (*p).clone() });
+            }
+        } else {
+            be.retain(|e| e.key.is_some());
+            be.extend(patch_pos.iter().map(|v| Entry { key: None, value: (*v).clone() }));
+        }
+    }
+    for e in pe.iter() {
+        let Some(k) = e.key.as_deref() else {
+            continue;
+        };
+        if top && MERGE_CONTROL_KEYS.contains(&k) {
+            continue;
+        }
+        match be.iter_mut().find(|b| b.key.as_deref() == Some(k)) {
+            Some(b) if matches!((&b.value, &e.value), (Value::Table { .. }, Value::Table { .. })) => {
+                merge_table(&mut b.value, &e.value, false);
+            }
+            Some(b) => b.value = e.value.clone(),
+            None => be.push(e.clone()),
+        }
+    }
+    if top {
+        let add = patch.get("AddCategories").map(Value::string_list).unwrap_or_default();
+        let del = patch.get("DelCategories").map(Value::string_list).unwrap_or_default();
+        if !add.is_empty() || !del.is_empty() {
+            if !be.iter().any(|b| b.key.as_deref() == Some("Categories")) {
+                be.push(Entry { key: Some("Categories".into()), value: Value::Table { constructor: None, entries: Vec::new() } });
+            }
+            if let Some(Entry { value: Value::Table { entries: ce, .. }, .. }) =
+                be.iter_mut().find(|b| b.key.as_deref() == Some("Categories"))
+            {
+                ce.retain(|c| !matches!(&c.value, Value::Str(s) if del.iter().any(|d| d.eq_ignore_ascii_case(s))));
+                for a in add {
+                    if !ce.iter().any(|c| matches!(&c.value, Value::Str(s) if s.eq_ignore_ascii_case(&a))) {
+                        ce.push(Entry { key: None, value: Value::Str(a) });
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Removes mod control keys from a blueprint that is added (not merged).
+pub fn strip_control_keys(v: &mut Value) {
+    if let Value::Table { entries, .. } = v {
+        entries.retain(|e| !e.key.as_deref().is_some_and(|k| MERGE_CONTROL_KEYS.contains(&k)));
+    }
+}
+
 /// Unit id from `units/UAL0001/UAL0001_unit.bp` -> `UAL0001`.
 pub fn unit_id_from_path(path: &str) -> String {
     let file = path.rsplit('/').next().unwrap_or(path);
@@ -395,6 +504,48 @@ UnitBlueprint {
             root.get("Categories").unwrap().string_list(),
             vec!["AEON", "AIR"]
         );
+    }
+
+    #[test]
+    fn reads_bools_and_keyed_tables() {
+        let root = parse_blueprint(
+            "UnitBlueprint { Intel = { Cloak = true, RadarStealth = false, JammerBlips = 5 },\n Enhancements = { Shield = { Slot = 'Back' }, Slots = { Back = { x = 1 } }, Odd = 3 } }",
+        )
+        .unwrap();
+        let intel = root.get("Intel").unwrap();
+        assert_eq!(intel.get_bool("Cloak"), Some(true));
+        assert_eq!(intel.get_bool("RadarStealth"), Some(false));
+        assert_eq!(intel.get_bool("JammerBlips"), Some(true));
+        assert_eq!(intel.get_bool("Missing"), None);
+        let names: Vec<&str> = root.get("Enhancements").unwrap().keyed_tables().iter().map(|(k, _)| *k).collect();
+        assert_eq!(names, vec!["Shield", "Slots"]);
+    }
+
+    #[test]
+    fn merge_semantics() {
+        let mut base = parse_blueprint(
+            "UnitBlueprint { Categories = {'UEF','LAND'}, Defense = { MaxHealth = 100, ArmorType = 'Normal' }, Weapon = { { Label = 'Gun', Damage = 10 }, { Label = 'AA', Damage = 3 } } }",
+        )
+        .unwrap();
+        let patch = parse_blueprint(
+            "UnitBlueprint { Merge = true, BlueprintId = 'x', AddCategories = {'NEWCAT'}, DelCategories = {'land'}, Defense = { MaxHealth = 250 }, Weapon = { { Damage = 42 } }, Intel = { VisionRadius = 30 } }",
+        )
+        .unwrap();
+        merge_into(&mut base, &patch);
+        assert_eq!(base.get("Categories").unwrap().string_list(), vec!["UEF", "NEWCAT"]);
+        assert_eq!(base.get("Defense").unwrap().get_f64("MaxHealth"), Some(250.0));
+        assert_eq!(base.get("Defense").unwrap().get_str("ArmorType"), Some("Normal"));
+        let w = base.get("Weapon").unwrap().table_list();
+        assert_eq!(w.len(), 2);
+        assert_eq!(w[0].get_f64("Damage"), Some(42.0));
+        assert_eq!(w[0].get_str("Label"), Some("Gun"));
+        assert_eq!(w[1].get_f64("Damage"), Some(3.0));
+        assert_eq!(base.get("Intel").unwrap().get_f64("VisionRadius"), Some(30.0));
+        assert!(base.get("Merge").is_none() && base.get("AddCategories").is_none());
+        // Positional scalar lists replace as a whole.
+        let p2 = parse_blueprint("UnitBlueprint { Categories = {'A'} }").unwrap();
+        merge_into(&mut base, &p2);
+        assert_eq!(base.get("Categories").unwrap().string_list(), vec!["A"]);
     }
 
     #[test]

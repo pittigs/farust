@@ -1,7 +1,7 @@
 //! Scene builders turning Forged Alliance unit meshes/textures and `.scmap` terrains
 //! into GPU-ready vertex/index/texture buffers.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use bytemuck::{Pod, Zeroable};
 
@@ -14,7 +14,7 @@ use crate::jobs;
 use crate::scd;
 use crate::scenario;
 use crate::scm::ScmMesh;
-use crate::scmap::{ScMap, ScMapLighting, ScMapProp};
+use crate::scmap::{ScMap, ScMapDecal, ScMapLighting, ScMapProp};
 use crate::viewer::GpuUnitInstance;
 
 #[repr(C)]
@@ -58,7 +58,8 @@ pub struct WaterGpuData {
     pub surface_color: [f32; 3],
 }
 
-/// Instanced environment prop batch (pine trees, boulders, logs) parsed from `.scmap`.
+/// Instanced environment prop batch (pine trees, boulders, logs) parsed from `.scmap`,
+/// partitioned into an `8x8` world XZ grid with conservative world AABBs for frustum culling.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct PropMeshBatch {
@@ -68,6 +69,100 @@ pub struct PropMeshBatch {
     pub albedo: Option<RgbaImage>,
     pub alpha_cutout: bool,
     pub instances: Vec<GpuUnitInstance>,
+    pub bounds_min: [f32; 3],
+    pub bounds_max: [f32; 3],
+}
+
+/// Terrain-draped decal geometry grouped by albedo texture path from `.scmap`.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct DecalBatch {
+    pub label: String,
+    pub vertices: Vec<GpuVertex>,
+    pub indices: Vec<u32>,
+    pub albedo: Option<RgbaImage>,
+}
+
+/// Packed `32x32` strategic icon texture atlas (`16` columns) with `:rest` and `:sel` UV rects.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct StrategicIconAtlas {
+    pub image: RgbaImage,
+    pub uv_rects: BTreeMap<String, [f32; 4]>,
+    pub default_uv: [f32; 4],
+}
+
+impl StrategicIconAtlas {
+    #[allow(dead_code)]
+    pub fn uv(&self, name: &str, selected: bool) -> [f32; 4] {
+        let base = normalize_icon_base_name(name);
+        let suffix = if selected { "sel" } else { "rest" };
+        let key = format!("{base}:{suffix}");
+        if let Some(&rect) = self.uv_rects.get(&key) {
+            return rect;
+        }
+        if selected {
+            let rest_key = format!("{base}:rest");
+            if let Some(&rect) = self.uv_rects.get(&rest_key) {
+                return rect;
+            }
+        }
+        self.default_uv
+    }
+}
+
+/// Faction-themed HUD color palette.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(dead_code)]
+pub struct FactionTheme {
+    pub name: &'static str,
+    pub primary: [f32; 4],
+    pub border: [f32; 4],
+    pub accent: [f32; 4],
+    pub panel_bg: [f32; 4],
+}
+
+/// Returns the HUD color theme for `"uef"`, `"cybran"`, `"aeon"`, `"seraphim"`,
+/// falling back to a neutral steel theme for unrecognized faction keys.
+#[allow(dead_code)]
+pub fn faction_theme(faction_key: &str) -> FactionTheme {
+    match faction_key.trim().to_ascii_lowercase().as_str() {
+        "uef" => FactionTheme {
+            name: "UEF",
+            primary: [0.18, 0.52, 0.94, 1.0],
+            border: [0.34, 0.66, 0.98, 0.95],
+            accent: [0.52, 0.88, 1.00, 1.0],
+            panel_bg: [0.05, 0.08, 0.14, 0.86],
+        },
+        "cybran" => FactionTheme {
+            name: "Cybran",
+            primary: [0.88, 0.20, 0.18, 1.0],
+            border: [0.95, 0.36, 0.28, 0.95],
+            accent: [1.00, 0.56, 0.24, 1.0],
+            panel_bg: [0.12, 0.05, 0.06, 0.86],
+        },
+        "aeon" => FactionTheme {
+            name: "Aeon",
+            primary: [0.18, 0.78, 0.44, 1.0],
+            border: [0.32, 0.90, 0.58, 0.95],
+            accent: [0.90, 0.86, 0.38, 1.0],
+            panel_bg: [0.05, 0.11, 0.08, 0.86],
+        },
+        "seraphim" => FactionTheme {
+            name: "Seraphim",
+            primary: [0.92, 0.74, 0.20, 1.0],
+            border: [0.98, 0.84, 0.36, 0.95],
+            accent: [0.45, 0.88, 0.96, 1.0],
+            panel_bg: [0.12, 0.09, 0.04, 0.86],
+        },
+        _ => FactionTheme {
+            name: "Neutral",
+            primary: [0.45, 0.56, 0.70, 1.0],
+            border: [0.58, 0.68, 0.82, 0.95],
+            accent: [0.82, 0.88, 0.96, 1.0],
+            panel_bg: [0.07, 0.09, 0.12, 0.86],
+        },
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -86,9 +181,222 @@ pub struct LoadedScene {
     pub water: Option<WaterGpuData>,
     pub sky_cube: Option<[RgbaImage; 6]>,
     pub prop_batches: Vec<PropMeshBatch>,
+    pub decal_batches: Vec<DecalBatch>,
 }
 
+#[allow(dead_code)]
 pub fn load_unit_scene(game_dir: &Path, unit_id: &str, aspect: f32) -> Result<LoadedScene, String> {
+    load_unit_scene_posed(game_dir, unit_id, aspect, None, 0.0)
+}
+
+/// Per-weapon render metadata (Phase 17): aim/recoil bones and the projectile blueprint.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct WeaponDisplayInfo {
+    pub label: String,
+    pub yaw_bone: Option<String>,
+    pub pitch_bone: Option<String>,
+    /// `RackBones[].RackBone` (slid back by `recoil_distance` on fire).
+    pub rack_bones: Vec<String>,
+    /// `RackBones[].MuzzleBones[]` plus `TurretBoneMuzzle`.
+    pub muzzle_bones: Vec<String>,
+    /// `RackRecoilDistance` in raw mesh units along the rack bone's local Z (negative = backwards).
+    pub recoil_distance: f32,
+    /// `TurretPitchRange` in degrees (`90` when absent).
+    pub pitch_range_deg: f32,
+    /// `TurretYawSpeed` / `TurretPitchSpeed` in degrees per second.
+    pub yaw_speed_deg: f32,
+    pub pitch_speed_deg: f32,
+    /// Normalized lower-case `ProjectileId` path (`projectiles/x/x_proj.bp`).
+    pub projectile_id: Option<String>,
+    /// `DamageRadius > 0` (area weapons fire ballistic shells in the sim).
+    pub splash: bool,
+}
+
+/// One `Display.AnimationDeath` entry: clip path and mid playback rate.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeathAnimInfo {
+    pub path: String,
+    pub rate: f32,
+}
+
+/// Blueprint `Display` fields the in-game renderer needs for skeletal animation and LOD switching.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnitDisplayInfo {
+    pub walk_anim: Option<String>,
+    pub idle_anim: Option<String>,
+    pub walk_rate: f32,
+    pub max_speed: f32,
+    pub lod0_cutoff: f32,
+    /// `Display.AnimationDeath[]` clips (played before the wreck appears).
+    pub death_anims: Vec<DeathAnimInfo>,
+    /// Looping `Display.AnimationBuild` (factory arms while producing).
+    pub build_anim: Option<String>,
+    /// One-shot `Display.AnimationOpen` (held open while working, reversed when idle).
+    pub open_anim: Option<String>,
+    pub weapons: Vec<WeaponDisplayInfo>,
+    /// `Defense.Shield.PersonalShield`.
+    pub personal_shield: bool,
+    /// `Air.BankFactor` (`0` for non-air units), `Air.Winged`, `Air.MaxAirspeed`.
+    pub bank_factor: f32,
+    pub winged: bool,
+    pub max_airspeed: f32,
+}
+
+fn norm_asset_path(s: &str) -> Option<String> {
+    let p = s.trim().replace('\\', "/").trim_start_matches('/').to_string();
+    (!p.is_empty()).then_some(p)
+}
+
+/// Extracts the weapon aim/recoil bones and projectile ids from `Weapon = { ... }`.
+pub fn parse_weapon_display_info(bp: &Value) -> Vec<WeaponDisplayInfo> {
+    let Some(list) = bp.get("Weapon") else {
+        return Vec::new();
+    };
+    list.table_list()
+        .into_iter()
+        .map(|w| {
+            let s = |k: &str| w.get_str(k).map(str::trim).filter(|v| !v.is_empty()).map(str::to_owned);
+            let f = |k: &str, d: f64| w.get_f64(k).filter(|v| v.is_finite()).unwrap_or(d) as f32;
+            let mut rack_bones = Vec::new();
+            let mut muzzle_bones = Vec::new();
+            if let Some(racks) = w.get("RackBones") {
+                for r in racks.table_list() {
+                    if let Some(rb) = r.get_str("RackBone").map(str::trim).filter(|v| !v.is_empty()) {
+                        rack_bones.push(rb.to_string());
+                    }
+                    if let Some(m) = r.get("MuzzleBones") {
+                        muzzle_bones.extend(m.string_list());
+                    }
+                }
+            }
+            if let Some(m) = s("TurretBoneMuzzle")
+                && !muzzle_bones.iter().any(|b| b.eq_ignore_ascii_case(&m))
+            {
+                muzzle_bones.push(m);
+            }
+            WeaponDisplayInfo {
+                label: s("Label").unwrap_or_default(),
+                yaw_bone: s("TurretBoneYaw"),
+                pitch_bone: s("TurretBonePitch"),
+                rack_bones,
+                muzzle_bones,
+                recoil_distance: f("RackRecoilDistance", 0.0),
+                pitch_range_deg: f("TurretPitchRange", 90.0).abs(),
+                yaw_speed_deg: f("TurretYawSpeed", 90.0).abs(),
+                pitch_speed_deg: f("TurretPitchSpeed", 60.0).abs(),
+                projectile_id: s("ProjectileId").and_then(|p| norm_asset_path(&p)).map(|p| p.to_ascii_lowercase()),
+                splash: f("DamageRadius", 0.0) > 0.0,
+            }
+        })
+        .collect()
+}
+
+/// Wires every weapon's yaw/pitch/rack bones (and `RackRecoilDistance`) into `rig`.
+pub fn apply_weapon_bones(rig: &mut crate::sca::UnitRig, weapons: &[WeaponDisplayInfo], span_raw: f32) {
+    let yaw: Vec<&str> = weapons.iter().filter_map(|w| w.yaw_bone.as_deref()).collect();
+    let pitch: Vec<&str> = weapons.iter().filter_map(|w| w.pitch_bone.as_deref()).collect();
+    let recoil: Vec<(&str, f32)> = weapons
+        .iter()
+        .flat_map(|w| w.rack_bones.iter().map(move |b| (b.as_str(), w.recoil_distance)))
+        .collect();
+    rig.set_weapon_bones(&yaw, &pitch, &recoil, span_raw);
+}
+
+/// Extracts `Display.AnimationWalk/AnimationIdle/AnimationWalkRate`, `Physics.MaxSpeed` and
+/// the first `Display.Mesh.LODs[].LODCutoff` from a parsed unit blueprint.
+pub fn parse_unit_display_info(bp: &Value) -> UnitDisplayInfo {
+    let display = bp.get("Display");
+    let anim_str = |key: &str| display.and_then(|d| d.get_str(key)).and_then(norm_asset_path);
+    let death_anims = display
+        .and_then(|d| d.get("AnimationDeath"))
+        .map(|list| {
+            list.table_list()
+                .into_iter()
+                .filter_map(|e| {
+                    let path = e.get_str("Animation").and_then(norm_asset_path)?;
+                    let lo = e.get_f64("AnimationRateMin").filter(|v| v.is_finite() && *v > 0.0).unwrap_or(1.0);
+                    let hi = e.get_f64("AnimationRateMax").filter(|v| v.is_finite() && *v > 0.0).unwrap_or(lo);
+                    Some(DeathAnimInfo { path, rate: ((lo + hi) * 0.5).clamp(0.1, 10.0) as f32 })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let air = bp.get("Air");
+    let air_f = |k: &str| air.and_then(|a| a.get_f64(k)).filter(|v| v.is_finite()).unwrap_or(0.0) as f32;
+    let personal_shield = bp
+        .get("Defense")
+        .and_then(|d| d.get("Shield"))
+        .and_then(|s| s.get("PersonalShield"))
+        .is_some_and(|v| matches!(v, Value::Bool(true)));
+    let walk_rate = display
+        .and_then(|d| d.get_f64("AnimationWalkRate"))
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .unwrap_or(1.0) as f32;
+    let max_speed = bp
+        .get("Physics")
+        .and_then(|p| p.get_f64("MaxSpeed"))
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .unwrap_or(1.0) as f32;
+    let lod0_cutoff = display
+        .and_then(|d| d.get("Mesh"))
+        .and_then(|m| m.get("LODs"))
+        .and_then(|l| l.table_list().into_iter().next())
+        .and_then(|l| l.get_f64("LODCutoff"))
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .unwrap_or(150.0) as f32;
+    UnitDisplayInfo {
+        walk_anim: anim_str("AnimationWalk"),
+        idle_anim: anim_str("AnimationIdle"),
+        walk_rate,
+        max_speed,
+        lod0_cutoff,
+        death_anims,
+        build_anim: anim_str("AnimationBuild"),
+        open_anim: anim_str("AnimationOpen"),
+        weapons: parse_weapon_display_info(bp),
+        personal_shield,
+        bank_factor: air_f("BankFactor").abs(),
+        winged: air.and_then(|a| a.get("Winged")).is_some_and(|v| matches!(v, Value::Bool(true))),
+        max_airspeed: air_f("MaxAirspeed").max(0.0),
+    }
+}
+
+/// Render-side projectile mesh info from a `*_proj.bp` (`Display.UniformScale`, `MISSILE` category).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProjectileDisplayInfo {
+    pub uniform_scale: f32,
+    pub missile: bool,
+}
+
+/// Parses a `ProjectileBlueprint { ... }` file (same pure-data grammar as unit blueprints).
+pub fn parse_projectile_blueprint(text: &str) -> Result<Value, String> {
+    blueprint::parse_blueprint(&text.replacen("ProjectileBlueprint", "UnitBlueprint", 1))
+}
+
+pub fn parse_projectile_display_info(bp: &Value) -> ProjectileDisplayInfo {
+    let uniform_scale = bp
+        .get("Display")
+        .and_then(|d| d.get_f64("UniformScale"))
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .unwrap_or(1.0) as f32;
+    let missile = bp
+        .get("Categories")
+        .map(Value::string_list)
+        .unwrap_or_default()
+        .iter()
+        .any(|c| c.eq_ignore_ascii_case("MISSILE"));
+    ProjectileDisplayInfo { uniform_scale, missile }
+}
+
+/// Like [`load_unit_scene`] but CPU-poses the mesh with a skeletal clip: `anim` is `walk`, `idle`,
+/// or a substring of a `.sca` file name in the unit's folder; `anim_time` is in clip seconds.
+pub fn load_unit_scene_posed(
+    game_dir: &Path,
+    unit_id: &str,
+    aspect: f32,
+    anim: Option<&str>,
+    anim_time: f32,
+) -> Result<LoadedScene, String> {
     let unit_id = unit_id.trim();
     if unit_id.is_empty() {
         return Err("Unit ID must not be empty".to_string());
@@ -257,18 +565,89 @@ pub fn load_unit_scene(game_dir: &Path, unit_id: &str, aspect: f32) -> Result<Lo
         }
     }
 
+    let mut title_suffix = String::new();
+    let pose = match anim {
+        Some(sel) => {
+            let info = parse_unit_display_info(&bp);
+            let names: Vec<&str> = mesh.bones.iter().map(|b| b.name.as_str()).collect();
+            // `+`-separated tokens: `aim:YAW:PITCH[:RECOIL]` (degrees, degrees, 0..1) poses the weapons;
+            // anything else picks the clip (`walk`, `idle`, `death`, `open`, `build`, `.sca` substring).
+            let mut aim = crate::sca::AimPose::default();
+            let mut clip_sel = None;
+            for tok in sel.split('+').map(str::trim).filter(|t| !t.is_empty()) {
+                if let Some(rest) = tok.strip_prefix("aim") {
+                    let v: Vec<f32> = rest
+                        .split(':')
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.trim().parse::<f32>().map_err(|_| format!("invalid aim value '{s}' in '{tok}'")))
+                        .collect::<Result<_, _>>()?;
+                    aim.yaw = v.first().copied().unwrap_or(0.0).to_radians();
+                    aim.pitch = v.get(1).copied().unwrap_or(0.0).to_radians();
+                    aim.recoil = v.get(2).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+                    title_suffix.push_str(&format!(
+                        " [aim yaw {:.0} pitch {:.0} recoil {:.2}]",
+                        aim.yaw.to_degrees(),
+                        aim.pitch.to_degrees(),
+                        aim.recoil
+                    ));
+                } else {
+                    clip_sel = Some(tok);
+                }
+            }
+            let mut rig = crate::sca::UnitRig::new(mesh.bones.clone(), [0.0; 3], scale);
+            let span_raw = mesh
+                .bounds
+                .map(|b| (b.max[0] - b.min[0]).abs().max((b.max[2] - b.min[2]).abs()))
+                .unwrap_or(1.0);
+            apply_weapon_bones(&mut rig, &info.weapons, span_raw);
+            let (clip, t, looping) = match clip_sel {
+                Some(c) => {
+                    let (path, clip) = resolve_unit_clip(&gamedata, bp_dir, unit_id, &info, c)?;
+                    let clip = crate::sca::AnimClip::new(clip, &names)
+                        .ok_or_else(|| format!("animation '{path}' shares no bones with the unit skeleton"))?;
+                    let one_shot = matches!(c.to_ascii_lowercase().as_str(), "death" | "open")
+                        || path.to_ascii_lowercase().contains("death");
+                    let t = if one_shot {
+                        anim_time.clamp(0.0, clip.duration())
+                    } else {
+                        crate::sca::wrap_anim_time(anim_time, clip.duration())
+                    };
+                    title_suffix = format!(" [{path} @ {t:.2}s]{title_suffix}");
+                    (Some(clip), t, !one_shot)
+                }
+                None => (None, 0.0, true),
+            };
+            let local = rig.sample_pose(clip.as_ref(), t, looping);
+            Some(rig.palette_from_pose(&local, aim))
+        }
+        None => None,
+    };
+
     let vertices: Vec<GpuVertex> = mesh
         .vertices
         .iter()
-        .map(|v| GpuVertex {
-            position: [
+        .map(|v| {
+            let p = [
                 v.position[0] * scale,
                 v.position[1] * scale,
                 v.position[2] * scale,
-            ],
-            normal: normalize_or_up(v.normal),
-            uv: v.uv0,
-            color: [1.0, 1.0, 1.0, 1.0],
+            ];
+            let (position, normal) = match pose
+                .as_ref()
+                .and_then(|pal| pal.get(usize::from(v.bone_indices[0])))
+            {
+                Some(m) => (
+                    crate::sca::skin_point(m, p),
+                    normalize_or_up(crate::sca::skin_dir(m, v.normal)),
+                ),
+                None => (p, normalize_or_up(v.normal)),
+            };
+            GpuVertex {
+                position,
+                normal,
+                uv: v.uv0,
+                color: [1.0, 1.0, 1.0, 1.0],
+            }
         })
         .collect();
 
@@ -294,7 +673,7 @@ pub fn load_unit_scene(game_dir: &Path, unit_id: &str, aspect: f32) -> Result<Lo
     };
 
     let initial_camera = OrbitCamera::for_bounds(bounds_min, bounds_max, aspect);
-    let title = format!("{} — {}", unit_id.to_uppercase(), desc);
+    let title = format!("{} — {}{title_suffix}", unit_id.to_uppercase(), desc);
 
     Ok(LoadedScene {
         title,
@@ -309,6 +688,7 @@ pub fn load_unit_scene(game_dir: &Path, unit_id: &str, aspect: f32) -> Result<Lo
         water: None,
         sky_cube: None,
         prop_batches: Vec::new(),
+        decal_batches: Vec::new(),
     })
 }
 
@@ -330,6 +710,7 @@ pub fn load_map_scene(game_dir: &Path, map_name: &str, aspect: f32) -> Result<Lo
     let water = load_water_gpu_data(game_dir, &scmap);
     let sky_cube = load_sky_cubemap(game_dir, &scmap);
     let prop_batches = load_map_props(game_dir, &scmap);
+    let decal_batches = load_map_decals(game_dir, &scmap);
 
     let baked = if terrain_splat.is_some() {
         None
@@ -379,6 +760,7 @@ pub fn load_map_scene(game_dir: &Path, map_name: &str, aspect: f32) -> Result<Lo
         water,
         sky_cube,
         prop_batches,
+        decal_batches,
     })
 }
 
@@ -766,20 +1148,26 @@ pub fn bake_terrain_albedo(game_dir: &Path, scmap: &ScMap, out_size: u32) -> Opt
 
 /// Loads `{unit_id}_Albedo.dds` + `{unit_id}_SpecTeam.dds` from `units.scd` and packs
 /// `(r, g, b, team_mask)` into one RGBA8 texture for hardware-instanced team-colored units.
+#[allow(dead_code)]
 pub fn load_unit_albedo_and_team_mask(game_dir: &Path, unit_id: &str) -> Option<RgbaImage> {
     let gamedata = scd::gamedata_dir(game_dir);
     let albedo_paths = [
         format!("units/{unit_id}/{unit_id}_Albedo.dds"),
         format!("units/{unit_id}/{unit_id}_albedo.dds"),
     ];
-    let mut albedo = decode_first_dds(&gamedata, &["units.scd", "textures.scd"], &albedo_paths)?;
+    let albedo = decode_first_dds(&gamedata, &["units.scd", "textures.scd"], &albedo_paths)?;
     let spec_paths = [
         format!("units/{unit_id}/{unit_id}_SpecTeam.dds"),
         format!("units/{unit_id}/{unit_id}_specteam.dds"),
     ];
     let spec = decode_first_dds(&gamedata, &["units.scd"], &spec_paths);
+    Some(pack_albedo_team_mask(albedo, spec.as_ref()))
+}
+
+/// Packs `(albedo.rgb, spec_team.a)` into one RGBA8 image (nearest-resampled team mask).
+pub fn pack_albedo_team_mask(mut albedo: RgbaImage, spec: Option<&RgbaImage>) -> RgbaImage {
     let n = (albedo.width as usize * albedo.height as usize).min(albedo.pixels.len() / 4);
-    if let Some(ref sp) = spec
+    if let Some(sp) = spec
         && sp.width > 0
         && sp.height > 0
     {
@@ -796,7 +1184,7 @@ pub fn load_unit_albedo_and_team_mask(game_dir: &Path, unit_id: &str) -> Option<
             albedo.pixels[i * 4 + 3] = 72;
         }
     }
-    Some(albedo)
+    albedo
 }
 
 fn normalize_tangent_normal_image(mut img: RgbaImage) -> RgbaImage {
@@ -1104,7 +1492,241 @@ fn resolve_rel_vfs_path(base_dir: &str, raw: &str) -> String {
     parts.join("/")
 }
 
-/// Loads unique `.scmap` prop meshes & textures from `env.scd` and builds hardware-instanced batches.
+#[allow(dead_code)]
+pub(crate) fn sample_scmap_height(scmap: &ScMap, wx: f32, wz: f32) -> f32 {
+    let hm_w = scmap.heightmap_width;
+    let hm_h = scmap.heightmap_height;
+    if hm_w == 0 || hm_h == 0 {
+        return 0.0;
+    }
+    let mw = if scmap.map_width > 0.0 {
+        scmap.map_width
+    } else {
+        hm_w as f32
+    };
+    let mh = if scmap.map_height > 0.0 {
+        scmap.map_height
+    } else {
+        hm_h as f32
+    };
+    let gx = ((wx / mw) * hm_w as f32).clamp(0.0, hm_w as f32);
+    let gz = ((wz / mh) * hm_h as f32).clamp(0.0, hm_h as f32);
+    let x0 = (gx.floor() as u32).min(hm_w);
+    let z0 = (gz.floor() as u32).min(hm_h);
+    let x1 = (x0 + 1).min(hm_w);
+    let z1 = (z0 + 1).min(hm_h);
+    let tx = (gx - x0 as f32).clamp(0.0, 1.0);
+    let tz = (gz - z0 as f32).clamp(0.0, 1.0);
+
+    let h00 = scmap.height_at(x0, z0).unwrap_or(0.0);
+    let h10 = scmap.height_at(x1, z0).unwrap_or(h00);
+    let h01 = scmap.height_at(x0, z1).unwrap_or(h00);
+    let h11 = scmap.height_at(x1, z1).unwrap_or(h00);
+
+    let h0 = h00 + (h10 - h00) * tx;
+    let h1 = h01 + (h11 - h01) * tx;
+    h0 + (h1 - h0) * tz
+}
+
+#[allow(dead_code)]
+fn sample_scmap_normal(scmap: &ScMap, wx: f32, wz: f32) -> [f32; 3] {
+    let hm_w = scmap.heightmap_width;
+    let hm_h = scmap.heightmap_height;
+    if hm_w == 0 || hm_h == 0 {
+        return [0.0, 1.0, 0.0];
+    }
+    let mw = if scmap.map_width > 0.0 {
+        scmap.map_width
+    } else {
+        hm_w as f32
+    };
+    let mh = if scmap.map_height > 0.0 {
+        scmap.map_height
+    } else {
+        hm_h as f32
+    };
+    let eps_x = (mw / hm_w as f32).clamp(0.25, 2.0);
+    let eps_z = (mh / hm_h as f32).clamp(0.25, 2.0);
+
+    let x_l = (wx - eps_x).clamp(0.0, mw);
+    let x_r = (wx + eps_x).clamp(0.0, mw);
+    let z_d = (wz - eps_z).clamp(0.0, mh);
+    let z_u = (wz + eps_z).clamp(0.0, mh);
+
+    let dx = (x_r - x_l).max(1e-4);
+    let dz = (z_u - z_d).max(1e-4);
+    let dh_dx = (sample_scmap_height(scmap, x_r, wz) - sample_scmap_height(scmap, x_l, wz)) / dx;
+    let dh_dz = (sample_scmap_height(scmap, wx, z_u) - sample_scmap_height(scmap, wx, z_d)) / dz;
+    normalize_or_up([-dh_dx, 1.0, -dh_dz])
+}
+
+/// Loads terrain-draped albedo decals from `scmap`, grouped by texture path (top 24 by count),
+/// subdivided into `2x2` terrain-sampled quads lifted `+0.08m` above the terrain.
+#[allow(dead_code)]
+pub fn load_map_decals(game_dir: &Path, scmap: &ScMap) -> Vec<DecalBatch> {
+    let Some(ref tt) = scmap.terrain_textures else {
+        return Vec::new();
+    };
+    if tt.decals.is_empty() {
+        return Vec::new();
+    }
+
+    let mut grouped: BTreeMap<String, (String, Vec<&ScMapDecal>)> = BTreeMap::new();
+    for d in &tt.decals {
+        if !d.position[0].is_finite()
+            || !d.position[2].is_finite()
+            || !d.scale[0].is_finite()
+            || !d.scale[2].is_finite()
+            || d.scale[0] <= 0.01
+            || d.scale[2] <= 0.01
+        {
+            continue;
+        }
+        let Some(raw_tex) = d.textures.iter().map(|s| s.trim()).find(|s| !s.is_empty()) else {
+            continue;
+        };
+        let tex_norm = raw_tex.trim_start_matches(['/', '\\']).replace('\\', "/");
+        if tex_norm.is_empty() {
+            continue;
+        }
+        let is_albedo = d.decal_type == 1
+            || ends_with_ci(&tex_norm, "_albedo.dds")
+            || !ends_with_ci(&tex_norm, "_normals.dds");
+        if !is_albedo {
+            continue;
+        }
+        grouped
+            .entry(tex_norm.to_ascii_lowercase())
+            .or_insert_with(|| (tex_norm, Vec::new()))
+            .1
+            .push(d);
+    }
+
+    let mut groups: Vec<(String, Vec<&ScMapDecal>)> = grouped.into_values().collect();
+    groups.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0)));
+    groups.truncate(24);
+
+    let gamedata = scd::gamedata_dir(game_dir);
+    let threads = jobs::default_thread_count();
+    let built = jobs::par_map_ordered(&groups, threads, |_, (tex_path, decals)| -> Option<DecalBatch> {
+        let albedo = decode_first_dds(
+            &gamedata,
+            &["env.scd", "textures.scd"],
+            std::slice::from_ref(tex_path),
+        );
+        let mut vertices = Vec::with_capacity(decals.len() * 9);
+        let mut indices = Vec::with_capacity(decals.len() * 24);
+
+        for d in decals {
+            let yaw = if d.rotation[1].is_finite() {
+                d.rotation[1]
+            } else {
+                0.0
+            };
+            let (sy, cy) = yaw.sin_cos();
+            let cx = d.position[0];
+            let cz = d.position[2];
+            let sx = d.scale[0];
+            let sz = d.scale[2];
+
+            let Ok(base) = u32::try_from(vertices.len()) else {
+                break;
+            };
+            for iz in 0..3u32 {
+                let v = iz as f32 * 0.5;
+                let lz = (v - 0.5) * sz;
+                for ix in 0..3u32 {
+                    let u = ix as f32 * 0.5;
+                    let lx = (u - 0.5) * sx;
+                    let wx = cx + lx * cy + lz * sy;
+                    let wz = cz - lx * sy + lz * cy;
+                    let wy = sample_scmap_height(scmap, wx, wz) + 0.08;
+                    let normal = sample_scmap_normal(scmap, wx, wz);
+                    vertices.push(GpuVertex {
+                        position: [wx, wy, wz],
+                        normal,
+                        uv: [u, v],
+                        color: [1.0, 1.0, 1.0, 0.05],
+                    });
+                }
+            }
+            for iz in 0..2u32 {
+                for ix in 0..2u32 {
+                    let c00 = base + iz * 3 + ix;
+                    let c10 = c00 + 1;
+                    let c01 = c00 + 3;
+                    let c11 = c01 + 1;
+                    indices.extend_from_slice(&[c00, c01, c10, c10, c01, c11]);
+                }
+            }
+        }
+
+        if vertices.is_empty() || indices.is_empty() {
+            return None;
+        }
+        Some(DecalBatch {
+            label: tex_path.clone(),
+            vertices,
+            indices,
+            albedo,
+        })
+    });
+
+    built.into_iter().flatten().collect()
+}
+
+struct PropChunk<'a> {
+    chunk_idx: usize,
+    refs: Vec<&'a ScMapProp>,
+    bounds_min: [f32; 3],
+    bounds_max: [f32; 3],
+}
+
+fn partition_prop_chunks<'a>(
+    refs: &[&'a ScMapProp],
+    map_width: f32,
+    map_height: f32,
+) -> Vec<PropChunk<'a>> {
+    let mw = map_width.max(1.0);
+    let mh = map_height.max(1.0);
+    let mut buckets: [Vec<&'a ScMapProp>; 64] = std::array::from_fn(|_| Vec::new());
+
+    for &p in refs {
+        if !p.position[0].is_finite() || !p.position[1].is_finite() || !p.position[2].is_finite() {
+            continue;
+        }
+        let cx = ((p.position[0] / mw) * 8.0).floor().clamp(0.0, 7.0) as usize;
+        let cz = ((p.position[2] / mh) * 8.0).floor().clamp(0.0, 7.0) as usize;
+        buckets[cz * 8 + cx].push(p);
+    }
+
+    let mut chunks = Vec::new();
+    for (chunk_idx, chunk_refs) in buckets.into_iter().enumerate() {
+        if chunk_refs.is_empty() {
+            continue;
+        }
+        let mut min_p = [f32::INFINITY; 3];
+        let mut max_p = [f32::NEG_INFINITY; 3];
+        for p in &chunk_refs {
+            min_p[0] = min_p[0].min(p.position[0]);
+            min_p[1] = min_p[1].min(p.position[1]);
+            min_p[2] = min_p[2].min(p.position[2]);
+            max_p[0] = max_p[0].max(p.position[0]);
+            max_p[1] = max_p[1].max(p.position[1]);
+            max_p[2] = max_p[2].max(p.position[2]);
+        }
+        chunks.push(PropChunk {
+            chunk_idx,
+            refs: chunk_refs,
+            bounds_min: [min_p[0] - 8.0, min_p[1] - 4.0, min_p[2] - 8.0],
+            bounds_max: [max_p[0] + 8.0, max_p[1] + 18.0, max_p[2] + 8.0],
+        });
+    }
+    chunks
+}
+
+/// Loads unique `.scmap` prop meshes & textures from `env.scd` and builds spatially chunked
+/// (`8x8` world XZ grid) hardware-instanced batches with world-space AABBs.
 pub fn load_map_props(game_dir: &Path, scmap: &ScMap) -> Vec<PropMeshBatch> {
     let Some(ref tt) = scmap.terrain_textures else {
         return Vec::new();
@@ -1125,15 +1747,30 @@ pub fn load_map_props(game_dir: &Path, scmap: &ScMap) -> Vec<PropMeshBatch> {
             .push(p);
     }
 
+    let mw = if scmap.map_width > 0.0 {
+        scmap.map_width
+    } else {
+        scmap.heightmap_width.max(1) as f32
+    };
+    let mh = if scmap.map_height > 0.0 {
+        scmap.map_height
+    } else {
+        scmap.heightmap_height.max(1) as f32
+    };
+
     let entries: Vec<(String, Vec<&ScMapProp>)> = grouped.into_values().collect();
     let gamedata = scd::gamedata_dir(game_dir);
     let env_scd = gamedata.join("env.scd");
     let threads = jobs::default_thread_count();
 
-    let built = jobs::par_map_ordered(&entries, threads, |_, (bp_rel, refs)| -> Option<PropMeshBatch> {
-        let (actual_bp, bp_bytes) = scd::read_scd_file_ci(&env_scd, bp_rel).ok()?;
+    let built = jobs::par_map_ordered(&entries, threads, |_, (bp_rel, refs)| -> Vec<PropMeshBatch> {
+        let Ok((actual_bp, bp_bytes)) = scd::read_scd_file_ci(&env_scd, bp_rel) else {
+            return Vec::new();
+        };
         let bp_text = String::from_utf8_lossy(&bp_bytes);
-        let root = blueprint::parse_prop_blueprint(&bp_text).ok()?;
+        let Ok(root) = blueprint::parse_prop_blueprint(&bp_text) else {
+            return Vec::new();
+        };
 
         let display = root.get("Display");
         let uniform_scale = display
@@ -1160,10 +1797,14 @@ pub fn load_map_props(game_dir: &Path, scmap: &ScMap) -> Vec<PropMeshBatch> {
         mesh_cands.push(format!("{base_stem}_lod0.scm"));
         mesh_cands.push(format!("{base_stem}_lod1.scm"));
 
-        let scm_bytes = find_asset_in_scds(&gamedata, &["env.scd"], &mesh_cands)?;
-        let mesh = ScmMesh::parse(&scm_bytes).ok()?;
+        let Some(scm_bytes) = find_asset_in_scds(&gamedata, &["env.scd"], &mesh_cands) else {
+            return Vec::new();
+        };
+        let Ok(mesh) = ScmMesh::parse(&scm_bytes) else {
+            return Vec::new();
+        };
         if mesh.vertices.is_empty() || mesh.indices.is_empty() {
-            return None;
+            return Vec::new();
         }
 
         let mut alb_cands = Vec::new();
@@ -1198,35 +1839,274 @@ pub fn load_map_props(game_dir: &Path, scmap: &ScMap) -> Vec<PropMeshBatch> {
 
         let use_tex = if albedo.is_some() { 1.0 } else { 0.0 };
         let cut = if alpha_cutout { 1.0 } else { 0.0 };
-        let instances = refs
-            .iter()
-            .map(|p| {
-                GpuUnitInstance::from_basis(
-                    p.position,
-                    p.rot_x,
-                    p.rot_y,
-                    p.rot_z,
-                    p.scale,
-                    [0.95, 0.95, 0.95, 0.12],
-                    [use_tex, cut, 0.0, 0.0],
-                )
-            })
-            .collect();
 
-        Some(PropMeshBatch {
-            label: bp_norm,
-            vertices,
-            indices,
-            albedo,
-            alpha_cutout,
-            instances,
-        })
+        partition_prop_chunks(refs, mw, mh)
+            .into_iter()
+            .map(|chunk| {
+                let instances = chunk
+                    .refs
+                    .iter()
+                    .map(|p| {
+                        GpuUnitInstance::from_basis(
+                            p.position,
+                            p.rot_x,
+                            p.rot_y,
+                            p.rot_z,
+                            p.scale,
+                            [0.95, 0.95, 0.95, 0.12],
+                            [use_tex, cut, 0.0, 0.0],
+                        )
+                    })
+                    .collect();
+                PropMeshBatch {
+                    label: format!("{bp_norm}#c{:02}", chunk.chunk_idx),
+                    vertices: vertices.clone(),
+                    indices: indices.clone(),
+                    albedo: albedo.clone(),
+                    alpha_cutout,
+                    instances,
+                    bounds_min: chunk.bounds_min,
+                    bounds_max: chunk.bounds_max,
+                }
+            })
+            .collect()
     });
 
     built.into_iter().flatten().collect()
 }
 
+#[allow(dead_code)]
+const CORE_STRATEGIC_ICONS: &[&str] = &[
+    "icon_commander_generic",
+    "icon_land1_engineer",
+    "icon_land1_directfire",
+    "icon_land1_artillery",
+    "icon_land2_directfire",
+    "icon_bot1_directfire",
+    "icon_bot3_directfire",
+    "icon_fighter1_antiair",
+    "icon_bomber1_directfire",
+    "icon_gunship2_directfire",
+    "icon_ship1_intel",
+    "icon_ship2_antinavy",
+    "icon_factory1_land",
+    "icon_factory1_air",
+    "icon_factory1_naval",
+    "icon_structure1_mass",
+    "icon_structure1_energy",
+    "icon_structure2_shield",
+    "icon_structure2_missile",
+    "icon_structure1_antiair",
+    "icon_structure1_intel",
+    "icon_experimental_generic",
+];
+
+#[allow(dead_code)]
+fn normalize_icon_base_name(raw: &str) -> String {
+    let s = raw.trim().replace('\\', "/");
+    let leaf = s.rsplit('/').next().unwrap_or(&s);
+    let no_ext = strip_suffix_ci(leaf, ".dds").unwrap_or(leaf);
+    let base = strip_suffix_ci(no_ext, "_rest")
+        .or_else(|| strip_suffix_ci(no_ext, "_selected"))
+        .or_else(|| strip_suffix_ci(no_ext, "_over"))
+        .unwrap_or(no_ext);
+    base.to_ascii_lowercase()
+}
+
+#[allow(dead_code)]
+fn strategic_icon_sdf(name: &str, dx: f32, dy: f32) -> f32 {
+    let adx = dx.abs();
+    let ady = dy.abs();
+    if name.contains("commander") {
+        (adx + ady - 12.0).min(adx.max(ady) - 7.5)
+    } else if name.contains("experimental") {
+        (adx + ady - 13.0).min(adx.max(ady) - 9.0)
+    } else if name.contains("factory") {
+        adx.max(ady) - 10.5
+    } else if name.contains("fighter") || name.contains("bomber") || name.contains("gunship") {
+        let half_w = ((dy + 10.5) / 20.0) * 11.0;
+        (-dy - 10.5).max(dy - 9.5).max(adx - half_w)
+    } else if name.contains("ship") || name.contains("naval") {
+        let half_w = ((10.5 - dy) / 18.0) * 11.5;
+        (-dy - 7.5).max(dy - 9.5).max(adx - half_w)
+    } else if name.contains("engineer") {
+        (adx - 3.5).max(ady - 10.5).min((ady - 3.5).max(adx - 10.5))
+    } else if name.contains("artillery") || name.contains("missile") {
+        (adx * 1.45 + ady) - 11.5
+    } else if name.contains("structure")
+        || name.contains("shield")
+        || name.contains("intel")
+        || name.contains("mass")
+        || name.contains("energy")
+        || name.contains("antiair")
+    {
+        adx.max(ady).max((adx + ady) * 0.72) - 9.5
+    } else {
+        (adx + ady) - 10.5
+    }
+}
+
+#[allow(dead_code)]
+fn render_fallback_strategic_icon(name: &str, selected: bool) -> RgbaImage {
+    const CELL: usize = 32;
+    let mut pixels = vec![0u8; CELL * CELL * 4];
+    for y in 0..CELL {
+        let dy = y as f32 - 15.5;
+        for x in 0..CELL {
+            let dx = x as f32 - 15.5;
+            let adx = dx.abs();
+            let ady = dy.abs();
+            let sd = strategic_icon_sdf(name, dx, dy);
+            let mut inner_cut = false;
+            if sd <= -2.5 && name.contains("commander") {
+                inner_cut = adx <= 1.2 && ady <= 4.2 || ady <= 1.2 && adx <= 4.2;
+            } else if sd <= -2.5 && name.contains("factory") {
+                inner_cut = adx <= 5.0 && ady <= 1.5;
+            } else if sd <= -2.5 && name.contains("shield") {
+                inner_cut = adx + ady <= 4.0;
+            }
+
+            let rgba: [u8; 4] = if inner_cut {
+                if selected {
+                    [255, 224, 96, 255]
+                } else {
+                    [36, 44, 56, 255]
+                }
+            } else if sd <= -1.5 {
+                if selected {
+                    [255, 255, 255, 255]
+                } else {
+                    [232, 238, 245, 255]
+                }
+            } else if sd <= 0.5 {
+                if selected {
+                    [255, 224, 96, 255]
+                } else {
+                    [16, 20, 26, 255]
+                }
+            } else if selected && adx.max(ady) >= 12.0 && adx.max(ady) <= 14.5 && adx >= 8.0 && ady >= 8.0 {
+                [255, 232, 110, 255]
+            } else {
+                [0, 0, 0, 0]
+            };
+
+            let off = (y * CELL + x) * 4;
+            pixels[off..off + 4].copy_from_slice(&rgba);
+        }
+    }
+    RgbaImage {
+        width: CELL as u32,
+        height: CELL as u32,
+        pixels,
+    }
+}
+
+/// Loads FA strategic icon DDS textures (`_rest.dds` & `_selected.dds`) from `textures.scd`
+/// and packs them into a `16`-column `32x32` RGBA atlas with procedural fallback icons.
+#[allow(dead_code)]
+pub fn load_strategic_icon_atlas(
+    game_dir: Option<&Path>,
+    icon_names: &[String],
+) -> StrategicIconAtlas {
+    const CELL: u32 = 32;
+    const COLS: u32 = 16;
+
+    let mut unique = BTreeSet::new();
+    for &core in CORE_STRATEGIC_ICONS {
+        unique.insert(core.to_string());
+    }
+    for raw in icon_names {
+        let norm = normalize_icon_base_name(raw);
+        if !norm.is_empty() {
+            unique.insert(norm);
+        }
+    }
+
+    let dds_map: BTreeMap<String, Vec<u8>> = game_dir
+        .and_then(|dir| {
+            let textures_scd = scd::gamedata_dir(dir).join("textures.scd");
+            scd::read_scd_matching(&textures_scd, |entry_name| {
+                let norm = entry_name.replace('\\', "/").to_ascii_lowercase();
+                let trimmed = norm.trim_start_matches('/');
+                trimmed.starts_with("textures/ui/common/game/strategicicons/")
+                    && trimmed.ends_with(".dds")
+            })
+            .ok()
+        })
+        .map(|entries| {
+            entries
+                .into_iter()
+                .map(|(k, v)| (k.replace('\\', "/").trim_start_matches('/').to_ascii_lowercase(), v))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut slots_meta = Vec::with_capacity(unique.len() * 2);
+    for name in unique {
+        let rest_path = format!("textures/ui/common/game/strategicicons/{name}_rest.dds");
+        let sel_path = format!("textures/ui/common/game/strategicicons/{name}_selected.dds");
+        slots_meta.push((name.clone(), false, format!("{name}:rest"), rest_path));
+        slots_meta.push((name.clone(), true, format!("{name}:sel"), sel_path));
+    }
+
+    let threads = jobs::default_thread_count();
+    let tiles: Vec<RgbaImage> = jobs::par_map_ordered(&slots_meta, threads, |_, (name, selected, _, rel_path)| {
+        if let Some(bytes) = dds_map.get(rel_path)
+            && let Ok(img) = decode_dds_rgba8(bytes)
+        {
+            return resize_rgba_bilinear(&img, CELL, CELL);
+        }
+        render_fallback_strategic_icon(name, *selected)
+    });
+
+    let total_slots = slots_meta.len().max(1) as u32;
+    let rows = total_slots.div_ceil(COLS);
+    let atlas_w = COLS * CELL;
+    let atlas_h = rows * CELL;
+    let mut pixels = vec![0u8; (atlas_w as usize) * (atlas_h as usize) * 4];
+    let mut uv_rects = BTreeMap::new();
+
+    let pad_u = 0.5 / atlas_w as f32;
+    let pad_v = 0.5 / atlas_h as f32;
+
+    for (idx, ((_, _, key, _), tile)) in slots_meta.into_iter().zip(tiles.into_iter()).enumerate() {
+        let idx_u32 = idx as u32;
+        let col = idx_u32 % COLS;
+        let row = idx_u32 / COLS;
+        let dst_x = (col * CELL) as usize;
+        let dst_y = (row * CELL) as usize;
+        let row_bytes = CELL as usize * 4;
+        for y in 0..CELL as usize {
+            let src_off = y * row_bytes;
+            let dst_off = ((dst_y + y) * atlas_w as usize + dst_x) * 4;
+            pixels[dst_off..dst_off + row_bytes].copy_from_slice(&tile.pixels[src_off..src_off + row_bytes]);
+        }
+        let u0 = (col * CELL) as f32 / atlas_w as f32 + pad_u;
+        let v0 = (row * CELL) as f32 / atlas_h as f32 + pad_v;
+        let u1 = ((col + 1) * CELL) as f32 / atlas_w as f32 - pad_u;
+        let v1 = ((row + 1) * CELL) as f32 / atlas_h as f32 - pad_v;
+        uv_rects.insert(key, [u0, v0, u1, v1]);
+    }
+
+    let default_uv = uv_rects
+        .get("icon_land1_directfire:rest")
+        .or_else(|| uv_rects.values().next())
+        .copied()
+        .unwrap_or([0.0, 0.0, 1.0, 1.0]);
+
+    StrategicIconAtlas {
+        image: RgbaImage {
+            width: atlas_w,
+            height: atlas_h,
+            pixels,
+        },
+        uv_rects,
+        default_uv,
+    }
+}
+
 /// Loads FA `64x64` HUD unit icons from `textures.scd` into a horizontal `(64*N)x64` atlas.
+#[allow(dead_code)]
 pub fn load_hud_icon_atlas(game_dir: &Path, unit_ids: &[&str]) -> Option<RgbaImage> {
     if unit_ids.is_empty() {
         return None;
@@ -1393,6 +2273,66 @@ fn pick_team_color(categories: &[String], unit_id: &str) -> [u8; 3] {
     } else {
         [48, 112, 230]
     }
+}
+
+/// Resolves `walk` / `idle` / `.sca` name substring to a parsed clip from `units.scd`.
+fn resolve_unit_clip(
+    gamedata: &Path,
+    bp_dir: &str,
+    unit_id: &str,
+    info: &UnitDisplayInfo,
+    sel: &str,
+) -> Result<(String, crate::sca::ScaAnimation), String> {
+    let units_scd = gamedata.join("units.scd");
+    let wanted = sel.trim().to_ascii_lowercase();
+    let path = match wanted.as_str() {
+        "walk" => info
+            .walk_anim
+            .clone()
+            .ok_or_else(|| format!("{unit_id} has no Display.AnimationWalk"))?,
+        "idle" => info
+            .idle_anim
+            .clone()
+            .ok_or_else(|| format!("{unit_id} has no Display.AnimationIdle"))?,
+        "death" => info
+            .death_anims
+            .first()
+            .map(|d| d.path.clone())
+            .ok_or_else(|| format!("{unit_id} has no Display.AnimationDeath"))?,
+        "open" => info
+            .open_anim
+            .clone()
+            .ok_or_else(|| format!("{unit_id} has no Display.AnimationOpen"))?,
+        "build" => info
+            .build_anim
+            .clone()
+            .ok_or_else(|| format!("{unit_id} has no Display.AnimationBuild"))?,
+        _ => {
+            let dir = if bp_dir.is_empty() {
+                format!("units/{}", unit_id.to_ascii_lowercase())
+            } else {
+                bp_dir.to_ascii_lowercase()
+            };
+            let mut hits: Vec<String> = scd::list_scd(&units_scd)
+                .map_err(|e| format!("{}: {e}", units_scd.display()))?
+                .into_iter()
+                .filter(|e| !e.is_dir)
+                .map(|e| e.name.replace('\\', "/"))
+                .filter(|n| {
+                    let l = n.trim_start_matches('/').to_ascii_lowercase();
+                    l.starts_with(&dir) && l.ends_with(".sca") && l.contains(&wanted)
+                })
+                .collect();
+            hits.sort();
+            hits.into_iter()
+                .next()
+                .ok_or_else(|| format!("no .sca matching '{sel}' under {dir}/"))?
+        }
+    };
+    let (found, bytes) = scd::read_scd_file_ci(&units_scd, &path)
+        .map_err(|e| format!("animation '{path}': {e}"))?;
+    let anim = crate::sca::ScaAnimation::parse(&bytes).map_err(|e| format!("{found}: {e}"))?;
+    Ok((found, anim))
 }
 
 fn resolve_bp_asset_path(bp_dir: &str, raw_path: &str) -> String {
@@ -1650,5 +2590,347 @@ mod tests {
             resolve_bp_asset_path("units/UAL0001", "UAL0001_lod0.scm"),
             "units/UAL0001/UAL0001_lod0.scm"
         );
+    }
+
+    #[test]
+    fn strategic_icon_atlas_fallback_generation_and_uv_lookup() {
+        let custom = vec![
+            "icon_custom_cruiser".to_string(),
+            "ICON_COMMANDER_GENERIC".to_string(),
+            "  ".to_string(),
+        ];
+        let atlas = load_strategic_icon_atlas(None, &custom);
+
+        assert_eq!(atlas.image.width, 16 * 32);
+        assert!(atlas.image.height >= 32 && atlas.image.height % 32 == 0);
+        assert_eq!(
+            atlas.image.pixels.len(),
+            (atlas.image.width * atlas.image.height * 4) as usize
+        );
+
+        for &name in CORE_STRATEGIC_ICONS {
+            let rest_key = format!("{name}:rest");
+            let sel_key = format!("{name}:sel");
+            assert!(atlas.uv_rects.contains_key(&rest_key), "missing {rest_key}");
+            assert!(atlas.uv_rects.contains_key(&sel_key), "missing {sel_key}");
+            let r_uv = atlas.uv(name, false);
+            let s_uv = atlas.uv(name, true);
+            assert_ne!(r_uv, s_uv);
+            for uv in [r_uv, s_uv] {
+                assert!(uv[0] >= 0.0 && uv[0] < uv[2] && uv[2] <= 1.0);
+                assert!(uv[1] >= 0.0 && uv[1] < uv[3] && uv[3] <= 1.0);
+            }
+        }
+
+        assert!(atlas.uv_rects.contains_key("icon_custom_cruiser:rest"));
+        assert!(atlas.uv_rects.contains_key("icon_custom_cruiser:sel"));
+        assert_eq!(atlas.uv("unknown_unit_icon", false), atlas.default_uv);
+
+        let tile_rest = render_fallback_strategic_icon("icon_commander_generic", false);
+        let tile_sel = render_fallback_strategic_icon("icon_commander_generic", true);
+        assert_ne!(tile_rest.pixels, tile_sel.pixels);
+        assert_eq!(tile_rest.pixels[(15 * 32 + 15) * 4 + 3], 255);
+        assert_eq!(tile_rest.pixels[3], 0);
+    }
+
+    #[test]
+    fn decal_quad_construction_drapes_rotates_and_caps_top_24() {
+        use crate::scmap::{ScMapWaterParams, TerrainTextures, WaterInfo};
+
+        let hm_w = 4u32;
+        let hm_h = 4u32;
+        let mut heights = Vec::with_capacity(25);
+        for iz in 0..=hm_h {
+            for ix in 0..=hm_w {
+                heights.push((ix * 4 + iz * 2) as u16);
+            }
+        }
+
+        let decals = vec![
+            ScMapDecal {
+                id: 1,
+                decal_type: 1,
+                textures: vec!["/env/common/decals/crater_albedo.dds".to_string()],
+                scale: [8.0, 1.0, 4.0],
+                position: [32.0, 0.0, 32.0],
+                rotation: [0.0, 0.0, 0.0],
+                cutoff_lod: 500.0,
+                near_cutoff_lod: 0.0,
+            },
+            ScMapDecal {
+                id: 2,
+                decal_type: 1,
+                textures: vec!["/env/common/decals/crater_albedo.dds".to_string()],
+                scale: [8.0, 1.0, 4.0],
+                position: [32.0, 0.0, 32.0],
+                rotation: [0.0, std::f32::consts::FRAC_PI_2, 0.0],
+                cutoff_lod: 500.0,
+                near_cutoff_lod: 0.0,
+            },
+            ScMapDecal {
+                id: 3,
+                decal_type: 2,
+                textures: vec!["/env/common/decals/crater_normals.dds".to_string()],
+                scale: [8.0, 1.0, 4.0],
+                position: [32.0, 0.0, 32.0],
+                rotation: [0.0, 0.0, 0.0],
+                cutoff_lod: 500.0,
+                near_cutoff_lod: 0.0,
+            },
+            ScMapDecal {
+                id: 4,
+                decal_type: 0,
+                textures: vec!["".to_string(), "/env/common/decals/scorch.dds".to_string()],
+                scale: [6.0, 1.0, 6.0],
+                position: [24.0, 0.0, 24.0],
+                rotation: [0.0, std::f32::consts::FRAC_PI_4, 0.0],
+                cutoff_lod: 500.0,
+                near_cutoff_lod: 0.0,
+            },
+        ];
+
+        let mut scmap = ScMap {
+            version_major: 2,
+            version_minor: 60,
+            map_width: 64.0,
+            map_height: 64.0,
+            preview_dds: Vec::new(),
+            heightmap_width: hm_w,
+            heightmap_height: hm_h,
+            height_scale: 1.0,
+            heightmap: heights,
+            terrain_shader: "TTerrain".to_string(),
+            background_path: String::new(),
+            sky_cubemap_path: String::new(),
+            cubemaps: Vec::new(),
+            lighting: ScMapLighting::default(),
+            water: WaterInfo {
+                has_water: false,
+                elevation: 0.0,
+                elevation_deep: 0.0,
+                elevation_abyss: 0.0,
+            },
+            terrain_textures: Some(TerrainTextures {
+                strata_albedo: Vec::new(),
+                strata_normal: Vec::new(),
+                decals,
+                texturemap0_dds: Vec::new(),
+                texturemap1_dds: Vec::new(),
+                normal_map_dds: Vec::new(),
+                water_params: ScMapWaterParams::default(),
+                props: Vec::new(),
+            }),
+        };
+
+        let batches = load_map_decals(Path::new("/nonexistent_farust_test"), &scmap);
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].label, "env/common/decals/crater_albedo.dds");
+        assert_eq!(batches[0].vertices.len(), 18);
+        assert_eq!(batches[0].indices.len(), 48);
+        assert_eq!(batches[1].label, "env/common/decals/scorch.dds");
+        assert_eq!(batches[1].vertices.len(), 9);
+        assert_eq!(batches[1].indices.len(), 24);
+
+        for batch in &batches {
+            for &idx in &batch.indices {
+                assert!((idx as usize) < batch.vertices.len());
+            }
+            for v in &batch.vertices {
+                let expected_y = sample_scmap_height(&scmap, v.position[0], v.position[2]) + 0.08;
+                assert!((v.position[1] - expected_y).abs() < 1e-4);
+                let nlen = (v.normal[0] * v.normal[0]
+                    + v.normal[1] * v.normal[1]
+                    + v.normal[2] * v.normal[2])
+                    .sqrt();
+                assert!((nlen - 1.0).abs() < 1e-4);
+                assert!(v.normal[1] > 0.8);
+                assert!(v.normal[0] < -0.1);
+            }
+        }
+
+        let rot_verts = &batches[0].vertices[9..18];
+        let min_x = rot_verts.iter().map(|v| v.position[0]).fold(f32::INFINITY, f32::min);
+        let max_x = rot_verts.iter().map(|v| v.position[0]).fold(f32::NEG_INFINITY, f32::max);
+        let min_z = rot_verts.iter().map(|v| v.position[2]).fold(f32::INFINITY, f32::min);
+        let max_z = rot_verts.iter().map(|v| v.position[2]).fold(f32::NEG_INFINITY, f32::max);
+        assert!((min_x - 30.0).abs() < 1e-4 && (max_x - 34.0).abs() < 1e-4);
+        assert!((min_z - 28.0).abs() < 1e-4 && (max_z - 36.0).abs() < 1e-4);
+
+        let mut many_decals = Vec::new();
+        for tex_idx in 0..26u32 {
+            let count = 26 - tex_idx;
+            for copy in 0..count {
+                many_decals.push(ScMapDecal {
+                    id: tex_idx * 100 + copy,
+                    decal_type: 1,
+                    textures: vec![format!("/env/decals/d_{tex_idx:02}_albedo.dds")],
+                    scale: [4.0, 1.0, 4.0],
+                    position: [16.0, 0.0, 16.0],
+                    rotation: [0.0, 0.0, 0.0],
+                    cutoff_lod: 500.0,
+                    near_cutoff_lod: 0.0,
+                });
+            }
+        }
+        scmap.terrain_textures.as_mut().expect("terrain_textures").decals = many_decals;
+        let capped = load_map_decals(Path::new("/nonexistent_farust_test"), &scmap);
+        assert_eq!(capped.len(), 24);
+        assert_eq!(capped[0].label, "env/decals/d_00_albedo.dds");
+        assert_eq!(capped[23].label, "env/decals/d_23_albedo.dds");
+    }
+
+    #[test]
+    fn faction_theme_returns_distinct_valid_palettes() {
+        let uef = faction_theme("uef");
+        let cybran = faction_theme("Cybran");
+        let aeon = faction_theme("AEON");
+        let seraphim = faction_theme("seraphim");
+        let neutral = faction_theme("unknown");
+
+        assert_eq!(uef.name, "UEF");
+        assert_eq!(cybran.name, "Cybran");
+        assert_eq!(aeon.name, "Aeon");
+        assert_eq!(seraphim.name, "Seraphim");
+        assert_eq!(neutral.name, "Neutral");
+
+        let themes = [uef, cybran, aeon, seraphim, neutral];
+        for (i, t) in themes.iter().enumerate() {
+            for rgba in [t.primary, t.border, t.accent, t.panel_bg] {
+                for c in rgba {
+                    assert!(c.is_finite() && (0.0..=1.0).contains(&c));
+                }
+            }
+            for other in themes.iter().skip(i + 1) {
+                assert_ne!(t.primary, other.primary);
+                assert_ne!(t.panel_bg, other.panel_bg);
+            }
+        }
+    }
+
+    #[test]
+    fn prop_chunk_partitioning_8x8_and_aabb_bounds() {
+        let make_prop = |x: f32, y: f32, z: f32| ScMapProp {
+            blueprint_path: "/env/trees/pine_prop.bp".to_string(),
+            position: [x, y, z],
+            rot_x: [1.0, 0.0, 0.0],
+            rot_y: [0.0, 1.0, 0.0],
+            rot_z: [0.0, 0.0, 1.0],
+            scale: [1.0, 1.0, 1.0],
+        };
+        let props = [
+            make_prop(10.0, 5.0, 12.0),
+            make_prop(100.0, 8.0, 70.0),
+            make_prop(112.0, 14.0, 80.0),
+            make_prop(250.0, 20.0, 240.0),
+        ];
+        let refs: Vec<&ScMapProp> = props.iter().collect();
+        let chunks = partition_prop_chunks(&refs, 256.0, 256.0);
+
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0].chunk_idx, 0);
+        assert_eq!(chunks[0].bounds_min, [2.0, 1.0, 4.0]);
+        assert_eq!(chunks[0].bounds_max, [18.0, 23.0, 20.0]);
+
+        assert_eq!(chunks[1].chunk_idx, 2 * 8 + 3);
+        assert_eq!(chunks[1].refs.len(), 2);
+        assert_eq!(chunks[1].bounds_min, [92.0, 4.0, 62.0]);
+        assert_eq!(chunks[1].bounds_max, [120.0, 32.0, 88.0]);
+
+        assert_eq!(chunks[2].chunk_idx, 7 * 8 + 7);
+        assert_eq!(chunks[2].bounds_min, [242.0, 16.0, 232.0]);
+        assert_eq!(chunks[2].bounds_max, [258.0, 38.0, 248.0]);
+    }
+
+    #[test]
+    fn parses_unit_display_anim_info() {
+        let bp = blueprint::parse_blueprint(
+            r#"UnitBlueprint {
+                Display = {
+                    AnimationWalk = '/units/uel0001/uel0001_a001.sca',
+                    AnimationWalkRate = 1.7,
+                    Mesh = { LODs = { { LODCutoff = 175 }, { LODCutoff = 400 } } },
+                },
+                Physics = { MaxSpeed = 1.7 },
+            }"#,
+        )
+        .unwrap();
+        let info = parse_unit_display_info(&bp);
+        assert_eq!(info.walk_anim.as_deref(), Some("units/uel0001/uel0001_a001.sca"));
+        assert_eq!(info.idle_anim, None);
+        assert!((info.walk_rate - 1.7).abs() < 1e-6);
+        assert!((info.max_speed - 1.7).abs() < 1e-6);
+        assert!((info.lod0_cutoff - 175.0).abs() < 1e-6);
+
+        let empty = parse_unit_display_info(&blueprint::parse_blueprint("UnitBlueprint { }").unwrap());
+        assert_eq!(empty.walk_anim, None);
+        assert_eq!(empty.walk_rate, 1.0);
+        assert_eq!(empty.lod0_cutoff, 150.0);
+        assert!(empty.weapons.is_empty() && empty.death_anims.is_empty());
+        assert!(!empty.personal_shield && empty.bank_factor == 0.0 && !empty.winged);
+    }
+
+    #[test]
+    fn parses_weapon_bones_death_clips_shield_and_air() {
+        let bp = blueprint::parse_blueprint(
+            r#"UnitBlueprint {
+                Air = { BankFactor = 2, Winged = true, MaxAirspeed = 15 },
+                Defense = { Shield = { PersonalShield = true, ShieldSize = 3 } },
+                Display = {
+                    AnimationBuild = '/units/urb0101/urb0101_abuild.sca',
+                    AnimationDeath = {
+                        { Animation = '/units/uel0106/uel0106_Adeath01.sca', AnimationRateMax = 1.25, AnimationRateMin = 0.75 },
+                        { Animation = '/units/uel0106/uel0106_Adeath02.sca' },
+                    },
+                },
+                Weapon = {
+                    {
+                        DamageRadius = 0,
+                        Label = 'MainGun',
+                        ProjectileId = '/projectiles/TDFGauss01/TDFGauss01_proj.bp',
+                        RackBones = { { MuzzleBones = { 'Turret_Muzzle' }, RackBone = 'Turret_Barrel' } },
+                        RackRecoilDistance = -2,
+                        TurretBoneMuzzle = 'Turret_Muzzle',
+                        TurretBonePitch = 'Turret_Barrel',
+                        TurretBoneYaw = 'Turret',
+                        TurretPitchRange = 45,
+                        TurretYawSpeed = 100,
+                    },
+                    { DamageRadius = 2, Label = 'Arty', ProjectileId = '/projectiles/TIFMortar01/TIFMortar01_proj.bp' },
+                },
+            }"#,
+        )
+        .unwrap();
+        let info = parse_unit_display_info(&bp);
+        assert_eq!(info.weapons.len(), 2);
+        let w = &info.weapons[0];
+        assert_eq!(w.label, "MainGun");
+        assert_eq!(w.yaw_bone.as_deref(), Some("Turret"));
+        assert_eq!(w.pitch_bone.as_deref(), Some("Turret_Barrel"));
+        assert_eq!(w.rack_bones, vec!["Turret_Barrel".to_string()]);
+        assert_eq!(w.muzzle_bones, vec!["Turret_Muzzle".to_string()]);
+        assert_eq!(w.recoil_distance, -2.0);
+        assert_eq!(w.pitch_range_deg, 45.0);
+        assert_eq!(w.yaw_speed_deg, 100.0);
+        assert_eq!(w.projectile_id.as_deref(), Some("projectiles/tdfgauss01/tdfgauss01_proj.bp"));
+        assert!(!w.splash && info.weapons[1].splash);
+        assert_eq!(info.weapons[1].pitch_range_deg, 90.0);
+
+        assert_eq!(info.death_anims.len(), 2);
+        assert_eq!(info.death_anims[0].path, "units/uel0106/uel0106_Adeath01.sca");
+        assert!((info.death_anims[0].rate - 1.0).abs() < 1e-6);
+        assert_eq!(info.death_anims[1].rate, 1.0);
+        assert_eq!(info.build_anim.as_deref(), Some("units/urb0101/urb0101_abuild.sca"));
+        assert_eq!(info.open_anim, None);
+        assert!(info.personal_shield);
+        assert_eq!(info.bank_factor, 2.0);
+        assert!(info.winged);
+        assert_eq!(info.max_airspeed, 15.0);
+
+        let proj = parse_projectile_blueprint(
+            "ProjectileBlueprint { Categories = { 'UEF', 'MISSILE' }, Display = { UniformScale = 0.15 } }",
+        )
+        .unwrap();
+        let p = parse_projectile_display_info(&proj);
+        assert!(p.missile && (p.uniform_scale - 0.15).abs() < 1e-6);
     }
 }
