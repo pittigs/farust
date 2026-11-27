@@ -2421,6 +2421,24 @@ struct PlayGpuState {
     /// Phase 23: window focus (edge scrolling) and the OS cursor currently shown.
     focused: bool,
     cursor_icon: winit::window::CursorIcon,
+    /// Phase 34: every map prop batch as loaded, and how many reclaimed props the uploaded
+    /// batches already hide (re-filtered at most once a second).
+    prop_cpu: Vec<crate::scene::PropMeshBatch>,
+    props_hidden: usize,
+    props_filtered_at: Instant,
+}
+
+/// Phase 34: `batches` without the props whose `.scmap` (x, z) position bits are in `gone`.
+fn filter_reclaimed_props(batches: &[crate::scene::PropMeshBatch], gone: &[(u32, u32)]) -> Vec<crate::scene::PropMeshBatch> {
+    let gone: std::collections::BTreeSet<(u32, u32)> = gone.iter().copied().collect();
+    batches
+        .iter()
+        .map(|b| {
+            let mut b = b.clone();
+            b.instances.retain(|i| !gone.contains(&(i.row0[3].to_bits(), i.row2[3].to_bits())));
+            b
+        })
+        .collect()
 }
 
 /// How the player asked to leave a running match (pause menu / end-of-game screen).
@@ -2549,6 +2567,7 @@ impl PlayApp {
         let (terrain_scene, minimap_img) =
             build_terrain_loaded_scene(self.game_dir.as_deref(), &self.map, camera.clone());
         let clear_color = terrain_scene.clear_color;
+        let prop_cpu = terrain_scene.prop_batches.clone();
 
         let mut resources =
             GpuSceneResources::new(&device, &queue, &terrain_scene, format, MSAA_SAMPLES, &camera);
@@ -2620,6 +2639,9 @@ impl PlayApp {
             dirty_dynamic: false,
             focused: true,
             cursor_icon: winit::window::CursorIcon::Default,
+            prop_cpu,
+            props_hidden: 0,
+            props_filtered_at: Instant::now(),
         })
     }
 
@@ -3760,6 +3782,14 @@ impl ApplicationHandler for PlayApp {
                 }
                 st.device.poll(wgpu::Maintain::Poll);
                 st.resources.poll_gpu_timer();
+                // Phase 34: hide reclaimed trees / rocks (also restores them after a seek back).
+                let gone = self.session.world.props_gone();
+                if gone.len() != st.props_hidden && st.props_filtered_at.elapsed().as_secs_f32() >= 1.0 {
+                    let batches = filter_reclaimed_props(&st.prop_cpu, gone);
+                    st.resources.update_prop_batches(&st.device, &st.queue, &batches);
+                    st.props_hidden = gone.len();
+                    st.props_filtered_at = Instant::now();
+                }
                 if crate::profiler::overlay_visible() {
                     st.dirty_dynamic = true;
                 }
@@ -3821,6 +3851,26 @@ impl ApplicationHandler for PlayApp {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn reclaimed_props_are_filtered_out_of_their_batches() {
+        let inst = |x: f32, z: f32| crate::viewer::GpuUnitInstance::from_basis([x, 0.0, z], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [1.0; 3], [1.0; 4], [0.0; 4]);
+        let batch = crate::scene::PropMeshBatch {
+            label: "t".into(),
+            vertices: vec![],
+            indices: vec![],
+            albedo: None,
+            alpha_cutout: false,
+            instances: vec![inst(10.5, 20.25), inst(30.0, 40.0)],
+            bounds_min: [0.0; 3],
+            bounds_max: [1.0; 3],
+        };
+        let out = super::filter_reclaimed_props(&[batch.clone()], &[(10.5f32.to_bits(), 20.25f32.to_bits())]);
+        assert_eq!(out[0].instances.len(), 1);
+        assert_eq!(out[0].instances[0].row0[3], 30.0);
+        assert_eq!(super::filter_reclaimed_props(&[batch], &[])[0].instances.len(), 2);
+    }
+
     use super::*;
     use crate::scmap::{ScMap, WaterInfo};
     use crate::skirmish::tests::test_world;

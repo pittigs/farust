@@ -674,6 +674,12 @@ impl PlaySession {
                 targets.push((d2(p), true, w.id, p));
             }
         }
+        // Phase 34: map props (trees, rocks) in the area are reclaimable too.
+        for q in self.world.props() {
+            if d2(q.pos) <= r2 {
+                targets.push((d2(q.pos), true, 0, q.pos));
+            }
+        }
         for u in self.world.units() {
             let p = (u.pos.x, u.pos.y);
             if u.army == self.human_army && u.hp < u.max_hp && d2(p) <= r2 && !builders.contains(&u.id) {

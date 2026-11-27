@@ -458,6 +458,13 @@ fn cmd_map(args: &[String]) -> Result<(), String> {
 
     if let Some(scmap_path) = &m.scmap_path {
         let map_data = scmap::ScMap::parse_file(scmap_path)?;
+        let props = skirmish::MapContext::load_props(&game_dir, &map_data);
+        println!(
+            "reclaim:     {} props | {} mass | {} energy",
+            props.len(),
+            props.iter().map(|p| p.mass).sum::<i64>() / sim::SCALE,
+            props.iter().map(|p| p.energy).sum::<i64>() / sim::SCALE
+        );
         let (min_h, max_h, avg_h) = map_data.height_stats();
         println!(
             "scmap:       {} (v{}.{}, map {}x{}, heightmap {}x{}, scale={}, min/max/avg={:.2}/{:.2}/{:.2})",

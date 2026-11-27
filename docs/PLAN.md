@@ -360,13 +360,23 @@ bumps `SIM_VERSION`, re-baselines golden hashes deliberately, and keeps
   `1t == 20t`; 12-game `ai-arena` all decisive. Done — the "no unmodelled flags" goal is
   not met: the 3 not-modelled and 7 partial abilities above remain.
 
-### Phase 34 — Map prop reclaim & destructible trees (planned)
-- Reclaiming live units (walls first, carried over from Phase 28).
-- `.scmap` prop reclaim values (mass/energy/time), tree falling and burning
-  (render), reclaim beams on props, area reclaim covering props, AI
-  reclaim fields.
-- Exit: an engineer area-reclaim on a forest on `SCMP_009` yields mass, and
-  replays of it hash identically.
+### Phase 34 — Map prop reclaim & live-unit reclaim (done)
+- Reclaimable props: `MapContext::load_props` reads every `.scmap` prop's blueprint from
+  `env.scd` (`Economy.ReclaimMassMax` / `ReclaimEnergyMax`, cached per blueprint) — e.g.
+  `SCMP_009` 5,182 props / 32,597 mass / 283,280 energy, `SCMP_001` 10,939 / 53,532 /
+  293,932 (`farust map NAME` prints the totals). Props are sim state (`Skirmish::props`,
+  hashed); reclaim orders take a wreck (16 m snap), else a prop (3 m), else a live unit.
+- Reclaim drains props at the wreck rate (energy ×10) and removes them; live units (walls,
+  structures, land units; never commanders or aircraft) drain back into their mass cost
+  and vanish without wreck or kill credit, re-opening the path grid. Area reclaim
+  (Ctrl+RMB) and the AI's reclaim job include props. Rules v7.
+- Render: reclaimed props disappear (instances filtered by their `.scmap` position bits,
+  re-uploaded at most once a second; a backward replay seek restores them).
+- Exit: exact tree/rock yields vs. a control run + determinism, wall reclaim refund and
+  render-filter tests pass (316/316); an AI game on `SCMP_009` (which now harvests props)
+  records and `replay verify`s. Done.
+- Not modelled: falling / burning tree animation, prop destruction by weapons, reclaim
+  time from `ReclaimTime` (props use the wreck rate).
 
 ### Phase 35 — Fire states & unit behaviours (planned)
 - Hold fire / return fire / ground fire (`Command::SetFireState`,

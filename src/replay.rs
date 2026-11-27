@@ -739,6 +739,7 @@ mod tests {
             mass_points: vec![(40 * SCALE, 40 * SCALE), (210 * SCALE, 210 * SCALE)],
             hydro_points: vec![],
             has_water: false,
+            props: Vec::new(),
         }
     }
 

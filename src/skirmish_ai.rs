@@ -1546,7 +1546,7 @@ impl Smart {
         // 4. Reclaim battlefield wrecks.
         if !is_acu
             && v.mass * 10 < v.mass_cap * 6
-            && let Some((_, wp)) = w.wreck_at(bp, 45 * U)
+            && let Some(wp) = w.reclaimable_mass_near(bp, 45 * U)
             && self.tm().surface_threat(wp, U) <= v.p.mex_danger
         {
             return Some(Work::Reclaim(wp));

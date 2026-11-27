@@ -2186,6 +2186,7 @@ mod tests {
             mass_points: vec![],
             hydro_points: vec![],
             has_water: false,
+            props: Vec::new(),
         }
     }
 

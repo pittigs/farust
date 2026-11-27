@@ -494,8 +494,8 @@ pub const LOF_CLEARANCE: i64 = SCALE / 4;
 /// footprints blocking pathing).
 /// 3 = Phase 30 air fuel & staging; 4 = Phase 31 engineering stations & pod drones;
 /// 5 = Phase 32 mobile factories, mobile staging & hatching eggs; 6 = Phase 33 Novax
-/// satellite, EMP stun, death explosions & kamikaze weapons.
-pub const RULES_VERSION: u32 = 6;
+/// satellite, EMP stun, death explosions & kamikaze weapons; 7 = Phase 34 prop reclaim.
+pub const RULES_VERSION: u32 = 7;
 
 /// Phase 29: milliradians per degree, scaled by 1000 (17.453 mrad / deg).
 const MRAD_PER_DEG_MILLI: i64 = 17_453;
@@ -2202,6 +2202,28 @@ pub struct ArmySetup {
     pub team: u8,
 }
 
+/// Phase 34: a reclaimable map prop (tree, rock, log) from the `.scmap` prop list with its
+/// blueprint's `ReclaimMassMax` / `ReclaimEnergyMax`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MapProp {
+    pub pos: (i64, i64),
+    pub mass: i64,
+    pub energy: i64,
+    /// Original `.scmap` position bits (x, z) so the renderer can hide reclaimed props.
+    pub src_xz: (u32, u32),
+}
+
+/// Phase 34: what a reclaim order is eating.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReclaimKind {
+    Wreck,
+    Prop,
+    Unit,
+}
+
+/// Phase 34: snap radius for prop reclaim orders.
+pub const PROP_SNAP: i64 = 3 * SCALE;
+
 /// Map-derived context shared by headless runs, the AI and the viewer.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -2220,9 +2242,45 @@ pub struct MapContext {
     /// Hydrocarbon markers in milli-units.
     pub hydro_points: Vec<(i64, i64)>,
     pub has_water: bool,
+    /// Phase 34: reclaimable props (empty when their blueprints cannot be read).
+    pub props: Vec<MapProp>,
 }
 
 impl MapContext {
+    /// Phase 34: reclaimable props of `scmap`, values from the prop blueprints in `env.scd`
+    /// (case-insensitive paths, cached per blueprint).
+    pub fn load_props(game_dir: &Path, scmap: &ScMap) -> Vec<MapProp> {
+        let Some(tt) = scmap.terrain_textures.as_ref() else {
+            return Vec::new();
+        };
+        let env = scd::gamedata_dir(game_dir).join("env.scd");
+        let mut values: BTreeMap<String, (i64, i64)> = BTreeMap::new();
+        let q = |v: f64| (v * SCALE as f64).round() as i64;
+        let mut out = Vec::new();
+        for p in &tt.props {
+            let key = p.blueprint_path.trim().trim_start_matches('/').replace('\\', "/").to_ascii_lowercase();
+            let (mass, energy) = *values.entry(key.clone()).or_insert_with(|| {
+                scd::read_scd_file_ci(&env, &key)
+                    .ok()
+                    .and_then(|(_, b)| blueprint::parse_any_blueprint(&String::from_utf8_lossy(&b)).ok().map(|(_, v)| v))
+                    .and_then(|root| {
+                        let e = root.get("Economy")?;
+                        Some((q(e.get_f64("ReclaimMassMax").unwrap_or(0.0).max(0.0)), q(e.get_f64("ReclaimEnergyMax").unwrap_or(0.0).max(0.0))))
+                    })
+                    .unwrap_or((0, 0))
+            });
+            if mass > 0 || energy > 0 {
+                out.push(MapProp {
+                    pos: (q(p.position[0] as f64), q(p.position[2] as f64)),
+                    mass,
+                    energy,
+                    src_xz: (p.position[0].to_bits(), p.position[2].to_bits()),
+                });
+            }
+        }
+        out
+    }
+
     pub fn load(game_dir: &Path, map: &str) -> Result<Self, String> {
         let files = scenario::find_map(game_dir, map)?;
         let meta = scenario::parse_scenario_file(&files.scenario_path, &files.id)?;
@@ -2262,6 +2320,7 @@ impl MapContext {
             .collect();
         let has_water = scmap.water.has_water && naval_grid.blocked_count() < (naval_grid.width * naval_grid.height) as usize;
         let size = (q(scmap.map_width), q(scmap.map_height));
+        let props = Self::load_props(game_dir, &scmap);
         Ok(Self {
             map_id: files.id.clone(),
             map_name: meta.name.clone(),
@@ -2274,6 +2333,7 @@ impl MapContext {
             mass_points,
             hydro_points,
             has_water,
+            props,
         })
     }
 }
@@ -2305,6 +2365,10 @@ pub struct Skirmish {
     walls_dirty: bool,
     /// Phase 29: integer terrain heights (flat on synthetic maps).
     terrain: Arc<HeightField>,
+    /// Phase 34: reclaimable map props still standing (key = index in the map's list).
+    props: BTreeMap<u32, MapProp>,
+    /// Phase 34: `.scmap` position bits of props reclaimed so far (render hides them).
+    props_gone: Vec<(u32, u32)>,
     flow_cache: FlowFieldCache,
     spatial: Arc<SpatialGrid>,
     spatial_snap: Arc<Vec<UnitSpatialSnap>>,
@@ -2384,6 +2448,8 @@ impl Skirmish {
             base_amphib: Arc::clone(&grid_arc),
             base_naval: grid_arc,
             terrain: Arc::new(HeightField::flat()),
+            props: BTreeMap::new(),
+            props_gone: Vec::new(),
             flow_cache: FlowFieldCache::new(),
             spatial,
             spatial_snap: Arc::new(Vec::new()),
@@ -2513,6 +2579,70 @@ impl Skirmish {
     pub fn attach_map(&mut self, map: &MapContext) {
         self.set_domain_grids(map.naval_grid.clone(), map.amphib_grid.clone(), map.hydro_points.clone());
         self.set_terrain(HeightField::from_scmap(&map.scmap));
+        self.set_props(map.props.clone());
+    }
+
+    /// Phase 34: reclaimable props (tests and map attachment).
+    pub fn set_props(&mut self, props: Vec<MapProp>) {
+        self.props = props.into_iter().enumerate().map(|(i, p)| (i as u32, p)).collect();
+        self.props_gone.clear();
+    }
+
+    pub fn props(&self) -> impl Iterator<Item = &MapProp> {
+        self.props.values()
+    }
+
+    /// Phase 34: `.scmap` position bits of every reclaimed prop, in reclaim order.
+    pub fn props_gone(&self) -> &[(u32, u32)] {
+        &self.props_gone
+    }
+
+    /// Phase 34: nearest standing prop to `p` within `max_dist` (ties by index).
+    pub fn prop_at(&self, p: (i64, i64), max_dist: i64) -> Option<(u32, (i64, i64))> {
+        let max_sq = (max_dist as i128) * (max_dist as i128);
+        self.props
+            .iter()
+            .map(|(&i, q)| (dist_sq(p, q.pos), i, q.pos))
+            .filter(|(d, _, _)| *d <= max_sq)
+            .min()
+            .map(|(_, i, pos)| (i, pos))
+    }
+
+    /// Phase 34: what a reclaim order at `p` works on: a wreck (snap 16 m) first, else a prop
+    /// (snap [`PROP_SNAP`]), else a live unit (walls, structures, land units — never
+    /// commanders or aircraft) whose footprint covers `p`.
+    fn reclaim_target(&self, p: (i64, i64)) -> Option<(ReclaimKind, u32, (i64, i64))> {
+        self.wreck_at(p, MASS_SNAP * 2)
+            .map(|(id, wp)| (ReclaimKind::Wreck, id, wp))
+            .or_else(|| self.prop_at(p, PROP_SNAP).map(|(i, pp)| (ReclaimKind::Prop, i, pp)))
+            .or_else(|| {
+                self.units
+                    .values()
+                    .filter(|u| {
+                        u.alive
+                            && u.role != Role::Commander
+                            && u.domain != NavDomain::Air
+                            && u.carried_by.is_none()
+                            && dist_sq(p, (u.pos.x, u.pos.y)) <= ((u.radius + SCALE) as i128).pow(2)
+                    })
+                    .map(|u| (dist_sq(p, (u.pos.x, u.pos.y)), u.id, (u.pos.x, u.pos.y)))
+                    .min()
+                    .map(|(_, id, up)| (ReclaimKind::Unit, id, up))
+            })
+    }
+
+    /// Phase 34: nearest reclaimable mass to `p` within `r` (wrecks, then mass-bearing props).
+    pub fn reclaimable_mass_near(&self, p: (i64, i64), r: i64) -> Option<(i64, i64)> {
+        let max_sq = (r as i128) * (r as i128);
+        self.wreck_at(p, r).map(|(_, wp)| wp).or_else(|| {
+            self.props
+                .iter()
+                .filter(|(_, q)| q.mass > 0)
+                .map(|(&i, q)| (dist_sq(p, q.pos), i, q.pos))
+                .filter(|(d, _, _)| *d <= max_sq)
+                .min()
+                .map(|(_, _, pos)| pos)
+        })
     }
 
     /// Phase 28: grid cells covered by a square footprint of half-size `r` centred on `p`.
@@ -4786,20 +4916,65 @@ impl Skirmish {
                     }
                     Some(UnitOrder::Reclaim { x, y }) => {
                         let reach = build_range + 4 * SCALE;
-                        if let Some((wid, wpos)) = self.wreck_at((x, y), MASS_SNAP * 2)
-                            && dist_sq(pos, wpos) <= (reach as i128) * (reach as i128)
-                        {
-                            let gain = (build_rate.max(1) * 400).max(SCALE / 5);
-                            let w = self.wrecks.get_mut(&wid).unwrap();
-                            let harvested = w.mass_left.min(gain);
-                            w.mass_left -= harvested;
-                            let a = &mut self.armies[army as usize];
-                            a.mass = (a.mass + harvested).min(a.mass_cap.max(a.mass));
-                            if w.mass_left <= 0 {
-                                self.wrecks.remove(&wid);
+                        match self.reclaim_target((x, y)) {
+                            Some((ReclaimKind::Wreck, wid, wpos)) if dist_sq(pos, wpos) <= (reach as i128) * (reach as i128) => {
+                                let gain = (build_rate.max(1) * 400).max(SCALE / 5);
+                                let w = self.wrecks.get_mut(&wid).unwrap();
+                                let harvested = w.mass_left.min(gain);
+                                w.mass_left -= harvested;
+                                let a = &mut self.armies[army as usize];
+                                a.mass = (a.mass + harvested).min(a.mass_cap.max(a.mass));
+                                if w.mass_left <= 0 {
+                                    self.wrecks.remove(&wid);
+                                }
                             }
-                        } else if self.wreck_at((x, y), MASS_SNAP * 2).is_none() {
-                            self.units.get_mut(&id).unwrap().orders.pop_front();
+                            Some((ReclaimKind::Unit, tid, tpos)) if tid != id && dist_sq(pos, tpos) <= (reach as i128) * (reach as i128) => {
+                                // Phase 34: a live unit drains back into its mass cost; fully
+                                // reclaimed units vanish (no wreck, no kill credit).
+                                let gain = (build_rate.max(1) * 400).max(SCALE / 5);
+                                let cost = self.units.get(&tid).and_then(|t| self.catalog.get(&t.type_id)).map_or(SCALE, |t| t.cost_mass.max(SCALE));
+                                let t = self.units.get_mut(&tid).unwrap();
+                                let hp_loss = ((t.max_hp as i128 * gain as i128) / cost as i128).max(1) as i64;
+                                let taken = hp_loss.min(t.hp);
+                                let value = ((cost as i128 * taken as i128) / t.max_hp.max(1) as i128) as i64;
+                                t.hp -= taken;
+                                let gone = t.hp <= 0;
+                                if gone {
+                                    t.alive = false;
+                                    t.hp = 0;
+                                }
+                                let structure = t.role.is_structure();
+                                let a = &mut self.armies[army as usize];
+                                a.mass = (a.mass + value).min(a.mass_cap.max(a.mass));
+                                if gone {
+                                    self.units.get_mut(&id).unwrap().orders.pop_front();
+                                    if structure {
+                                        self.walls_dirty = true;
+                                    }
+                                }
+                            }
+                            Some((ReclaimKind::Prop, pid, ppos)) if dist_sq(pos, ppos) <= (reach as i128) * (reach as i128) => {
+                                // Phase 34: props drain mass and energy at the wreck rate
+                                // (energy ten times faster, matching its lower value).
+                                let gain = (build_rate.max(1) * 400).max(SCALE / 5);
+                                let pr = self.props.get_mut(&pid).unwrap();
+                                let (dm, de) = (pr.mass.min(gain), pr.energy.min(gain * 10));
+                                pr.mass -= dm;
+                                pr.energy -= de;
+                                let done = pr.mass <= 0 && pr.energy <= 0;
+                                let src = pr.src_xz;
+                                let a = &mut self.armies[army as usize];
+                                a.mass = (a.mass + dm).min(a.mass_cap.max(a.mass));
+                                a.energy = (a.energy + de).min(a.energy_cap.max(a.energy));
+                                if done {
+                                    self.props.remove(&pid);
+                                    self.props_gone.push(src);
+                                }
+                            }
+                            Some(_) => {}
+                            None => {
+                                self.units.get_mut(&id).unwrap().orders.pop_front();
+                            }
                         }
                     }
                     Some(UnitOrder::Repair(tid)) => {
@@ -5154,10 +5329,7 @@ impl Skirmish {
                         .map(|t| t.build_range)
                         .unwrap_or(0);
                     let reach = range + 4 * SCALE;
-                    let target = self
-                        .wreck_at((x, y), MASS_SNAP * 2)
-                        .map(|(_, wp)| wp)
-                        .unwrap_or((x, y));
+                    let target = self.reclaim_target((x, y)).map(|(_, _, p)| p).unwrap_or((x, y));
                     if dist_sq(pos, target) <= (reach as i128) * (reach as i128) {
                         return None;
                     }
@@ -6812,6 +6984,11 @@ impl Skirmish {
         m(&mut h, &self.next_projectile_id.to_le_bytes());
         m(&mut h, &self.shots_fired.to_le_bytes());
         m(&mut h, &self.kills.to_le_bytes());
+        m(&mut h, &(self.props.len() as u64).to_le_bytes());
+        for p in self.props.values() {
+            m(&mut h, &p.mass.to_le_bytes());
+            m(&mut h, &p.energy.to_le_bytes());
+        }
         for a in &self.armies {
             m(&mut h, &[a.id, a.team, a.defeated as u8]);
             for v in [a.mass, a.energy, a.mass_cap, a.energy_cap, a.damage_dealt] {
@@ -7727,6 +7904,56 @@ pub(crate) mod tests {
         w.units.get_mut(&centre).unwrap().hp = 0;
         w.run(3);
         assert!(w.unit(s).is_none(), "satellite falls with its launch centre");
+    }
+
+    #[test]
+    fn engineers_reclaim_trees_and_rocks_for_mass_and_energy_deterministically() {
+        let run = |reclaim: bool| {
+            let mut w = wall_world();
+            w.set_props(vec![
+                MapProp { pos: (100 * SCALE, 100 * SCALE), mass: 4 * SCALE, energy: 40 * SCALE, src_xz: (1, 2) },
+                MapProp { pos: (104 * SCALE, 100 * SCALE), mass: 5 * SCALE, energy: 0, src_xz: (3, 4) },
+                MapProp { pos: (200 * SCALE, 200 * SCALE), mass: 5 * SCALE, energy: 0, src_xz: (5, 6) },
+            ]);
+            w.armies[0].mass = 0;
+            w.armies[0].energy = 0;
+            let eng = w.spawn_unit(0, "RENG", (90 * SCALE, 100 * SCALE)).unwrap();
+            assert_eq!(w.prop_at((101 * SCALE, 100 * SCALE), PROP_SNAP).map(|p| p.0), Some(0));
+            let (m0, e0) = (w.armies[0].mass, w.armies[0].energy);
+            if reclaim {
+                w.issue(0, Command::Reclaim { units: vec![eng], x: 100 * SCALE, y: 100 * SCALE, queue: false });
+                w.issue(0, Command::Reclaim { units: vec![eng], x: 104 * SCALE, y: 100 * SCALE, queue: true });
+            }
+            w.run(120);
+            (w.armies[0].mass - m0, w.armies[0].energy - e0, w.props().count(), w.props_gone().to_vec(), w.state_hash())
+        };
+        let (dm, de, left, gone, h1) = run(true);
+        let (cm, ce, ..) = run(false);
+        assert_eq!(dm - cm, 9 * SCALE, "exactly both props' mass on top of income");
+        assert_eq!(de - ce, 40 * SCALE, "exactly the tree's energy on top of income");
+        assert_eq!(left, 1, "the far rock still stands");
+        assert_eq!(gone, vec![(1, 2), (3, 4)], "reclaimed props reported in order for the renderer");
+        assert_eq!(run(true).4, h1, "prop reclaim is deterministic");
+    }
+
+    #[test]
+    fn engineers_reclaim_live_walls_for_their_mass_cost() {
+        let mut w = wall_world();
+        w.catalog.types.get_mut("RWALL").unwrap().cost_mass = 20 * SCALE;
+        let wall = w.spawn_unit(0, "RWALL", (100 * SCALE + SCALE / 2, 100 * SCALE + SCALE / 2)).unwrap();
+        let eng = w.spawn_unit(0, "RENG", (94 * SCALE, 100 * SCALE)).unwrap();
+        w.step();
+        assert!(w.is_wall_cell((100 * SCALE, 100 * SCALE)));
+        w.armies[0].mass = 0;
+        let mut control = w.clone();
+        w.issue(0, Command::Reclaim { units: vec![eng], x: 100 * SCALE + SCALE / 2, y: 100 * SCALE + SCALE / 2, queue: false });
+        w.run(30);
+        control.run(30);
+        assert!(w.unit(wall).is_none(), "wall reclaimed away");
+        assert!(w.wrecks().next().is_none(), "reclaimed units leave no wreck");
+        assert_eq!(w.armies[0].mass - control.armies[0].mass, 20 * SCALE, "refunds the wall's mass cost");
+        assert!(!w.is_wall_cell((100 * SCALE, 100 * SCALE)), "path grid re-opened");
+        assert!(w.unit(eng).unwrap().orders.is_empty());
     }
 
     #[test]
