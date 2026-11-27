@@ -805,11 +805,31 @@ bumps `SIM_VERSION`, re-baselines golden hashes deliberately, and keeps
   p95 9.94 ms. Done for the target; compute-shader culling / indirect draws (the original
   plan) are not implemented — CPU instance preparation (≈ 6 ms) is the next lever.
 
-### Phase 56 — Windows & macOS ports (planned)
-- Native audio output (WASAPI / CoreAudio) behind the existing silent
-  fallback, FA install discovery per OS, cross-architecture determinism test
-  (x86_64 vs aarch64 hashes must match).
-- Exit: a Linux–Windows lockstep match ends on an identical hash.
+### Phase 56 — Windows & macOS ports (code done; Windows run blocked on a linker)
+- `src/platform.rs`: per-OS user dirs (Linux XDG unchanged; Windows `%APPDATA%` /
+  `%LOCALAPPDATA%`; macOS `~/Library/Application Support` / `~/Library/Caches`) used by
+  settings, saves/replays, maps, mods; FA install discovery: `$FA_PATH`, every Steam
+  library in `libraryfolders.vdf` of the known Steam roots (native, `~/.steam`, Flatpak,
+  Snap, Windows Program Files, macOS), GOG / retail / Wine-prefix folders; native Windows
+  `Documents/My Games/…/Maps` as a user map folder. Replaces the hard-coded install path.
+  `farust platform` prints the result.
+- Native audio behind the existing fallbacks (`src/xact.rs` `PcmSink`): WinMM `waveOut`
+  ring (Windows) and CoreAudio `AudioQueue` (macOS) via plain FFI, no new crates; Linux
+  keeps `pw-cat` / `pacat` / `aplay`; no device → silent as before.
+- `zip` restricted to its `deflate` feature (FA archives are deflate/stored): drops the
+  zstd / bzip2 / lzma C builds, so the crate cross-compiles without a C toolchain.
+- Cross-platform determinism: sim audit (only load-time `f64` quantization with exact
+  IEEE `*`/`round`, two correctly rounded `sqrt`s, no `HashMap` in tick state, no FMA
+  contraction in Rust) plus `golden_hashes_pin_cross_platform_determinism` pinning the
+  Phase 4 sim, an AI match on the test catalog, `atan2_mrad`, `isqrt` and `quantize`
+  results; the test needs no game data, so it runs on any CI architecture.
+- Verified: `cargo check` clean for `x86_64-pc-windows-gnu`, `x86_64-apple-darwin`,
+  `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu` (clippy clean on the native-sink
+  code); Linux behaviour and every hash unchanged; 371 tests pass without an FA install.
+- Exit not yet run: a Linux–Windows lockstep match needs a Windows binary — this machine
+  has no MinGW linker (`mingw-w64-gcc`, needs sudo) and no aarch64 runner/qemu. With
+  the linker: `cargo build --release --target x86_64-pc-windows-gnu`, then
+  `wine farust.exe join 127.0.0.1:PORT` against a Linux host and compare hashes.
 
 ### Phase 57 — CI, packaging & 1.0 (planned)
 - CI running tests, fuzzers and golden-hash suites; crash reporter with

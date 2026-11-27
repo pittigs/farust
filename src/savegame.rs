@@ -55,12 +55,7 @@ pub fn data_dir(kind: &str) -> PathBuf {
     if local.is_dir() {
         return local.join(kind);
     }
-    let base = std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
-        .unwrap_or_else(|| PathBuf::from("."));
-    base.join("farust").join(kind)
+    crate::platform::data_home().join("farust").join(kind)
 }
 
 /// `--no-record` on the command line (or `FARUST_NO_RECORD` in the environment) disables

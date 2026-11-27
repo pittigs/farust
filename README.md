@@ -342,3 +342,14 @@ FARUST_MODS_DIR=/tmp/empty-mods cargo run --release -- join 127.0.0.1:15000   # 
 cargo run --release -- play --mission missions/x1ca_001.farust-mission
 cargo run --release -- mission missions/x1ca_001.farust-mission --human-ai hard --trace 5
 ```
+
+## Step 56 — ports (code): platform dirs, FA discovery, native audio
+
+- `src/platform.rs`: per-OS config/data/cache dirs and Steam/GOG/retail FA discovery.
+- Native audio sinks: WinMM (Windows), CoreAudio AudioQueue (macOS); Linux unchanged.
+- Golden cross-platform hash test; `zip` without C codecs so cross builds need no C compiler.
+
+```sh
+cargo run --release -- platform
+cargo check --release --target x86_64-pc-windows-gnu    # also *-apple-darwin, aarch64-unknown-linux-gnu
+```

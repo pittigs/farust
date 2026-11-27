@@ -2920,6 +2920,27 @@ mod tests {
         w
     }
 
+    /// Phase 56: pinned hashes for the platform-independence contract. The sim is integer
+    /// only (blueprint floats are quantized with IEEE-exact `*`/`round`; the two runtime
+    /// `sqrt`s are correctly rounded everywhere), so these must match bit for bit on
+    /// x86_64, aarch64, Windows, macOS and Linux. A change here is a rules change.
+    #[test]
+    fn golden_hashes_pin_cross_platform_determinism() {
+        let (_, rep) = crate::sim::run_selftest(10_000, crate::sim::DEFAULT_SEED);
+        assert_eq!(rep.hash, 0x35db_8f2b_d7a6_faf2, "Phase 4 synthetic sim");
+        let w = play(4242, [Difficulty::Hard, Difficulty::Normal], 3_000);
+        assert_eq!(w.state_hash(), 0x3c9c_66c0_199c_c7fb, "AI match on the test catalog: {:016x}", w.state_hash());
+        let atan: Vec<i64> = [(1, 0), (0, 1), (-7, 3), (12345, -6789), (-1, -1)]
+            .iter()
+            .map(|&(y, x)| crate::combat::atan2_mrad(y, x))
+            .collect();
+        assert_eq!(atan, vec![1571, 0, -1166, 2074, -2356], "{atan:?}");
+        let roots: Vec<i64> = [0i128, 1, 2, 99, 10_000_000_000_007, (1i128 << 62) + 12345].iter().map(|&v| crate::skirmish::isqrt(v)).collect();
+        assert_eq!(roots, vec![0, 1, 1, 9, 3_162_277, 2_147_483_648], "{roots:?}");
+        let q: Vec<i64> = [0.1f64, 2.675, -1.0005, 1e9 / 3.0, 0.3 * 3.0].iter().map(|&v| crate::sim::quantize(v)).collect();
+        assert_eq!(q, vec![100, 2675, -1001, 333_333_333_333, 900], "{q:?}");
+    }
+
     #[test]
     fn difficulty_parses_displays_and_lists() {
         for d in Difficulty::ALL {

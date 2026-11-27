@@ -116,11 +116,10 @@ pub fn read_scd_file_ci(scd_path: &Path, inner_path: &str) -> io::Result<(String
     Ok((actual, buf))
 }
 
+/// `$FA_PATH`, else the discovered Steam / GOG / retail install (Phase 56, see
+/// [`crate::platform::default_game_dir`]).
 pub fn default_game_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("FA_PATH") {
-        return PathBuf::from(dir);
-    }
-    PathBuf::from("/home/bas_pit/.local/share/Steam/steamapps/common/Supreme Commander Forged Alliance")
+    crate::platform::default_game_dir()
 }
 
 pub fn gamedata_dir(game_dir: &Path) -> PathBuf {

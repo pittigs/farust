@@ -2,8 +2,10 @@
 //! parser, PCM / MS-ADPCM decoder, WAV exporter, cue library and a threaded
 //! spatial stereo mixer built exclusively on Rust `std`.
 //!
-//! Output goes to a `pw-cat` / `pacat` / `aplay` subprocess as raw S16 stereo; when none
-//! is available the engine silently stays mute. Audio never feeds back into the sim.
+//! Output goes to a native sink (Phase 56: WinMM `waveOut` on Windows, CoreAudio
+//! `AudioQueue` on macOS) or, on Linux, a `pw-cat` / `pacat` / `aplay` subprocess, all as
+//! raw S16 stereo; when none is available the engine silently stays mute. Audio never
+//! feeds back into the sim.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File};
@@ -1865,10 +1867,58 @@ impl AudioEngine {
     }
 }
 
-/// Raw S16LE stereo sink candidates, tried in order (stderr silenced).
-fn spawn_pcm_sink(skip: usize) -> Option<(usize, Child)> {
+/// Phase 56: a raw S16LE stereo output at [`OUTPUT_SAMPLE_RATE`].
+trait PcmSink: Send {
+    /// Queues interleaved S16LE stereo bytes; `false` when the sink broke.
+    fn write(&mut self, bytes: &[u8]) -> bool;
+    /// `false` once the sink died on its own (e.g. the player process exited).
+    fn alive(&mut self) -> bool {
+        true
+    }
+}
+
+/// A `pw-cat` / `pacat` / `aplay` child process fed through stdin.
+struct ChildSink(Option<Child>);
+
+impl PcmSink for ChildSink {
+    fn write(&mut self, bytes: &[u8]) -> bool {
+        self.0
+            .as_mut()
+            .and_then(|c| c.stdin.as_mut())
+            .is_some_and(|stdin| stdin.write_all(bytes).is_ok())
+    }
+
+    fn alive(&mut self) -> bool {
+        self.0.as_mut().is_some_and(|c| matches!(c.try_wait(), Ok(None)))
+    }
+}
+
+impl Drop for ChildSink {
+    fn drop(&mut self) {
+        if let Some(mut c) = self.0.take() {
+            drop(c.stdin.take());
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
+}
+
+/// Opens a native sink (`None` when the device is unavailable).
+type SinkOpener = fn() -> Option<Box<dyn PcmSink>>;
+
+#[cfg(windows)]
+const NATIVE_SINKS: &[SinkOpener] = &[native_sink::open_winmm];
+#[cfg(target_os = "macos")]
+const NATIVE_SINKS: &[SinkOpener] = &[native_sink::open_audio_queue];
+#[cfg(not(any(windows, target_os = "macos")))]
+const NATIVE_SINKS: &[SinkOpener] = &[];
+
+/// Sink candidates for this OS, tried in order: the native API first (Windows / macOS),
+/// then the Linux PCM players (stderr silenced).
+fn spawn_pcm_sink(skip: usize) -> Option<(usize, Box<dyn PcmSink>)> {
     let rate = OUTPUT_SAMPLE_RATE.to_string();
     let pa_rate = format!("--rate={rate}");
+    let natives = NATIVE_SINKS;
     let candidates: [(&str, Vec<&str>); 3] = [
         (
             "pw-cat",
@@ -1889,7 +1939,15 @@ fn spawn_pcm_sink(skip: usize) -> Option<(usize, Child)> {
             vec!["-q", "-t", "raw", "-f", "S16_LE", "-r", &rate, "-c", "2", "--buffer-time=60000"],
         ),
     ];
-    for (i, (cmd, args)) in candidates.iter().enumerate().skip(skip) {
+    let total = natives.len() + candidates.len();
+    for i in skip..total {
+        if let Some(open) = natives.get(i) {
+            if let Some(sink) = open() {
+                return Some((i, sink));
+            }
+            continue;
+        }
+        let (cmd, args) = &candidates[i - natives.len()];
         if let Ok(child) = Command::new(cmd)
             .args(args)
             .stdin(Stdio::piped())
@@ -1897,23 +1955,356 @@ fn spawn_pcm_sink(skip: usize) -> Option<(usize, Child)> {
             .stderr(Stdio::null())
             .spawn()
         {
-            return Some((i, child));
+            return Some((i, Box::new(ChildSink(Some(child)))));
         }
     }
     None
 }
 
-fn stop_child(mut c: Child) {
-    drop(c.stdin.take());
-    let _ = c.kill();
-    let _ = c.wait();
+/// Phase 56: native audio outputs through the OS APIs (plain FFI, no extra crates).
+#[cfg(any(windows, target_os = "macos"))]
+mod native_sink {
+    use super::{OUTPUT_SAMPLE_RATE, PcmSink};
+
+    /// ~20 ms blocks.
+    const BLOCK_BYTES: usize = (OUTPUT_SAMPLE_RATE as usize / 50) * 4;
+
+    #[cfg(windows)]
+    mod winmm {
+        use std::ffi::c_void;
+
+        pub type HWaveOut = *mut c_void;
+        pub const WAVE_MAPPER: u32 = 0xFFFF_FFFF;
+        pub const WAVE_FORMAT_PCM: u16 = 1;
+        pub const WHDR_DONE: u32 = 0x1;
+        pub const WHDR_PREPARED: u32 = 0x2;
+
+        #[repr(C, packed(2))]
+        pub struct WaveFormatEx {
+            pub format_tag: u16,
+            pub channels: u16,
+            pub samples_per_sec: u32,
+            pub avg_bytes_per_sec: u32,
+            pub block_align: u16,
+            pub bits_per_sample: u16,
+            pub cb_size: u16,
+        }
+
+        #[repr(C)]
+        pub struct WaveHdr {
+            pub data: *mut u8,
+            pub buffer_length: u32,
+            pub bytes_recorded: u32,
+            pub user: usize,
+            pub flags: u32,
+            pub loops: u32,
+            pub next: *mut WaveHdr,
+            pub reserved: usize,
+        }
+
+        #[link(name = "winmm")]
+        unsafe extern "system" {
+            pub fn waveOutOpen(out: *mut HWaveOut, device: u32, fmt: *const WaveFormatEx, cb: usize, inst: usize, flags: u32) -> u32;
+            pub fn waveOutPrepareHeader(h: HWaveOut, hdr: *mut WaveHdr, size: u32) -> u32;
+            pub fn waveOutUnprepareHeader(h: HWaveOut, hdr: *mut WaveHdr, size: u32) -> u32;
+            pub fn waveOutWrite(h: HWaveOut, hdr: *mut WaveHdr, size: u32) -> u32;
+            pub fn waveOutReset(h: HWaveOut) -> u32;
+            pub fn waveOutClose(h: HWaveOut) -> u32;
+        }
+    }
+
+    /// WinMM `waveOut` with a ring of fixed blocks (polled `WHDR_DONE`, no callbacks).
+    #[cfg(windows)]
+    struct WinMmSink {
+        handle: winmm::HWaveOut,
+        headers: Box<[winmm::WaveHdr]>,
+        buffers: Vec<Box<[u8]>>,
+        next: usize,
+        pending: Vec<u8>,
+    }
+
+    // The handle is only used from the audio worker thread that owns the sink.
+    #[cfg(windows)]
+    unsafe impl Send for WinMmSink {}
+
+    #[cfg(windows)]
+    pub fn open_winmm() -> Option<Box<dyn PcmSink>> {
+        use winmm::*;
+        const BLOCKS: usize = 8;
+        let fmt = WaveFormatEx {
+            format_tag: WAVE_FORMAT_PCM,
+            channels: 2,
+            samples_per_sec: OUTPUT_SAMPLE_RATE,
+            avg_bytes_per_sec: OUTPUT_SAMPLE_RATE * 4,
+            block_align: 4,
+            bits_per_sample: 16,
+            cb_size: 0,
+        };
+        let mut handle: HWaveOut = std::ptr::null_mut();
+        // SAFETY: valid out-pointer and format; CALLBACK_NULL (no callback is invoked).
+        if unsafe { waveOutOpen(&mut handle, WAVE_MAPPER, &fmt, 0, 0, 0) } != 0 || handle.is_null() {
+            return None;
+        }
+        let mut buffers: Vec<Box<[u8]>> = (0..BLOCKS).map(|_| vec![0u8; BLOCK_BYTES].into_boxed_slice()).collect();
+        let headers: Box<[WaveHdr]> = buffers
+            .iter_mut()
+            .map(|b| WaveHdr {
+                data: b.as_mut_ptr(),
+                buffer_length: BLOCK_BYTES as u32,
+                bytes_recorded: 0,
+                user: 0,
+                flags: WHDR_DONE,
+                loops: 0,
+                next: std::ptr::null_mut(),
+                reserved: 0,
+            })
+            .collect();
+        Some(Box::new(WinMmSink { handle, headers, buffers, next: 0, pending: Vec::with_capacity(BLOCK_BYTES * 2) }))
+    }
+
+    #[cfg(windows)]
+    impl WinMmSink {
+        fn submit(&mut self) -> bool {
+            use winmm::*;
+            let size = std::mem::size_of::<WaveHdr>() as u32;
+            let i = self.next;
+            // Wait (bounded) for the device to finish with this block.
+            let t0 = std::time::Instant::now();
+            // SAFETY: the header lives in `self.headers` (stable boxed slice); WinMM sets
+            // WHDR_DONE asynchronously, so read it volatilely.
+            while unsafe { std::ptr::read_volatile(&self.headers[i].flags) } & WHDR_DONE == 0 {
+                if t0.elapsed() > std::time::Duration::from_millis(500) {
+                    return false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            let hdr: *mut WaveHdr = &mut self.headers[i];
+            // SAFETY: `hdr` points into `self.headers`; the device no longer uses it (DONE).
+            unsafe {
+                if (*hdr).flags & WHDR_PREPARED != 0 {
+                    waveOutUnprepareHeader(self.handle, hdr, size);
+                }
+                self.buffers[i].copy_from_slice(&self.pending[..BLOCK_BYTES]);
+                (*hdr).data = self.buffers[i].as_mut_ptr();
+                (*hdr).buffer_length = BLOCK_BYTES as u32;
+                (*hdr).flags = 0;
+                if waveOutPrepareHeader(self.handle, hdr, size) != 0 || waveOutWrite(self.handle, hdr, size) != 0 {
+                    return false;
+                }
+            }
+            self.pending.drain(..BLOCK_BYTES);
+            self.next = (i + 1) % self.headers.len();
+            true
+        }
+    }
+
+    #[cfg(windows)]
+    impl PcmSink for WinMmSink {
+        fn write(&mut self, bytes: &[u8]) -> bool {
+            self.pending.extend_from_slice(bytes);
+            while self.pending.len() >= BLOCK_BYTES {
+                if !self.submit() {
+                    return false;
+                }
+            }
+            true
+        }
+    }
+
+    #[cfg(windows)]
+    impl Drop for WinMmSink {
+        fn drop(&mut self) {
+            use winmm::*;
+            let size = std::mem::size_of::<WaveHdr>() as u32;
+            // SAFETY: reset returns every queued block before the headers are unprepared.
+            unsafe {
+                waveOutReset(self.handle);
+                for h in self.headers.iter_mut() {
+                    if h.flags & WHDR_PREPARED != 0 {
+                        waveOutUnprepareHeader(self.handle, h, size);
+                    }
+                }
+                waveOutClose(self.handle);
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    mod coreaudio {
+        use std::ffi::c_void;
+
+        pub type AudioQueueRef = *mut c_void;
+        pub const K_AUDIO_FORMAT_LINEAR_PCM: u32 = u32::from_be_bytes(*b"lpcm");
+        /// `kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked`.
+        pub const PCM_FLAGS: u32 = 0x4 | 0x8;
+
+        #[repr(C)]
+        pub struct AudioStreamBasicDescription {
+            pub sample_rate: f64,
+            pub format_id: u32,
+            pub format_flags: u32,
+            pub bytes_per_packet: u32,
+            pub frames_per_packet: u32,
+            pub bytes_per_frame: u32,
+            pub channels_per_frame: u32,
+            pub bits_per_channel: u32,
+            pub reserved: u32,
+        }
+
+        #[repr(C)]
+        pub struct AudioQueueBuffer {
+            pub capacity: u32,
+            pub data: *mut c_void,
+            pub byte_size: u32,
+            pub user_data: *mut c_void,
+            pub packet_desc_capacity: u32,
+            pub packet_descs: *mut c_void,
+            pub packet_desc_count: u32,
+        }
+
+        pub type AudioQueueBufferRef = *mut AudioQueueBuffer;
+        pub type OutputCallback = unsafe extern "C" fn(*mut c_void, AudioQueueRef, AudioQueueBufferRef);
+
+        #[link(name = "AudioToolbox", kind = "framework")]
+        unsafe extern "C" {
+            pub fn AudioQueueNewOutput(
+                fmt: *const AudioStreamBasicDescription,
+                cb: OutputCallback,
+                user: *mut c_void,
+                run_loop: *const c_void,
+                run_loop_mode: *const c_void,
+                flags: u32,
+                out: *mut AudioQueueRef,
+            ) -> i32;
+            pub fn AudioQueueAllocateBuffer(q: AudioQueueRef, size: u32, out: *mut AudioQueueBufferRef) -> i32;
+            pub fn AudioQueueEnqueueBuffer(q: AudioQueueRef, buf: AudioQueueBufferRef, n: u32, descs: *const c_void) -> i32;
+            pub fn AudioQueueStart(q: AudioQueueRef, start: *const c_void) -> i32;
+            pub fn AudioQueueStop(q: AudioQueueRef, immediate: u8) -> i32;
+            pub fn AudioQueueDispose(q: AudioQueueRef, immediate: u8) -> i32;
+        }
+    }
+
+    /// Bytes shared between the writer and the AudioQueue callback thread.
+    #[cfg(target_os = "macos")]
+    type Ring = std::sync::Mutex<std::collections::VecDeque<u8>>;
+
+    /// CoreAudio `AudioQueue` (pull model): the callback drains a byte ring the worker
+    /// fills; an underrun plays silence.
+    #[cfg(target_os = "macos")]
+    struct AudioQueueSink {
+        queue: coreaudio::AudioQueueRef,
+        ring: *const Ring,
+    }
+
+    // The queue is driven by CoreAudio's own thread; the ring is a Mutex.
+    #[cfg(target_os = "macos")]
+    unsafe impl Send for AudioQueueSink {}
+
+    #[cfg(target_os = "macos")]
+    unsafe extern "C" fn aq_callback(user: *mut std::ffi::c_void, q: coreaudio::AudioQueueRef, buf: coreaudio::AudioQueueBufferRef) {
+        // SAFETY: `user` is the leaked-until-dispose ring; `buf` is a queue-owned buffer.
+        unsafe {
+            let ring = &*(user as *const Ring);
+            let cap = (*buf).capacity as usize;
+            let dst = std::slice::from_raw_parts_mut((*buf).data as *mut u8, cap);
+            let n = match ring.lock() {
+                Ok(mut r) => {
+                    let n = r.len().min(cap) & !3;
+                    for (d, s) in dst.iter_mut().zip(r.drain(..n)) {
+                        *d = s;
+                    }
+                    n
+                }
+                Err(_) => 0,
+            };
+            dst[n..].fill(0);
+            (*buf).byte_size = cap as u32;
+            coreaudio::AudioQueueEnqueueBuffer(q, buf, 0, std::ptr::null());
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn open_audio_queue() -> Option<Box<dyn PcmSink>> {
+        use coreaudio::*;
+        let fmt = AudioStreamBasicDescription {
+            sample_rate: f64::from(OUTPUT_SAMPLE_RATE),
+            format_id: K_AUDIO_FORMAT_LINEAR_PCM,
+            format_flags: PCM_FLAGS,
+            bytes_per_packet: 4,
+            frames_per_packet: 1,
+            bytes_per_frame: 4,
+            channels_per_frame: 2,
+            bits_per_channel: 16,
+            reserved: 0,
+        };
+        let ring: *const Ring = Box::into_raw(Box::new(std::sync::Mutex::new(std::collections::VecDeque::new())));
+        let mut queue: AudioQueueRef = std::ptr::null_mut();
+        // SAFETY: valid format / out-pointer; a null run loop makes CoreAudio call back on
+        // its own thread. `ring` stays alive until the queue is disposed in `drop`.
+        unsafe {
+            if AudioQueueNewOutput(&fmt, aq_callback, ring as *mut _, std::ptr::null(), std::ptr::null(), 0, &mut queue) != 0
+                || queue.is_null()
+            {
+                drop(Box::from_raw(ring as *mut Ring));
+                return None;
+            }
+            for _ in 0..3 {
+                let mut buf: AudioQueueBufferRef = std::ptr::null_mut();
+                if AudioQueueAllocateBuffer(queue, BLOCK_BYTES as u32, &mut buf) != 0 {
+                    AudioQueueDispose(queue, 1);
+                    drop(Box::from_raw(ring as *mut Ring));
+                    return None;
+                }
+                aq_callback(ring as *mut _, queue, buf);
+            }
+            if AudioQueueStart(queue, std::ptr::null()) != 0 {
+                AudioQueueDispose(queue, 1);
+                drop(Box::from_raw(ring as *mut Ring));
+                return None;
+            }
+        }
+        Some(Box::new(AudioQueueSink { queue, ring }))
+    }
+
+    #[cfg(target_os = "macos")]
+    impl PcmSink for AudioQueueSink {
+        fn write(&mut self, bytes: &[u8]) -> bool {
+            // SAFETY: the ring outlives the sink (freed in `drop` after disposal).
+            let ring = unsafe { &*self.ring };
+            match ring.lock() {
+                Ok(mut r) => {
+                    // Never buffer more than ~250 ms (drop the oldest on a stall).
+                    let max = OUTPUT_SAMPLE_RATE as usize;
+                    r.extend(bytes.iter().copied());
+                    if r.len() > max {
+                        let extra = (r.len() - max) & !3;
+                        r.drain(..extra);
+                    }
+                    true
+                }
+                Err(_) => false,
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Drop for AudioQueueSink {
+        fn drop(&mut self) {
+            // SAFETY: disposing synchronously stops callbacks before the ring is freed.
+            unsafe {
+                coreaudio::AudioQueueStop(self.queue, 1);
+                coreaudio::AudioQueueDispose(self.queue, 1);
+                drop(Box::from_raw(self.ring as *mut Ring));
+            }
+        }
+    }
 }
 
 /// Realtime loop: keeps the sink ~`SINK_AHEAD_MS` ahead of the wall clock in 5 ms
 /// quanta (low latency without a native audio API). Falls back through the sink list
 /// and exits quietly (output unavailable) when none works.
 fn run_audio_worker(mixer: Arc<Mutex<Mixer>>, stop: Arc<AtomicBool>, output_ok: Arc<AtomicBool>) {
-    let Some((mut which, mut child)) = spawn_pcm_sink(0) else {
+    let Some((mut which, mut sink)) = spawn_pcm_sink(0) else {
         output_ok.store(false, Ordering::Relaxed);
         return;
     };
@@ -1924,7 +2315,7 @@ fn run_audio_worker(mixer: Arc<Mutex<Mixer>>, stop: Arc<AtomicBool>, output_ok: 
     let mut mixbuf = vec![0.0f32; MIX_CHUNK_FRAMES * 2];
     let mut bytes = Vec::with_capacity(MIX_CHUNK_FRAMES * 4);
     while !stop.load(Ordering::Relaxed) {
-        let mut failed = matches!(child.try_wait(), Ok(Some(_)) | Err(_));
+        let mut failed = !sink.alive();
         let now = (start.elapsed().as_secs_f64() * rate as f64) as u64;
         if written + rate / 4 < now {
             // Stalled (suspend / debugger): resync instead of bursting.
@@ -1941,18 +2332,15 @@ fn run_audio_worker(mixer: Arc<Mutex<Mixer>>, stop: Arc<AtomicBool>, output_ok: 
             for &s in &mixbuf {
                 bytes.extend_from_slice(&f32_to_i16(s).to_le_bytes());
             }
-            failed = child
-                .stdin
-                .as_mut()
-                .is_none_or(|stdin| stdin.write_all(&bytes).is_err());
+            failed = !sink.write(&bytes);
             written += MIX_CHUNK_FRAMES as u64;
         }
         if failed {
-            stop_child(child);
+            drop(sink);
             match spawn_pcm_sink(which + 1) {
                 Some((w, c)) => {
                     which = w;
-                    child = c;
+                    sink = c;
                     start = Instant::now();
                     written = 0;
                     continue;
@@ -1968,7 +2356,7 @@ fn run_audio_worker(mixer: Arc<Mutex<Mixer>>, stop: Arc<AtomicBool>, output_ok: 
         }
         thread::sleep(Duration::from_millis(2));
     }
-    stop_child(child);
+    drop(sink);
 }
 
 #[cfg(test)]

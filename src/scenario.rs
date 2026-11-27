@@ -131,22 +131,12 @@ pub fn list_maps(game_dir: &Path) -> Result<Vec<MapFiles>, String> {
 
 /// `$XDG_DATA_HOME` (absolute) or `~/.local/share`.
 pub fn xdg_data_home() -> PathBuf {
-    std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
-        .unwrap_or_else(|| PathBuf::from("."))
+    crate::platform::data_home()
 }
 
 /// Extraction cache for archived user maps: `$XDG_CACHE_HOME/farust/maps` (`~/.cache/...`).
 pub fn map_cache_dir() -> PathBuf {
-    std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
-        .unwrap_or_else(|| std::env::temp_dir())
-        .join("farust")
-        .join("maps")
+    crate::platform::cache_home().join("farust").join("maps")
 }
 
 const FA_USER_MAPS: &str =
@@ -160,8 +150,12 @@ pub fn user_map_dirs(game_dir: &Path) -> Vec<(MapSource, PathBuf)> {
     if let Some(steamapps) = game_dir.parent().and_then(Path::parent) {
         out.push((MapSource::FaUser, steamapps.join(FA_USER_MAPS)));
     }
-    if let Some(home) = std::env::var_os("HOME") {
-        out.push((MapSource::FaUser, PathBuf::from(home).join(".local/share/Steam/steamapps").join(FA_USER_MAPS)));
+    // Phase 56: native Windows installs keep user maps in Documents/My Games.
+    if let Some(docs) = crate::platform::fa_documents_dir() {
+        out.push((MapSource::FaUser, docs.join("Maps")));
+    }
+    for root in crate::platform::steam_roots() {
+        out.push((MapSource::FaUser, root.join("steamapps").join(FA_USER_MAPS)));
     }
     out.push((MapSource::Farust, xdg_data_home().join("farust").join("maps")));
     if let Some(d) = std::env::var_os("FARUST_MAPS_DIR") {

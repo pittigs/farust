@@ -403,8 +403,8 @@ pub fn mods_dir() -> PathBuf {
 /// 1. `$FARUST_MODS_CACHE_DIR`
 /// 2. `$FARUST_MODS_DIR/.downloaded` (when `FARUST_MODS_DIR` is overridden, keeping test/CLI
 ///    sandboxes isolated from the user's global cache)
-/// 3. `$XDG_CACHE_HOME/farust/mods` (fallback `~/.cache/farust/mods`, else
-///    `$XDG_DATA_HOME/farust/mods_cache`).
+/// 3. `<cache>/farust/mods` with the per-OS cache base of [`crate::platform::cache_home`]
+///    (`$XDG_CACHE_HOME` or `~/.cache` on Linux).
 pub fn downloaded_mods_dir() -> PathBuf {
     if let Some(d) = std::env::var_os("FARUST_MODS_CACHE_DIR").filter(|v| !v.is_empty()) {
         return PathBuf::from(d);
@@ -412,13 +412,8 @@ pub fn downloaded_mods_dir() -> PathBuf {
     if let Some(d) = std::env::var_os("FARUST_MODS_DIR").filter(|v| !v.is_empty()) {
         return PathBuf::from(d).join(".downloaded");
     }
-    if let Some(c) = std::env::var_os("XDG_CACHE_HOME").filter(|v| !v.is_empty()) {
-        return PathBuf::from(c).join("farust").join("mods");
-    }
-    if let Some(h) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
-        return PathBuf::from(h).join(".cache").join("farust").join("mods");
-    }
-    crate::scenario::xdg_data_home().join("farust").join("mods_cache")
+    // Phase 56: `$XDG_CACHE_HOME` / `~/.cache` on Linux, `%LOCALAPPDATA%`, `~/Library/Caches`.
+    crate::platform::cache_home().join("farust").join("mods")
 }
 
 /// Every mod directory in [`mods_dir`], sorted by folder name (hidden `.` dirs skipped).

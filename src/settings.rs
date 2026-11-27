@@ -512,23 +512,16 @@ impl Settings {
     }
 }
 
-fn env_dir(var: &str) -> Option<PathBuf> {
-    std::env::var_os(var).filter(|v| !v.is_empty()).map(PathBuf::from)
-}
-
-/// `$XDG_CONFIG_HOME/farust` or `~/.config/farust`.
+/// `$XDG_CONFIG_HOME/farust` or `~/.config/farust` (Windows `%APPDATA%\farust`, macOS
+/// `~/Library/Application Support/farust`; see [`crate::platform::config_home`]).
 pub fn config_dir() -> Option<PathBuf> {
-    env_dir("XDG_CONFIG_HOME")
-        .or_else(|| env_dir("HOME").map(|h| h.join(".config")))
-        .map(|d| d.join("farust"))
+    crate::platform::config_home().map(|d| d.join("farust"))
 }
 
-/// `$XDG_DATA_HOME/farust` or `~/.local/share/farust`.
+/// `$XDG_DATA_HOME/farust` or `~/.local/share/farust` (per-OS, see [`crate::platform::data_home`]).
 #[allow(dead_code)]
 pub fn data_dir() -> Option<PathBuf> {
-    env_dir("XDG_DATA_HOME")
-        .or_else(|| env_dir("HOME").map(|h| h.join(".local").join("share")))
-        .map(|d| d.join("farust"))
+    Some(crate::platform::data_home().join("farust"))
 }
 
 pub fn settings_path() -> Option<PathBuf> {

@@ -9,4 +9,4 @@ png = "0.17"
 pollster = "0.4"
 wgpu = "24"
 winit = "0.30"
-zip = "2"
+zip = { version = "2", default-features = false, features = ["deflate"] }

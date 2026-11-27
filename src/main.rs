@@ -24,6 +24,7 @@ mod loc;
 mod menu;
 mod mission;
 mod mods;
+mod platform;
 mod net;
 mod net_lobby;
 mod pathfinding;
@@ -75,6 +76,7 @@ fn print_usage() {
     eprintln!("  farust maps [GAME_DIR] [--limit N] [--check]      (stock + user maps, with source)");
     eprintln!("  farust roster [GAME_DIR] [--faction F] [--json]   (data-driven unit roster & coverage)");
     eprintln!("  farust loc [--check | <KEY> | --unit <ID>] [--lang CODE] [GAME_DIR] (localization tables)");
+    eprintln!("  farust platform                                   (OS dirs + Forged Alliance install discovery)");
     eprintln!("  farust mods [enable <SPEC> | disable <SPEC> | conflicts] (installed & persisted blueprint mods)");
     eprintln!("  global: --mod <DIR|NAME> (repeatable) enables a blueprint mod for any subcommand");
     eprintln!("  farust map <NAME> [GAME_DIR]");
@@ -309,6 +311,7 @@ fn run(args: &[String], connect_lobby: Option<&str>) -> Result<(), String> {
         "roster" => roster::cmd_roster(args),
         "loc" => loc::cmd_loc(args),
         "mods" => mods::cmd_mods(args),
+        "platform" => platform::cmd_platform(),
         "map" => cmd_map(args),
         "mission" => mission::cmd_mission(args),
         "map-roundtrip" => map_author::cmd_map_roundtrip(args),
