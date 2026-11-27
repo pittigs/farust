@@ -1650,7 +1650,8 @@ impl Catalog {
     /// apply the process-wide enabled mods ([`mods::active`]) and add the Phase 24
     /// data-driven roster.
     pub fn load(game_dir: &Path) -> Result<Self, String> {
-        Self::load_with_mods(game_dir, mods::active()?)
+        let active = mods::active()?;
+        Self::load_with_mods(game_dir, &active)
     }
 
     /// Every `*_unit.bp` in `units.scd`, keyed by upper-case blueprint id.

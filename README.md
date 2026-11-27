@@ -317,3 +317,18 @@ cargo run --release -- replay upload match.farust-replay --rendezvous 127.0.0.1:
 cargo run --release -- replay download XXXX-XXXX --rendezvous 127.0.0.1:15050
 cargo run --release -- menu --screen replays
 ```
+
+## Step 51 — done: mod manager & lobby mod sync
+
+- **Mod manager** (main menu → MODS, `src/menu.rs`, `src/mods.rs`): enable/disable mods
+  (persisted in `settings.ini`), blueprint/load conflict detection.
+- **Automatic mod transfer** (`src/net.rs`): peers missing a host mod receive it as a
+  hash-verified bundle into the per-user cache before the match starts.
+- **Data-driven weapons/abilities**: see `examples/mods/heavy_strikers`.
+
+```sh
+cargo run --release -- mods enable examples/mods/heavy_strikers
+cargo run --release -- mods conflicts
+cargo run --release -- host 127.0.0.1:15000 SCMP_001 --players 2 --mod examples/mods/heavy_strikers
+FARUST_MODS_DIR=/tmp/empty-mods cargo run --release -- join 127.0.0.1:15000   # receives the mod
+```

@@ -589,7 +589,7 @@ bumps `SIM_VERSION`, re-baselines golden hashes deliberately, and keeps
   port prediction (falls back to TCP relay).
 
 ### Phase 45 — Reconnect & late join (done, direct TCP hosts)
-- Direct TCP hosts keep listening for the whole match (protocol v16). A peer that connects
+- Direct TCP hosts keep listening for the whole match (protocol v17). A peer that connects
   with `MSG_REJOIN` receives the handshake (`join_turn`) plus every turn bundle so far and
   re-simulates them (the "snapshot" is the deterministic turn history; every re-simulated
   turn is still hash-verified against the recorded hashes, including its own old ones).
@@ -699,11 +699,30 @@ bumps `SIM_VERSION`, re-baselines golden hashes deliberately, and keeps
   272/272 tests pass; golden hashes unchanged (`sim-run` `35db8f2bd7a6faf2`,
   `skirmish SCMP_001` `192e89b083b978cb`). Done.
 
-### Phase 51 — Mod manager & lobby mod sync (planned)
-- In-game mod manager (enable/disable, conflicts), automatic mod transfer
-  between lobby peers with hash verification, mod-defined weapons/abilities
-  as data.
-- Exit: a client missing the host's mod receives it and the match starts.
+### Phase 51 — Mod manager & lobby mod sync (done)
+- Mod manager (main menu → MODS; `farust mods [enable SPEC | disable SPEC | conflicts]`):
+  discovered mods with name/uid/version/author/description/blueprint count, enable/disable
+  persisted as `mods=` in `settings.ini`, conflicts shown (two enabled mods overriding the
+  same blueprint, or a mod that fails to load).
+- Lobby/handshake mod sync (protocol v16, now v17 together with Phase 45): the handshake
+  carries the host's mod identities; a peer missing one requests it, the host streams a
+  `FARMD1` bundle in 512 KiB chunks (≤ 32 MiB / 4096 files per mod, relative paths only,
+  no `..`), the client verifies the content hash against the host identity before
+  installing it into the per-user cache (`$FARUST_MODS_CACHE_DIR`, else
+  `$FARUST_MODS_DIR/.downloaded`, else `~/.cache/farust/mods`, never the game install) and
+  activates it for the match. A hash mismatch aborts with an error. Works for direct,
+  invite-code, UDP and menu-lobby hosts.
+- Mod weapons/abilities as data: blueprint overrides of damage, range, rate of fire,
+  muzzle velocity, splash, EMP stun, shields and intel flow into the catalog; example mod
+  `examples/mods/heavy_strikers` (UEF Striker override).
+- Exit met: `host … --mod examples/mods/heavy_strikers` with a client whose mods dir is
+  empty → client logs `synced 1 mod(s) from host: Heavy Strikers v1 … #ce017db6d0b58146`,
+  both peers end 6000 ticks on `9d122458cf26b109` (without the mod: `0b0fd8b5080e4fc7`).
+  Tests: `loopback_mod_sync_transfers_mod_and_matches_sim_hash`, bundle path safety,
+  hash-mismatch rejection, settings persistence, conflict detection,
+  `mod_weapon_and_ability_override_changes_sim_outcome`.
+- Built by an Antigravity delegate that ran out of quota mid-way; finished here (duplicate
+  menu block removed, test fixtures fixed, merged with Phase 45 → protocol v17).
 
 ### Arc F — AI III (52–53)
 

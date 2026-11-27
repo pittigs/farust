@@ -1,0 +1,32 @@
+UnitBlueprint {
+    Merge = true,
+    Defense = {
+        MaxHealth = 450,
+        Shield = {
+            ShieldMaxHealth = 150,
+            ShieldSize = 4,
+            ShieldRegenRate = 15,
+        },
+    },
+    Intel = {
+        RadarStealth = true,
+        VisionRadius = 26,
+    },
+    Weapon = {
+        {
+            Damage = 60,
+            MaxRadius = 30,
+            RateOfFire = 1.5,
+            MuzzleVelocity = 40,
+            DamageRadius = 2.5,
+            Buffs = {
+                {
+                    BuffType = 'STUN',
+                    Duration = 1.0,
+                    Radius = 2.0,
+                    Add = { OnImpact = true },
+                },
+            },
+        },
+    },
+}

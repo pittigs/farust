@@ -79,7 +79,9 @@ const ADAPTIVE_DOWN_HYSTERESIS: u8 = 2;
 /// v15 (Phase 53): sim rules v10 (pings as commands).
 /// v16 (Phase 45): rejoin & late join (`MSG_REJOIN`, handshake `join_turn`, turn history
 /// transfer, `NetControl::Rejoined`).
-pub const PROTOCOL_VERSION: u32 = 16;
+/// v16 (Phase 51): automatic lobby/handshake mod sync with hash verification.
+/// v17: both of the above (Phase 45 rejoin + Phase 51 mod sync).
+pub const PROTOCOL_VERSION: u32 = 17;
 /// The host's army (star-topology relay); only it may change the game speed.
 pub const HOST_ARMY: ArmyId = 0;
 /// Sender id of host-generated control messages (`Dropped`).
@@ -90,16 +92,20 @@ pub const MAX_PAUSES_PER_PLAYER: u8 = 3;
 const DESYNC_EXTRA_TURNS: u64 = 3;
 const MAX_CONTROLS: usize = 1024;
 const MAX_FRAME_BYTES: usize = 2 * 1024 * 1024;
+const MOD_CHUNK_BYTES: usize = 512 * 1024;
 const NET_TIMEOUT: Duration = Duration::from_secs(60);
 const HISTORY_TURNS: usize = 4;
 const MSG_HANDSHAKE: u8 = 1;
 const MSG_TURN: u8 = 2;
 const MSG_TURN_BUNDLE: u8 = 3;
-/// Phase 45: first frame of a peer that rejoins a running match (`[4, version u32, army u8]`,
+const MSG_MOD_SYNC_REQ: u8 = 4;
+const MSG_MOD_CHUNK: u8 = 5;
+const MSG_MOD_SYNC_ACK: u8 = 6;
+/// Phase 45: first frame of a peer that rejoins a running match (`[7, version u32, army u8]`,
 /// army [`REJOIN_OBSERVER`] = join as a new live observer).
-const MSG_REJOIN: u8 = 4;
-/// Phase 45: precedes the turn history sent to a rejoining peer (`[5, count u64]`).
-const MSG_HISTORY: u8 = 5;
+const MSG_REJOIN: u8 = 7;
+/// Phase 45: precedes the turn history sent to a rejoining peer (`[8, count u64]`).
+const MSG_HISTORY: u8 = 8;
 /// Phase 45: `--rejoin observer` request byte.
 pub const REJOIN_OBSERVER: ArmyId = 255;
 /// Most turn bundles a rejoining peer accepts as history (~10 h at 3-tick turns).
@@ -123,6 +129,8 @@ pub struct Handshake {
     /// Phase 45: first turn this peer sends packets for (0 = from the start). A rejoining
     /// peer re-simulates the history before it and only listens for those turns.
     pub join_turn: u64,
+    /// Phase 24/51: host-authoritative enabled mod identities (synced automatically in v16).
+    pub mods: Vec<crate::mods::ModIdentity>,
 }
 
 /// Phase 38: first army id given to live observers (they send empty turns, so their
@@ -305,9 +313,9 @@ fn encode_handshake(h: &Handshake) -> Vec<u8> {
         out.extend_from_slice(&s.start.1.to_le_bytes());
         out.push(s.team);
     }
-    // Protocol v4 (Phase 24): enabled mod identities; peers must match exactly.
-    crate::mods::encode_identities(&mut out, &crate::mods::active_identities());
-    // Protocol v16 (Phase 45): first turn the receiver submits packets for.
+    // Protocol v4/v16 (Phase 24/51): host-authoritative mod identities (synced on mismatch).
+    crate::mods::encode_identities(&mut out, &h.mods);
+    // Protocol v17 (Phase 45): first turn the receiver submits packets for.
     out.extend_from_slice(&h.join_turn.to_le_bytes());
     out
 }
@@ -348,8 +356,7 @@ fn decode_handshake(data: &[u8]) -> Result<Handshake, String> {
             team,
         });
     }
-    let host_mods = crate::mods::decode_identities(data, &mut pos)?;
-    crate::mods::check_match(&host_mods, &crate::mods::active_identities(), "the host")?;
+    let mods = crate::mods::decode_identities(data, &mut pos)?;
     let join_turn = read_u64(data, &mut pos)?;
     if player_count < 2 || player_count > setups.len() {
         return Err(format!(
@@ -368,7 +375,238 @@ fn decode_handshake(data: &[u8]) -> Result<Handshake, String> {
         input_delay,
         tick_limit,
         assigned_army,
+        mods,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Phase 51: Handshake mod sync wire codecs & transfer
+// ---------------------------------------------------------------------------
+
+fn encode_mod_sync_req(indices: &[u32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(5 + indices.len() * 4);
+    out.push(MSG_MOD_SYNC_REQ);
+    out.extend_from_slice(&(indices.len() as u32).to_le_bytes());
+    for &i in indices {
+        out.extend_from_slice(&i.to_le_bytes());
+    }
+    out
+}
+
+fn decode_mod_sync_req(data: &[u8]) -> Result<Vec<u32>, String> {
+    let mut pos = 0;
+    if read_u8(data, &mut pos)? != MSG_MOD_SYNC_REQ {
+        return Err("expected mod sync request message".to_string());
+    }
+    let n = read_u32(data, &mut pos)? as usize;
+    if n > 256 {
+        return Err(format!("mod sync request lists {n} mods (max 256)"));
+    }
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        out.push(read_u32(data, &mut pos)?);
+    }
+    if pos != data.len() {
+        return Err(format!("mod sync request has {} trailing bytes", data.len() - pos));
+    }
+    Ok(out)
+}
+
+fn encode_mod_chunk(mod_idx: u32, total_len: u32, offset: u32, chunk: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(13 + chunk.len());
+    out.push(MSG_MOD_CHUNK);
+    out.extend_from_slice(&mod_idx.to_le_bytes());
+    out.extend_from_slice(&total_len.to_le_bytes());
+    out.extend_from_slice(&offset.to_le_bytes());
+    out.extend_from_slice(chunk);
+    out
+}
+
+fn decode_mod_chunk(data: &[u8]) -> Result<(u32, u32, u32, &[u8]), String> {
+    let mut pos = 0;
+    if read_u8(data, &mut pos)? != MSG_MOD_CHUNK {
+        return Err("expected mod bundle chunk message".to_string());
+    }
+    let mod_idx = read_u32(data, &mut pos)?;
+    let total_len = read_u32(data, &mut pos)?;
+    let offset = read_u32(data, &mut pos)?;
+    Ok((mod_idx, total_len, offset, &data[pos..]))
+}
+
+fn encode_mod_sync_ack(ok: bool, err: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(6 + err.len());
+    out.push(MSG_MOD_SYNC_ACK);
+    out.push(u8::from(ok));
+    write_str(&mut out, err);
+    out
+}
+
+fn decode_mod_sync_ack(data: &[u8]) -> Result<Result<(), String>, String> {
+    let mut pos = 0;
+    if read_u8(data, &mut pos)? != MSG_MOD_SYNC_ACK {
+        return Err("expected mod sync ack message".to_string());
+    }
+    let ok = read_u8(data, &mut pos)? != 0;
+    let err = read_str(data, &mut pos)?;
+    if pos != data.len() {
+        return Err(format!("mod sync ack has {} trailing bytes", data.len() - pos));
+    }
+    if ok { Ok(Ok(())) } else { Ok(Err(err)) }
+}
+
+/// Host side of the v16 handshake: sends `Handshake` (carrying `host_mods` identities),
+/// reads the peer's missing-mod request, streams each requested bundle in 512 KiB chunks,
+/// and waits for the peer's verified acknowledgement.
+fn host_send_handshake_and_sync(
+    stream: &mut PeerStream,
+    hs: &Handshake,
+    host_mods: &[crate::mods::Mod],
+) -> Result<(), String> {
+    let mut client_hs = hs.clone();
+    client_hs.mods = host_mods.iter().map(crate::mods::Mod::identity).collect();
+    stream.write_frame(&encode_handshake(&client_hs))?;
+    let req_raw = stream.read_frame().map_err(|e| format!("mod sync request read failed: {e}"))?;
+    let missing = decode_mod_sync_req(&req_raw)?;
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let mut sent = vec![false; host_mods.len()];
+    for idx in missing {
+        let i = idx as usize;
+        if i >= host_mods.len() {
+            return Err(format!("peer requested invalid mod index {i} (host has {})", host_mods.len()));
+        }
+        if sent[i] {
+            return Err(format!("peer requested duplicate mod index {i}"));
+        }
+        sent[i] = true;
+        let bundle = crate::mods::encode_mod_bundle(&host_mods[i])?;
+        let total = u32::try_from(bundle.len()).map_err(|_| "mod bundle exceeds u32 length".to_string())?;
+        let mut offset = 0usize;
+        while offset < bundle.len() {
+            let end = (offset + MOD_CHUNK_BYTES).min(bundle.len());
+            stream.write_frame(&encode_mod_chunk(idx, total, offset as u32, &bundle[offset..end]))?;
+            offset = end;
+        }
+    }
+    let ack_raw = stream.read_frame().map_err(|e| format!("mod sync ack read failed: {e}"))?;
+    match decode_mod_sync_ack(&ack_raw)? {
+        Ok(()) => Ok(()),
+        Err(reason) => Err(format!("peer rejected mod sync: {reason}")),
+    }
+}
+
+/// Client side of the v16 handshake: given the already-read `MSG_HANDSHAKE` frame, requests
+/// any missing host mods, verifies their content hashes against `hs.mods`, installs them into
+/// `cache_dir`, and returns `(Handshake, synced_mods, downloaded_count)`.
+fn client_finish_handshake_and_sync(
+    stream: &mut PeerStream,
+    first_frame: &[u8],
+    local_mods: &[crate::mods::Mod],
+    cache_dir: &Path,
+    search_mods_dir: bool,
+) -> Result<(Handshake, Vec<crate::mods::Mod>, usize), String> {
+    let hs = decode_handshake(first_frame)?;
+    let mut resolved: Vec<Option<crate::mods::Mod>> = vec![None; hs.mods.len()];
+    let mut missing: Vec<u32> = Vec::new();
+    for (i, want) in hs.mods.iter().enumerate() {
+        if let Some(found) = crate::mods::find_local_mod(want, local_mods, cache_dir, search_mods_dir) {
+            resolved[i] = Some(found);
+        } else {
+            missing.push(i as u32);
+        }
+    }
+    stream.write_frame(&encode_mod_sync_req(&missing))?;
+    let downloaded = missing.len();
+    if !missing.is_empty() {
+        for idx in missing {
+            let i = idx as usize;
+            let expected = &hs.mods[i];
+            let mut buf: Vec<u8> = Vec::new();
+            let mut expected_total: Option<usize> = None;
+            loop {
+                let raw = match stream.read_frame() {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let msg = format!("mod '{}' download failed: {e}", expected.name);
+                        let _ = stream.write_frame(&encode_mod_sync_ack(false, &msg));
+                        return Err(msg);
+                    }
+                };
+                let (c_idx, total_len, offset, payload) = match decode_mod_chunk(&raw) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let _ = stream.write_frame(&encode_mod_sync_ack(false, &e));
+                        return Err(e);
+                    }
+                };
+                if c_idx != idx {
+                    let msg = format!("unexpected mod chunk index {c_idx} (expected {idx})");
+                    let _ = stream.write_frame(&encode_mod_sync_ack(false, &msg));
+                    return Err(msg);
+                }
+                let total = total_len as usize;
+                if total == 0 || total > crate::mods::MAX_MOD_BUNDLE_BYTES {
+                    let msg = format!(
+                        "mod '{}' size {total} exceeds {} MiB limit",
+                        expected.name,
+                        crate::mods::MAX_MOD_BUNDLE_BYTES / (1024 * 1024)
+                    );
+                    let _ = stream.write_frame(&encode_mod_sync_ack(false, &msg));
+                    return Err(msg);
+                }
+                if let Some(prev) = expected_total {
+                    if prev != total {
+                        let msg = format!("mod '{}' inconsistent bundle size {total} != {prev}", expected.name);
+                        let _ = stream.write_frame(&encode_mod_sync_ack(false, &msg));
+                        return Err(msg);
+                    }
+                } else {
+                    expected_total = Some(total);
+                    buf.reserve(total.min(1024 * 1024));
+                }
+                if offset as usize != buf.len() || buf.len() + payload.len() > total {
+                    let msg = format!("mod '{}' invalid chunk offset {offset} / len {}", expected.name, payload.len());
+                    let _ = stream.write_frame(&encode_mod_sync_ack(false, &msg));
+                    return Err(msg);
+                }
+                buf.extend_from_slice(payload);
+                if buf.len() == total {
+                    break;
+                }
+            }
+            let mut decoded = match crate::mods::decode_mod_bundle(&buf, expected) {
+                Ok(m) => m,
+                Err(e) => {
+                    let _ = stream.write_frame(&encode_mod_sync_ack(false, &e));
+                    return Err(e);
+                }
+            };
+            match crate::mods::install_cached_mod(&decoded, cache_dir) {
+                Ok(dir) => {
+                    decoded.dir = Some(dir);
+                    resolved[i] = Some(decoded);
+                }
+                Err(e) => {
+                    let _ = stream.write_frame(&encode_mod_sync_ack(false, &e));
+                    return Err(e);
+                }
+            }
+        }
+        stream.write_frame(&encode_mod_sync_ack(true, ""))?;
+    }
+    let synced: Vec<crate::mods::Mod> = resolved.into_iter().flatten().collect();
+    Ok((hs, synced, downloaded))
+}
+
+fn activate_synced_mods(hs: &Handshake, synced: Vec<crate::mods::Mod>, downloaded: usize) {
+    if downloaded > 0 {
+        let names: Vec<String> = synced.iter().map(|m| m.identity().to_string()).collect();
+        println!("synced {downloaded} mod(s) from host: {}", names.join(", "));
+    }
+    if !hs.mods.is_empty() || crate::mods::active_identities() != hs.mods {
+        crate::mods::set_active_mods(synced);
+    }
 }
 
 fn encode_turn(p: &TurnPacket) -> Vec<u8> {
@@ -945,6 +1183,7 @@ impl LockstepHost {
                 hs.setups.len()
             ));
         }
+        let host_mods = crate::mods::active()?;
         mux.set_accepting(true);
         let mut clients = Vec::with_capacity(n - 1 + hs.observers);
         for slot in 1..n + hs.observers {
@@ -956,9 +1195,10 @@ impl LockstepHost {
             let army = slot_army(slot, n);
             let mut client_hs = hs.clone();
             client_hs.assigned_army = army;
-            ch.write_frame(&encode_handshake(&client_hs))?;
+            let mut ps = PeerStream::Udp(ch);
+            host_send_handshake_and_sync(&mut ps, &client_hs, &host_mods)?;
             on_join(army, peer);
-            clients.push((army, PeerStream::Udp(ch)));
+            clients.push((army, ps));
         }
         mux.set_accepting(false);
         Ok(Self {
@@ -1079,6 +1319,7 @@ impl LockstepHost {
         let code = reg.code.clone();
         println!("Invite code: {code} (rendezvous {rendezvous_addr}, UDP punch + TCP relay)");
 
+        let host_mods = crate::mods::active()?;
         let mut clients = Vec::with_capacity(n - 1 + hs.observers);
         for slot in 1..n + hs.observers {
             let (mut stream, peer, via) = rx
@@ -1086,12 +1327,13 @@ impl LockstepHost {
                 .map_err(|_| format!("accept slot {slot} failed: listener closed"))?;
             if let PeerStream::Tcp(s) = &stream {
                 let _ = s.set_nodelay(true);
+                let _ = s.set_write_timeout(Some(NET_TIMEOUT));
             }
             stream.set_read_timeout(Some(NET_TIMEOUT));
             let army = slot_army(slot, n);
             let mut client_hs = hs.clone();
             client_hs.assigned_army = army;
-            stream.write_frame(&encode_handshake(&client_hs))?;
+            host_send_handshake_and_sync(&mut stream, &client_hs, &host_mods)?;
             on_join(army, peer, via);
             clients.push((army, stream));
         }
@@ -1182,19 +1424,22 @@ impl LockstepHost {
         let code = reg.code.clone();
         println!("Invite code: {code} (rendezvous {rendezvous_addr})");
 
+        let host_mods = crate::mods::active()?;
         let mut clients = Vec::with_capacity(n - 1 + hs.observers);
         for slot in 1..n + hs.observers {
-            let (mut stream, peer, relayed) = rx
+            let (stream, peer, relayed) = rx
                 .recv()
                 .map_err(|_| format!("accept slot {slot} failed: listener closed"))?;
             let _ = stream.set_nodelay(true);
             let _ = stream.set_read_timeout(Some(NET_TIMEOUT));
+            let _ = stream.set_write_timeout(Some(NET_TIMEOUT));
             let army = slot_army(slot, n);
             let mut client_hs = hs.clone();
             client_hs.assigned_army = army;
-            write_frame(&mut stream, &encode_handshake(&client_hs))?;
+            let mut ps = PeerStream::Tcp(stream);
+            host_send_handshake_and_sync(&mut ps, &client_hs, &host_mods)?;
             on_join(army, peer, relayed);
-            clients.push((army, PeerStream::Tcp(stream)));
+            clients.push((army, ps));
         }
 
         reg.close();
@@ -1219,6 +1464,16 @@ impl LockstepHost {
         hs: &Handshake,
         on_join: &mut dyn FnMut(ArmyId, SocketAddr),
     ) -> Result<Self, String> {
+        let host_mods = crate::mods::active()?;
+        Self::accept_players_with_mods(listener, hs, &host_mods, on_join)
+    }
+
+    pub fn accept_players_with_mods(
+        listener: TcpListener,
+        hs: &Handshake,
+        host_mods: &[crate::mods::Mod],
+        on_join: &mut dyn FnMut(ArmyId, SocketAddr),
+    ) -> Result<Self, String> {
         let n = hs.player_count;
         if !(2..=8).contains(&n) {
             return Err(format!("player count {n} out of range 2..=8"));
@@ -1231,17 +1486,19 @@ impl LockstepHost {
         }
         let mut clients = Vec::with_capacity(n - 1 + hs.observers);
         for slot in 1..n + hs.observers {
-            let (mut stream, peer) = listener
+            let (stream, peer) = listener
                 .accept()
                 .map_err(|e| format!("accept slot {slot} failed: {e}"))?;
             let _ = stream.set_nodelay(true);
             let _ = stream.set_read_timeout(Some(NET_TIMEOUT));
+            let _ = stream.set_write_timeout(Some(NET_TIMEOUT));
             let army = slot_army(slot, n);
             let mut client_hs = hs.clone();
             client_hs.assigned_army = army;
-            write_frame(&mut stream, &encode_handshake(&client_hs))?;
+            let mut ps = PeerStream::Tcp(stream);
+            host_send_handshake_and_sync(&mut ps, &client_hs, host_mods)?;
             on_join(army, peer);
-            clients.push((army, PeerStream::Tcp(stream)));
+            clients.push((army, ps));
         }
         Ok(Self {
             clients,
@@ -1353,17 +1610,25 @@ impl LockstepClient {
     pub fn from_stream(mut stream: TcpStream) -> Result<(Self, Handshake), String> {
         let _ = stream.set_nodelay(true);
         let _ = stream.set_read_timeout(Some(NET_TIMEOUT));
+        let _ = stream.set_write_timeout(Some(NET_TIMEOUT));
         let raw = read_frame(&mut stream)?;
-        let hs = if raw.first() == Some(&MSG_HANDSHAKE) {
-            decode_handshake(&raw)?
+        let (stream, hs) = if raw.first() == Some(&MSG_HANDSHAKE) {
+            let local_mods = crate::mods::active().unwrap_or_default();
+            let cache_dir = crate::mods::downloaded_mods_dir();
+            let mut ps = PeerStream::Tcp(stream);
+            let (hs, synced, dl) =
+                client_finish_handshake_and_sync(&mut ps, &raw, &local_mods, &cache_dir, true)?;
+            activate_synced_mods(&hs, synced, dl);
+            (ps, hs)
         } else {
             // Phase 20: a menu-hosted lobby greets first; join it as an auto-ready peer.
             let hs = crate::net_lobby::auto_join(&mut stream, &raw)?;
             let _ = stream.set_read_timeout(Some(NET_TIMEOUT));
-            hs
+            let _ = stream.set_write_timeout(Some(NET_TIMEOUT));
+            (PeerStream::Tcp(stream), hs)
         };
         let client = Self {
-            stream: PeerStream::Tcp(stream),
+            stream,
             local_army: hs.assigned_army,
             next_turn: 0,
             silent_until: 0,
@@ -1372,12 +1637,44 @@ impl LockstepClient {
         Ok((client, hs))
     }
 
+    /// Connects to `addr` using explicit `local_mods` and `cache_dir` (isolated from global mod
+    /// state; used for tests and custom mod sandboxes).
+    #[allow(dead_code)]
+    pub fn connect_with_mods(
+        addr: &str,
+        local_mods: &[crate::mods::Mod],
+        cache_dir: &Path,
+    ) -> Result<(Self, Handshake, Vec<crate::mods::Mod>), String> {
+        let mut stream =
+            TcpStream::connect(addr).map_err(|e| format!("failed to connect {addr}: {e}"))?;
+        let _ = stream.set_nodelay(true);
+        let _ = stream.set_read_timeout(Some(NET_TIMEOUT));
+        let _ = stream.set_write_timeout(Some(NET_TIMEOUT));
+        let raw = read_frame(&mut stream)?;
+        let mut ps = PeerStream::Tcp(stream);
+        let (hs, synced, _) =
+            client_finish_handshake_and_sync(&mut ps, &raw, local_mods, cache_dir, false)?;
+        let client = Self {
+            stream: ps,
+            local_army: hs.assigned_army,
+            next_turn: 0,
+            silent_until: 0,
+            backlog: VecDeque::new(),
+        };
+        Ok((client, hs, synced))
+    }
+
     pub fn from_udp(mut channel: UdpChannel) -> Result<(Self, Handshake), String> {
         channel.set_read_timeout(Some(NET_TIMEOUT));
         let raw = channel.read_frame()?;
-        let hs = decode_handshake(&raw)?;
+        let local_mods = crate::mods::active().unwrap_or_default();
+        let cache_dir = crate::mods::downloaded_mods_dir();
+        let mut ps = PeerStream::Udp(channel);
+        let (hs, synced, dl) =
+            client_finish_handshake_and_sync(&mut ps, &raw, &local_mods, &cache_dir, true)?;
+        activate_synced_mods(&hs, synced, dl);
         let client = Self {
-            stream: PeerStream::Udp(channel),
+            stream: ps,
             local_army: hs.assigned_army,
             next_turn: 0,
             silent_until: 0,
@@ -1487,6 +1784,8 @@ impl LockstepClient {
         let _ = stream.set_read_timeout(Some(NET_TIMEOUT));
         write_frame(&mut stream, &encode_rejoin(army))?;
         let hs = decode_handshake(&read_frame(&mut stream).map_err(|e| format!("rejoin refused by host: {e}"))?)?;
+        // A rejoining peer must already have the host's mods (it played this match before).
+        crate::mods::check_match(&hs.mods, &crate::mods::active_identities(), "the host")?;
         let raw = read_frame(&mut stream)?;
         let mut pos = 0;
         if read_u8(&raw, &mut pos)? != MSG_HISTORY {
@@ -1580,27 +1879,46 @@ pub(crate) fn lobby_read_frame(stream: &mut TcpStream) -> Result<Vec<u8>, String
     read_frame(stream)
 }
 
-/// Decodes a frame if it is a lockstep [`Handshake`] (`None` for any other message).
-pub(crate) fn lobby_try_handshake(data: &[u8]) -> Option<Result<Handshake, String>> {
-    (data.first() == Some(&MSG_HANDSHAKE)).then(|| decode_handshake(data))
+/// Whether `data` is a lockstep [`Handshake`] frame.
+pub(crate) fn lobby_is_handshake(data: &[u8]) -> bool {
+    data.first() == Some(&MSG_HANDSHAKE)
+}
+
+/// Finishes a lockstep [`Handshake`] on an already-open lobby TCP stream, performing v16
+/// automatic mod sync (downloading, hash-verifying, caching and activating any missing host mods).
+pub(crate) fn lobby_finish_handshake(stream: &mut TcpStream, first_frame: &[u8]) -> Result<Handshake, String> {
+    let _ = stream.set_read_timeout(Some(NET_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(NET_TIMEOUT));
+    let cloned = stream.try_clone().map_err(|e| format!("socket clone failed: {e}"))?;
+    let local_mods = crate::mods::active().unwrap_or_default();
+    let cache_dir = crate::mods::downloaded_mods_dir();
+    let mut ps = PeerStream::Tcp(cloned);
+    let (hs, synced, dl) =
+        client_finish_handshake_and_sync(&mut ps, first_frame, &local_mods, &cache_dir, true)?;
+    activate_synced_mods(&hs, synced, dl);
+    Ok(hs)
 }
 
 impl LockstepHost {
     /// Hands lobby connections over to lockstep: sends every peer its [`Handshake`]
-    /// (`assigned_army` filled in) on the already-open stream.
+    /// (`assigned_army` filled in) and streams any missing host mods on the already-open stream.
     pub fn from_lobby(peers: Vec<(ArmyId, TcpStream)>, hs: &Handshake) -> Result<Self, String> {
         let n = hs.player_count;
         if !(2..=8).contains(&n) || peers.len() + 1 != n {
             return Err(format!("lobby start with {} peers for {n} players", peers.len()));
         }
+        let host_mods = crate::mods::active()?;
         let mut clients = Vec::with_capacity(peers.len());
-        for (army, mut stream) in peers {
+        for (army, stream) in peers {
             let _ = stream.set_nodelay(true);
             let _ = stream.set_read_timeout(Some(NET_TIMEOUT));
+            let _ = stream.set_write_timeout(Some(NET_TIMEOUT));
             let mut client_hs = hs.clone();
             client_hs.assigned_army = army;
-            write_frame(&mut stream, &encode_handshake(&client_hs)).map_err(|e| format!("army {army}: {e}"))?;
-            clients.push((army, PeerStream::Tcp(stream)));
+            let mut ps = PeerStream::Tcp(stream);
+            host_send_handshake_and_sync(&mut ps, &client_hs, &host_mods)
+                .map_err(|e| format!("army {army}: {e}"))?;
+            clients.push((army, ps));
         }
         clients.sort_by_key(|(a, _)| *a);
         Ok(Self {
@@ -2967,6 +3285,7 @@ mod tests {
             input_delay: DEFAULT_INPUT_DELAY,
             tick_limit: ticks,
             assigned_army: 0,
+            mods: Vec::new(),
         }
     }
 
@@ -3851,5 +4170,129 @@ mod tests {
         let h_client = run_headless(&mut client, &mut core_c, &mut w_c, c_hs.tick_limit).unwrap();
         let h_host = host_t.join().unwrap();
         assert_eq!(h_host, h_client, "punched UDP lockstep hashes must match");
+    }
+
+    #[test]
+    fn loopback_mod_sync_transfers_mod_and_matches_sim_hash() {
+        use crate::blueprint;
+        use crate::mods::{Mod, apply};
+        use crate::skirmish::{Role, UnitType};
+
+        let mod_info = "name = 'Sync Heavy Tank'\nuid = 'sync-heavy-tank-v1'\nversion = 1\nauthor = 'Test'\ndescription = 'Boosts UEL0201 gun'\n";
+        let mod_bp = r#"UnitBlueprint {
+            Merge = true,
+            Defense = { MaxHealth = 500 },
+            Weapon = { { Damage = 85, MaxRadius = 32, RateOfFire = 2.0, MuzzleVelocity = 48, DamageRadius = 2.5 } },
+        }"#;
+        let host_mod = Mod::from_memory(
+            mod_info,
+            vec![("units/UEL0201/UEL0201_unit.bp".into(), mod_bp.into())],
+            "sync-heavy",
+        );
+        let expected_id = host_mod.identity();
+
+        let base_bp = r#"UnitBlueprint {
+            Description = 'Light Tank',
+            Categories = {'UEF','MOBILE','LAND','TECH1','DIRECTFIRE'},
+            Defense = { MaxHealth = 250 },
+            Economy = { BuildCostMass = 50, BuildCostEnergy = 250, BuildTime = 200 },
+            Intel = { VisionRadius = 20 },
+            Physics = { MaxSpeed = 3.5, MotionType = 'RULEUMT_Land' },
+            Weapon = { { Label = 'Gun', Damage = 15, MaxRadius = 18, RateOfFire = 0.5, MuzzleVelocity = 25 } },
+        }"#;
+
+        let build_modded_world = |setups: &[ArmySetup], seed: u64, applied: &[Mod]| {
+            let mut cat = test_catalog();
+            let mut roots = BTreeMap::new();
+            roots.insert("UEL0201".into(), blueprint::parse_blueprint(base_bp).unwrap());
+            apply(&mut roots, applied).unwrap();
+            cat.types.insert("UEL0201".into(), UnitType::from_blueprint("UEL0201", Role::Mobile, &roots["UEL0201"]));
+            cat.mods = applied.iter().map(Mod::identity).collect();
+            let grid = PathGrid::new(64, 64, 4 * SCALE);
+            let mut w = Skirmish::new(cat, grid, (256 * SCALE, 256 * SCALE), vec![], setups, seed).unwrap();
+            let u0 = w.spawn_unit(0, "UEL0201", (100 * SCALE, 100 * SCALE)).unwrap();
+            let u1 = w.spawn_unit(1, "RT", (124 * SCALE, 100 * SCALE)).unwrap();
+            w.issue(0, Command::Attack { units: vec![u0], target: u1, queue: false });
+            w.issue(1, Command::Attack { units: vec![u1], target: u0, queue: false });
+            w
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let mut hs_host = handshake(2, 2, 777, 90);
+        hs_host.mods = vec![expected_id.clone()];
+        let host_mod_clone = host_mod.clone();
+        let hs_for_host = hs_host.clone();
+
+        let host_thread = std::thread::spawn(move || {
+            let mut t = LockstepHost::accept_players_with_mods(
+                listener,
+                &hs_for_host,
+                std::slice::from_ref(&host_mod_clone),
+                &mut |_, _| {},
+            )
+            .unwrap();
+            let mut w = build_modded_world(&hs_for_host.setups, hs_for_host.seed, std::slice::from_ref(&host_mod_clone));
+            let mut core = LockstepCore::from_handshake(&w, &hs_for_host);
+            run_headless(&mut t, &mut core, &mut w, hs_for_host.tick_limit).unwrap()
+        });
+
+        let cache_dir = std::env::temp_dir().join(format!("farust-net-modsync-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&cache_dir);
+        let (mut client, hs_client, synced) = LockstepClient::connect_with_mods(&addr, &[], &cache_dir).unwrap();
+        assert_eq!(hs_client.mods, vec![expected_id.clone()]);
+        assert_eq!(synced.len(), 1);
+        assert_eq!(synced[0].identity(), expected_id);
+        assert!(synced[0].dir.as_ref().is_some_and(|d| d.starts_with(&cache_dir)));
+
+        let mut w_client = build_modded_world(&hs_client.setups, hs_client.seed, &synced);
+        let mut core_client = LockstepCore::from_handshake(&w_client, &hs_client);
+        let h_client = run_headless(&mut client, &mut core_client, &mut w_client, hs_client.tick_limit).unwrap();
+        let h_host = host_thread.join().unwrap();
+        assert_eq!(h_host, h_client, "host and synced client must finish with identical sim hash");
+
+        // Verify the synced mod actually changed the sim hash relative to unmodded stock.
+        let mut w_stock = build_modded_world(&hs_host.setups, hs_host.seed, &[]);
+        w_stock.run(hs_host.tick_limit);
+        assert_ne!(h_host, w_stock.state_hash(), "mod must alter sim outcome");
+        let _ = std::fs::remove_dir_all(&cache_dir);
+    }
+
+    #[test]
+    fn mod_sync_hash_mismatch_aborts_cleanly() {
+        use crate::mods::{Mod, encode_mod_bundle};
+
+        let host_mod = Mod::from_memory(
+            "name = 'Tamper Test'\nuid = 'tamper-test-v1'\nversion = 1\n",
+            vec![("units/UEL0201/UEL0201_unit.bp".into(), "UnitBlueprint { Merge = true, Defense = { MaxHealth = 500 } }".into())],
+            "tamper",
+        );
+        let mut bad_bundle = encode_mod_bundle(&host_mod).unwrap();
+        let last = bad_bundle.len() - 2;
+        bad_bundle[last] ^= 0x01; // Corrupt blueprint byte -> hash mismatch!
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let mut hs_host = handshake(2, 2, 123, 30);
+        hs_host.mods = vec![host_mod.identity()];
+
+        let host_t = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut ps = PeerStream::Tcp(stream);
+            ps.write_frame(&encode_handshake(&hs_host)).unwrap();
+            let req = decode_mod_sync_req(&ps.read_frame().unwrap()).unwrap();
+            assert_eq!(req, vec![0]);
+            ps.write_frame(&encode_mod_chunk(0, bad_bundle.len() as u32, 0, &bad_bundle)).unwrap();
+            decode_mod_sync_ack(&ps.read_frame().unwrap()).unwrap()
+        });
+
+        let cache_dir = std::env::temp_dir().join(format!("farust-net-modsync-bad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&cache_dir);
+        let Err(client_err) = LockstepClient::connect_with_mods(&addr, &[], &cache_dir) else { panic!("expected a hash mismatch") };
+        assert!(client_err.contains("hash mismatch"), "expected hash mismatch error, got: {client_err}");
+        let host_ack = host_t.join().unwrap();
+        assert!(host_ack.is_err(), "host should receive mod sync rejection");
+        assert!(!cache_dir.exists() || std::fs::read_dir(&cache_dir).unwrap().count() == 0);
+        let _ = std::fs::remove_dir_all(&cache_dir);
     }
 }
