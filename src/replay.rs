@@ -56,10 +56,10 @@ impl ReplayHeader {
         }
     }
 
-    /// Phase 48: installs the recorded mission script (if any) into a fresh world.
-    pub fn apply_mission(&self, world: &mut Skirmish) -> Result<(), String> {
+    /// Phase 48/49: installs the recorded mission script (if any) into a fresh world.
+    pub fn apply_mission(&self, world: &mut Skirmish, map: &MapContext) -> Result<(), String> {
         if let Some(src) = &self.mission {
-            world.set_mission(crate::mission::Mission::parse(src)?);
+            crate::mission::Mission::parse(src)?.install(world, map)?;
         }
         Ok(())
     }
@@ -725,8 +725,8 @@ impl Replay {
             self.header.seed,
         )?;
         world.attach_map(map);
-        self.header.apply_mission(&mut world)?;
         world.set_options(self.header.options);
+        self.header.apply_mission(&mut world, map)?;
 
         let mut cmd_idx = 0usize;
         let mut cp_idx = 0usize;
@@ -838,6 +838,8 @@ mod tests {
             hydro_points: vec![],
             has_water: false,
             props: Vec::new(),
+            markers: Default::default(),
+            areas: Default::default(),
         }
     }
 

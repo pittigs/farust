@@ -30,6 +30,13 @@ pub struct SaveMarkers {
     pub total_markers: usize,
 }
 
+/// Phase 49: named markers and rectangular areas parsed from a scenario `_save.lua`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SaveMissionData {
+    pub markers: std::collections::BTreeMap<String, [f32; 3]>,
+    pub areas: std::collections::BTreeMap<String, [f32; 4]>,
+}
+
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct MapFiles {
@@ -476,6 +483,52 @@ pub fn parse_save_markers(text: &str, armies: &[String]) -> Result<SaveMarkers, 
         hydro_points,
         total_markers,
     })
+}
+
+pub fn parse_save_mission_data_file(path: &Path) -> Result<SaveMissionData, String> {
+    let bytes = std::fs::read(path)
+        .map_err(|e| format!("failed to read save file {}: {e}", path.display()))?;
+    let text = String::from_utf8_lossy(&bytes);
+    parse_save_mission_data(&text)
+}
+
+/// Phase 49: extracts `Scenario.Areas` rectangles and all `MasterChain._MASTERCHAIN_.Markers`
+/// positions from `_save.lua` for campaign missions.
+pub fn parse_save_mission_data(text: &str) -> Result<SaveMissionData, String> {
+    let mut out = SaveMissionData::default();
+
+    let mut area_lex = Lexer::new(text);
+    if let Some(areas_pos) = area_lex.find_table_value_start("Areas")?
+        && let Ok(mut p) = Parser::new(&area_lex.src[areas_pos..])
+        && let Ok(areas_tbl) = p.parse_table()
+    {
+        for (key, val) in &areas_tbl.entries {
+            let (Some(name), Some(tbl)) = (key.as_ref(), val.as_table()) else {
+                continue;
+            };
+            if let Some(rect) = tbl.get("rectangle").and_then(LuaVal::as_rect4) {
+                out.areas.insert(name.clone(), rect);
+            }
+        }
+    }
+
+    let mut mc_lex = Lexer::new(text);
+    if let Some(brace_pos) = mc_lex.find_table_value_start("MasterChain")?
+        && let Ok(mut p) = Parser::new(&mc_lex.src[brace_pos..])
+        && let Ok(mc) = p.parse_table()
+        && let Some(inner) = mc.get("_MASTERCHAIN_").and_then(LuaVal::as_table)
+        && let Some(markers_tbl) = inner.get("Markers").and_then(LuaVal::as_table)
+    {
+        for (key, val) in &markers_tbl.entries {
+            let (Some(name), Some(tbl)) = (key.as_ref(), val.as_table()) else {
+                continue;
+            };
+            let pos = tbl.get("position").and_then(LuaVal::as_vec3).unwrap_or([0.0, 0.0, 0.0]);
+            out.markers.insert(name.clone(), pos);
+        }
+    }
+
+    Ok(out)
 }
 
 /// Directory edited maps are written to: `$XDG_DATA_HOME/farust/maps`.
@@ -994,6 +1047,35 @@ impl LuaVal {
                         nums.push(n as f32);
                         if nums.len() == 3 {
                             return Some([nums[0], nums[1], nums[2]]);
+                        }
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn as_rect4(&self) -> Option<[f32; 4]> {
+        let norm = |a: f32, b: f32, c: f32, d: f32| [a.min(c), b.min(d), a.max(c), b.max(d)];
+        match self {
+            LuaVal::Call(name, args)
+                if name.eq_ignore_ascii_case("RECTANGLE") && args.len() >= 4 =>
+            {
+                Some(norm(
+                    args[0].as_f64()? as f32,
+                    args[1].as_f64()? as f32,
+                    args[2].as_f64()? as f32,
+                    args[3].as_f64()? as f32,
+                ))
+            }
+            LuaVal::Table(t) => {
+                let mut nums = Vec::with_capacity(4);
+                for (_, v) in &t.entries {
+                    if let Some(n) = v.as_f64() {
+                        nums.push(n as f32);
+                        if nums.len() == 4 {
+                            return Some(norm(nums[0], nums[1], nums[2], nums[3]));
                         }
                     }
                 }
@@ -2140,5 +2222,31 @@ Scenario = {
         let dirs = user_map_dirs(&game);
         assert_eq!(dirs[0], (MapSource::FaUser, guard.path().join("steamapps").join(FA_USER_MAPS)));
         assert!(dirs.iter().any(|(s, p)| *s == MapSource::Farust && p.ends_with("farust/maps")));
+    }
+
+    #[test]
+    fn parse_save_mission_data_extracts_named_markers_and_areas() {
+        let save = r#"
+Scenario = {
+    Areas = {
+        ['M1_North_Base_Area'] = {
+            ['rectangle'] = RECTANGLE( 277.5, 667.5, 215.5, 605.5 ),
+        },
+    },
+    MasterChain = {
+        ['_MASTERCHAIN_'] = {
+            Markers = {
+                ['CDRWarp'] = {
+                    ['type'] = STRING( 'Blank Marker' ),
+                    ['position'] = VECTOR3( 76.5, 18.0, 960.5 ),
+                },
+            },
+        },
+    },
+}
+"#;
+        let data = parse_save_mission_data(save).unwrap();
+        assert_eq!(data.areas.get("M1_North_Base_Area"), Some(&[215.5, 605.5, 277.5, 667.5]));
+        assert_eq!(data.markers.get("CDRWarp"), Some(&[76.5, 18.0, 960.5]));
     }
 }

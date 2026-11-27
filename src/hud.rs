@@ -2187,6 +2187,8 @@ mod tests {
             hydro_points: vec![],
             has_water: false,
             props: Vec::new(),
+            markers: Default::default(),
+            areas: Default::default(),
         }
     }
 

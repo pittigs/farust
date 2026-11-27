@@ -1505,6 +1505,7 @@ const BUILTIN_DE: &[(&str, &str)] = &[
     ("caption.transport_full", "Transporter voll"),
     ("caption.mass_storage_full", "Massespeicher voll"),
     ("caption.energy_storage_full", "Energiespeicher voll"),
+    ("ui.campaign", "KAMPAGNE"),
     ("ui.tutorial", "TUTORIAL"),
     ("ui.colorblind", "Farbenblind-Modus"),
     ("ui.mouse_swap", "Maustasten tauschen"),
