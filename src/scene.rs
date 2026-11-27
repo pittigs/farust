@@ -706,20 +706,42 @@ pub fn load_map_scene(game_dir: &Path, map_name: &str, aspect: f32) -> Result<Lo
         .ok_or_else(|| format!("Map '{}' has no .scmap file", map_files.id))?;
     let scmap = ScMap::parse_file(scmap_path)?;
 
-    let terrain_splat = load_terrain_splat_data(game_dir, &scmap);
-    let water = load_water_gpu_data(game_dir, &scmap);
-    let sky_cube = load_sky_cubemap(game_dir, &scmap);
-    let prop_batches = load_map_props(game_dir, &scmap);
-    let decal_batches = load_map_decals(game_dir, &scmap);
+    let title = if meta.name.trim().is_empty() {
+        meta.id.clone()
+    } else {
+        format!("{} ({})", meta.name, meta.id)
+    };
+    Ok(build_map_scene_from_parts(
+        game_dir,
+        title,
+        &scmap,
+        markers.as_ref(),
+        aspect,
+    ))
+}
+
+/// Builds a [`LoadedScene`] from an already-parsed [`ScMap`] and optional [`scenario::SaveMarkers`].
+pub fn build_map_scene_from_parts(
+    game_dir: &Path,
+    title: String,
+    scmap: &ScMap,
+    markers: Option<&scenario::SaveMarkers>,
+    aspect: f32,
+) -> LoadedScene {
+    let terrain_splat = load_terrain_splat_data(game_dir, scmap);
+    let water = load_water_gpu_data(game_dir, scmap);
+    let sky_cube = load_sky_cubemap(game_dir, scmap);
+    let prop_batches = load_map_props(game_dir, scmap);
+    let decal_batches = load_map_decals(game_dir, scmap);
 
     let baked = if terrain_splat.is_some() {
         None
     } else {
-        bake_terrain_albedo(game_dir, &scmap, 1024)
+        bake_terrain_albedo(game_dir, scmap, 1024)
     };
     let textured = terrain_splat.is_some() || baked.is_some();
     let (vertices, indices, overlay_vertices, overlay_indices) =
-        build_terrain_and_overlay_meshes_opts(&scmap, markers.as_ref(), textured, water.is_none());
+        build_terrain_and_overlay_meshes_opts(scmap, markers, textured, water.is_none());
 
     let albedo = baked.unwrap_or_else(|| RgbaImage {
         width: 1,
@@ -734,15 +756,9 @@ pub fn load_map_scene(game_dir: &Path, map_name: &str, aspect: f32) -> Result<Lo
         avg_h
     };
     let initial_camera = OrbitCamera::for_map(scmap.map_width, scmap.map_height, focus_y, aspect);
-
-    let title = if meta.name.trim().is_empty() {
-        meta.id.clone()
-    } else {
-        format!("{} ({})", meta.name, meta.id)
-    };
     let fc = scmap.lighting.fog_color;
 
-    Ok(LoadedScene {
+    LoadedScene {
         title,
         vertices,
         indices,
@@ -761,7 +777,7 @@ pub fn load_map_scene(game_dir: &Path, map_name: &str, aspect: f32) -> Result<Lo
         sky_cube,
         prop_batches,
         decal_batches,
-    })
+    }
 }
 
 #[allow(dead_code)]
@@ -2710,6 +2726,8 @@ mod tests {
                 elevation_deep: 0.0,
                 elevation_abyss: 0.0,
             },
+            unknown1: 0, unknown2: 0, unknown3: 0, unknown4: 0, post_heightmap_byte: 0,
+            shader_raw: Vec::new(), background_raw: Vec::new(), sky_raw: Vec::new(), cubemaps_raw: Vec::new(), tail_bytes: Vec::new(),
             terrain_textures: Some(TerrainTextures {
                 strata_albedo: Vec::new(),
                 strata_normal: Vec::new(),
@@ -2719,6 +2737,8 @@ mod tests {
                 normal_map_dds: Vec::new(),
                 water_params: ScMapWaterParams::default(),
                 props: Vec::new(),
+                props_tail_range: None,
+                props_dirty: false,
             }),
         };
 

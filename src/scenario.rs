@@ -478,6 +478,361 @@ pub fn parse_save_markers(text: &str, armies: &[String]) -> Result<SaveMarkers, 
     })
 }
 
+/// Directory edited maps are written to: `$XDG_DATA_HOME/farust/maps`.
+pub fn farust_maps_dir() -> PathBuf {
+    xdg_data_home().join("farust").join("maps")
+}
+
+/// Replaces every ASCII-case-insensitive occurrence of `old_id` with `new_id`
+/// in scenario/save/script text when cloning a map under a new id.
+pub fn rewrite_map_id(text: &str, old_id: &str, new_id: &str) -> String {
+    if old_id.is_empty() || old_id.eq_ignore_ascii_case(new_id) && old_id == new_id {
+        return text.to_string();
+    }
+    let needle = old_id.as_bytes();
+    let hay = text.as_bytes();
+    if needle.len() > hay.len() {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0usize;
+    while i < hay.len() {
+        if i + needle.len() <= hay.len() && hay[i..i + needle.len()].eq_ignore_ascii_case(needle) {
+            out.push_str(new_id);
+            i += needle.len();
+        } else {
+            let ch = text[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    out
+}
+
+/// Rewrites a `_scenario.lua` file for a cloned/edited map under `new_id`,
+/// updating VFS paths (`map`, `save`, `script`) and optionally the display `name`.
+pub fn rewrite_scenario_for_clone(
+    text: &str,
+    old_id: &str,
+    new_id: &str,
+    new_name: Option<&str>,
+) -> String {
+    let mut out = rewrite_map_id(text, old_id, new_id);
+    // Normalize `map = '...'`, `save = '...'`, `script = '...'` lines in case the
+    // source scenario referenced differently named files.
+    let targets = [
+        ("map", format!("/maps/{new_id}/{new_id}.scmap")),
+        ("save", format!("/maps/{new_id}/{new_id}_save.lua")),
+        ("script", format!("/maps/{new_id}/{new_id}_script.lua")),
+    ];
+    let mut lines: Vec<String> = Vec::new();
+    for line in out.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        let indent_len = line.len() - trimmed.len();
+        let indent = &line[..indent_len];
+        let eol = if line.ends_with("\r\n") {
+            "\r\n"
+        } else if line.ends_with('\n') {
+            "\n"
+        } else {
+            ""
+        };
+        let mut replaced = None;
+        for (key, val) in &targets {
+            if let Some(rest) = trimmed.strip_prefix(key) {
+                let after = rest.trim_start();
+                if after.starts_with('=') {
+                    let comma = if trimmed.trim_end().ends_with(',') { "," } else { "" };
+                    replaced = Some(format!("{indent}{key} = '{val}'{comma}{eol}"));
+                    break;
+                }
+            }
+        }
+        if replaced.is_none()
+            && let Some(title) = new_name
+            && let Some(rest) = trimmed.strip_prefix("name")
+            && rest.trim_start().starts_with('=')
+        {
+            let escaped = title.replace('\\', "\\\\").replace('\'', "\\'");
+            let comma = if trimmed.trim_end().ends_with(',') { "," } else { "" };
+            replaced = Some(format!("{indent}name = '{escaped}'{comma}{eol}"));
+        }
+        lines.push(replaced.unwrap_or_else(|| line.to_string()));
+    }
+    out = lines.concat();
+    out
+}
+
+fn scan_matching_brace(bytes: &[u8], open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut i = open;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'-' if bytes.get(i + 1) == Some(&b'-') => {
+                // Lua comment: long `--[[ ]]` or to end of line.
+                let mut j = i + 2;
+                if bytes.get(j) == Some(&b'[') {
+                    let mut eq = 0usize;
+                    j += 1;
+                    while bytes.get(j) == Some(&b'=') {
+                        eq += 1;
+                        j += 1;
+                    }
+                    if bytes.get(j) == Some(&b'[') {
+                        let close: Vec<u8> = std::iter::once(b']')
+                            .chain(std::iter::repeat_n(b'=', eq))
+                            .chain(*b"]")
+                            .collect();
+                        let mut k = j + 1;
+                        let mut found = None;
+                        while k + close.len() <= bytes.len() {
+                            if &bytes[k..k + close.len()] == close.as_slice() {
+                                found = Some(k + close.len());
+                                break;
+                            }
+                            k += 1;
+                        }
+                        i = found?;
+                        continue;
+                    }
+                }
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'\'' | b'"' => {
+                let q = bytes[i];
+                i += 1;
+                while i < bytes.len() && bytes[i] != q {
+                    if bytes[i] == b'\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                i += 1;
+            }
+            b'{' => {
+                depth += 1;
+                i += 1;
+            }
+            b'}' => {
+                depth -= 1;
+                i += 1;
+                if depth == 0 {
+                    return Some(i - 1);
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+fn skip_ws_and_lua_comments(bytes: &[u8], mut i: usize, end: usize) -> usize {
+    while i < end {
+        if bytes[i].is_ascii_whitespace() || bytes[i] == b',' || bytes[i] == b';' {
+            i += 1;
+            continue;
+        }
+        if bytes[i] == b'-' && bytes.get(i + 1) == Some(&b'-') {
+            let mut j = i + 2;
+            if bytes.get(j) == Some(&b'[') {
+                let mut eq = 0usize;
+                j += 1;
+                while j < end && bytes[j] == b'=' {
+                    eq += 1;
+                    j += 1;
+                }
+                if j < end && bytes[j] == b'[' {
+                    let close: Vec<u8> = std::iter::once(b']')
+                        .chain(std::iter::repeat_n(b'=', eq))
+                        .chain(*b"]")
+                        .collect();
+                    let mut k = j + 1;
+                    let mut found = end;
+                    while k + close.len() <= end {
+                        if &bytes[k..k + close.len()] == close.as_slice() {
+                            found = k + close.len();
+                            break;
+                        }
+                        k += 1;
+                    }
+                    i = found;
+                    continue;
+                }
+            }
+            while i < end && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        break;
+    }
+    i
+}
+
+fn marker_entry(name: &str, marker_type: &str, pos: [f32; 3]) -> String {
+    let escaped = name.replace('\\', "\\\\").replace('\'', "\\'");
+    let (color, prop, extra) = match marker_type {
+        "Mass" => (
+            "ff808080",
+            "/env/common/props/markers/M_Mass_prop.bp",
+            "                    ['size'] = FLOAT( 1.000000 ),\n                    ['resource'] = BOOLEAN( true ),\n                    ['amount'] = FLOAT( 100.000000 ),\n                    ['editorIcon'] = STRING( '/textures/editor/marker_mass.bmp' ),\n",
+        ),
+        "Hydrocarbon" => (
+            "ff808080",
+            "/env/common/props/markers/M_Hydrocarbon_prop.bp",
+            "                    ['size'] = FLOAT( 1.000000 ),\n                    ['resource'] = BOOLEAN( true ),\n                    ['amount'] = FLOAT( 100.000000 ),\n                    ['editorIcon'] = STRING( '/textures/editor/marker_hydro.bmp' ),\n",
+        ),
+        _ => ("ff800080", "/env/common/props/markers/M_Blank_prop.bp", ""),
+    };
+    format!(
+        "                ['{escaped}'] = {{\n{extra}                    ['color'] = STRING( '{color}' ),\n                    ['type'] = STRING( '{marker_type}' ),\n                    ['prop'] = STRING( '{prop}' ),\n                    ['orientation'] = VECTOR3( 0, 0, 0 ),\n                    ['position'] = VECTOR3( {:.4}, {:.4}, {:.4} ),\n                }},\n",
+        pos[0], pos[1], pos[2]
+    )
+}
+
+/// Regenerates the start/resource markers of a `_save.lua` text from the
+/// given lists. All other markers and all text outside the `Markers` table
+/// are kept verbatim.
+pub fn rewrite_save_markers(
+    text: &str,
+    armies: &[String],
+    starts: &[Marker],
+    mass: &[Marker],
+    hydro: &[Marker],
+) -> Result<String, String> {
+    let src = text.strip_prefix('\u{FEFF}').unwrap_or(text);
+    let prefix_len = text.len() - src.len();
+    let bytes = src.as_bytes();
+
+    // Locate `MasterChain = { ... ['_MASTERCHAIN_'] = { ... Markers = { ... } } }`
+    // using the comment/string-aware Lua lexer.
+    let mc_open = Lexer::new(src)
+        .find_table_value_start("MasterChain")?
+        .ok_or_else(|| "missing MasterChain in save text".to_string())?;
+    let mc_close = scan_matching_brace(bytes, mc_open)
+        .ok_or_else(|| "unterminated MasterChain table".to_string())?;
+    let inner_open = Lexer::new(&src[mc_open + 1..mc_close])
+        .find_table_value_start("_MASTERCHAIN_")?
+        .map(|p| mc_open + 1 + p)
+        .ok_or_else(|| "missing '_MASTERCHAIN_' in MasterChain".to_string())?;
+    let inner_close = scan_matching_brace(bytes, inner_open)
+        .ok_or_else(|| "unterminated '_MASTERCHAIN_' table".to_string())?;
+    let open = Lexer::new(&src[inner_open + 1..inner_close])
+        .find_table_value_start("Markers")?
+        .map(|p| inner_open + 1 + p)
+        .ok_or_else(|| "missing Markers in '_MASTERCHAIN_'".to_string())?;
+    let close = scan_matching_brace(bytes, open)
+        .ok_or_else(|| "unterminated Markers table".to_string())?;
+
+    // Split the interior into top-level `['name'] = { ... },` or `name = { ... },` entries.
+    let mut kept: Vec<String> = Vec::new();
+    let mut i = open + 1;
+    while i < close {
+        i = skip_ws_and_lua_comments(bytes, i, close);
+        if i >= close {
+            break;
+        }
+        let entry_start = i;
+        // Parse key name (`['name']`, `["name"]`, or bare identifier).
+        let name = if bytes[i] == b'[' {
+            let mut lex = Lexer::new(&src[i + 1..close]);
+            let _ = lex.skip_whitespace_and_comments();
+            let k = match lex.next_token().ok().flatten() {
+                Some(Token::Str(s)) => s,
+                Some(Token::Ident(s)) => s,
+                Some(Token::Num(n)) => n.to_string(),
+                _ => String::new(),
+            };
+            let _ = lex.skip_whitespace_and_comments();
+            if bytes.get(i + 1 + lex.pos) == Some(&b']') {
+                i = i + 1 + lex.pos + 1;
+            }
+            k
+        } else if is_ident_start(bytes[i]) {
+            let ks = i;
+            i += 1;
+            while i < close && is_ident_continue(bytes[i]) {
+                i += 1;
+            }
+            src[ks..i].to_string()
+        } else {
+            String::new()
+        };
+
+        // Advance past `=` to the entry's opening `{`.
+        i = skip_ws_and_lua_comments(bytes, i, close);
+        if i < close && bytes[i] == b'=' {
+            i += 1;
+            i = skip_ws_and_lua_comments(bytes, i, close);
+        }
+        let (val_open, entry_end) = if i < close && bytes[i] == b'{' {
+            let eopen = i;
+            match scan_matching_brace(bytes, eopen) {
+                Some(eclose) => {
+                    let mut e = eclose + 1;
+                    if bytes.get(e) == Some(&b',') {
+                        e += 1;
+                    }
+                    (Some((eopen, eclose)), e)
+                }
+                None => (None, close),
+            }
+        } else {
+            // Non-table fallback: advance to next comma or end.
+            let mut e = i;
+            while e < close && bytes[e] != b',' {
+                e += 1;
+            }
+            if e < close && bytes[e] == b',' {
+                e += 1;
+            }
+            (None, e)
+        };
+        if entry_end <= entry_start {
+            break;
+        }
+        let entry = &src[entry_start..entry_end];
+        let ty = val_open
+            .and_then(|(vo, vc)| Parser::new(&src[vo..=vc]).ok()?.parse_table().ok())
+            .and_then(|tbl| tbl.get("type").and_then(|v| v.as_string()))
+            .unwrap_or_default();
+        let is_start = name.starts_with("ARMY_") || armies.iter().any(|a| a == &name);
+        if !is_start && ty != "Mass" && ty != "Hydrocarbon" {
+            kept.push(format!("                {}", entry.trim_start()));
+            if !entry.trim_end().ends_with(',') {
+                kept.last_mut().unwrap().push(',');
+            }
+            kept.last_mut().unwrap().push('\n');
+        }
+        i = entry_end;
+    }
+
+    let mut interior = String::new();
+    interior.push('\n');
+    for m in starts {
+        interior.push_str(&marker_entry(&m.name, "Blank Marker", m.position));
+    }
+    for m in mass {
+        interior.push_str(&marker_entry(&m.name, "Mass", m.position));
+    }
+    for m in hydro {
+        interior.push_str(&marker_entry(&m.name, "Hydrocarbon", m.position));
+    }
+    for k in kept {
+        interior.push_str(&k);
+    }
+    interior.push_str("            ");
+    Ok(format!(
+        "{}{}{}{}",
+        &text[..prefix_len],
+        &src[..=open],
+        interior,
+        &src[close..]
+    ))
+}
+
 fn list_dir_files_sorted(dir: &Path) -> Result<Vec<(String, PathBuf)>, String> {
     let entries = std::fs::read_dir(dir)
         .map_err(|e| format!("failed to read directory {}: {e}", dir.display()))?;
@@ -1444,6 +1799,97 @@ description]],
         assert_eq!(meta.scenario_type, "campaign");
         assert_eq!(meta.size, (256, 512));
         assert_eq!(meta.armies, vec!["Player", "Aeon"]);
+    }
+
+    #[test]
+    fn rewrite_save_markers_regenerates_and_keeps_others() {
+        let lua = "Scenario = {\n    MasterChain = {\n        ['_MASTERCHAIN_'] = {\n            Markers = {\n                ['ARMY_1'] = {\n                    ['type'] = STRING( 'Blank Marker' ),\n                    ['position'] = VECTOR3( 10, 5, 20 ),\n                },\n                ['MASS_1'] = {\n                    ['type'] = STRING( 'Mass' ),\n                    ['position'] = VECTOR3( 30, 5, 40 ),\n                },\n                ['Transport Marker 01'] = {\n                    ['type'] = STRING( 'Transport Marker' ),\n                    ['position'] = VECTOR3( 1, 2, 3 ),\n                },\n            },\n        },\n    },\n}\n";
+        let armies = vec!["ARMY_1".to_string(), "ARMY_2".to_string()];
+        let starts = vec![
+            Marker { name: "ARMY_1".into(), marker_type: "Blank Marker".into(), position: [100.0, 9.0, 200.0] },
+            Marker { name: "ARMY_2".into(), marker_type: "Blank Marker".into(), position: [300.0, 9.0, 400.0] },
+        ];
+        let mass = vec![Marker { name: "MASS_900".into(), marker_type: "Mass".into(), position: [50.0, 7.0, 60.0] }];
+        let out = rewrite_save_markers(lua, &armies, &starts, &mass, &[]).expect("rewrite");
+        assert!(out.contains("Transport Marker 01"), "other markers kept verbatim");
+        assert!(out.starts_with("Scenario = {\n    MasterChain = {"));
+        let parsed = parse_save_markers(&out, &armies).expect("reparse rewritten save");
+        assert_eq!(parsed.start_spots.len(), 2);
+        assert_eq!(parsed.start_spots[0].position, [100.0, 9.0, 200.0]);
+        assert_eq!(parsed.mass_points.len(), 1);
+        assert_eq!(parsed.mass_points[0].name, "MASS_900");
+        assert_eq!(parsed.total_markers, 4);
+        assert_eq!(
+            rewrite_map_id("map = '/maps/scmp_001/SCMP_001.scmap'", "SCMP_001", "NEW1"),
+            "map = '/maps/NEW1/NEW1.scmap'"
+        );
+    }
+
+    #[test]
+    fn rewrite_save_markers_handles_comments_bare_keys_and_plain_types() {
+        let lua = r#"
+--[[ Fake MasterChain = { ['_MASTERCHAIN_'] = { Markers = { } } } ]]--
+Scenario = {
+    note = "MasterChain = { fake }",
+    MasterChain = {
+        ['_MASTERCHAIN_'] = {
+            Markers = {
+                -- existing comment inside Markers
+                ARMY_1 = {
+                    ['type'] = 'Blank Marker',
+                    ['position'] = VECTOR3( 1, 2, 3 ),
+                },
+                ['Mass 01'] = {
+                    ['type'] = 'Mass',
+                    ['position'] = VECTOR3( 4, 5, 6 ),
+                },
+                ['Hydro 01'] = {
+                    ['type'] = STRING( 'Hydrocarbon' ),
+                    ['position'] = VECTOR3( 7, 8, 9 ),
+                },
+                ['Land Path Node 01'] = {
+                    ['type'] = STRING( 'Land Path Node' ),
+                    ['position'] = VECTOR3( 10, 11, 12 ),
+                },
+            },
+        },
+    },
+}
+"#;
+        let armies = vec!["ARMY_1".to_string()];
+        let starts = vec![Marker {
+            name: "ARMY_1".into(),
+            marker_type: "Blank Marker".into(),
+            position: [55.0, 12.0, 66.0],
+        }];
+        let mass = vec![Marker {
+            name: "Mass 02".into(),
+            marker_type: "Mass".into(),
+            position: [77.0, 12.0, 88.0],
+        }];
+        let hydro = vec![Marker {
+            name: "Hydro 02".into(),
+            marker_type: "Hydrocarbon".into(),
+            position: [99.0, 12.0, 111.0],
+        }];
+        let out = rewrite_save_markers(lua, &armies, &starts, &mass, &hydro).expect("rewrite");
+        let parsed = parse_save_markers(&out, &armies).expect("reparse");
+        assert_eq!(parsed.start_spots.len(), 1);
+        assert_eq!(parsed.start_spots[0].position, [55.0, 12.0, 66.0]);
+        assert_eq!(parsed.mass_points.len(), 1);
+        assert_eq!(parsed.mass_points[0].name, "Mass 02");
+        assert_eq!(parsed.hydro_points.len(), 1);
+        assert_eq!(parsed.hydro_points[0].name, "Hydro 02");
+        assert_eq!(parsed.total_markers, 4); // 1 start + 1 mass + 1 hydro + 1 kept path node
+        assert!(out.contains("Land Path Node 01"));
+
+        let scen = "ScenarioInfo = {\n    name = 'Old Name',\n    map = '/maps/old_id/old.scmap',\n    save = '/maps/old_id/old_save.lua',\n    script = '/maps/old_id/old_script.lua',\n}\n";
+        let cloned = rewrite_scenario_for_clone(scen, "OLD_ID", "NEW_ID", Some("New Name"));
+        let meta = parse_scenario(&cloned, "NEW_ID").expect("parse cloned scenario");
+        assert_eq!(meta.name, "New Name");
+        assert_eq!(meta.map_vfs_path, "/maps/NEW_ID/NEW_ID.scmap");
+        assert_eq!(meta.save_vfs_path, "/maps/NEW_ID/NEW_ID_save.lua");
+        assert!(cloned.contains("script = '/maps/NEW_ID/NEW_ID_script.lua',"));
     }
 
     #[test]
