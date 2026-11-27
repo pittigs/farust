@@ -805,6 +805,9 @@ impl PlaySession {
         if self.handle_left_click_order(world_xz, queue, pick_radius) {
             return true;
         }
+        if self.place_template(world_xz, queue) {
+            return true;
+        }
         if let Some(ref btype) = self.build_mode.clone() {
             let Some(builder_id) = self.builder_for(btype) else {
                 self.build_mode = None;
@@ -1286,6 +1289,10 @@ fn unit_yaw(world: &Skirmish, u: &crate::skirmish::Unit) -> f32 {
         Some(UnitOrder::Unload { x, y }) => ((x - u.pos.x) as f32).atan2((y - u.pos.y) as f32),
         Some(UnitOrder::Board(_) | UnitOrder::Enhance(_)) => 0.0,
         Some(UnitOrder::AttackGround { x, y }) => ((x - u.pos.x) as f32).atan2((y - u.pos.y) as f32),
+        Some(UnitOrder::Ferry { from, to }) => {
+            let g = if u.cargo.is_empty() { *from } else { *to };
+            ((g.0 - u.pos.x) as f32).atan2((g.1 - u.pos.y) as f32)
+        }
         Some(UnitOrder::Guard(tid)) | Some(UnitOrder::Dock(tid)) => world
             .unit(*tid)
             .map(|t| ((t.pos.x - u.pos.x) as f32).atan2((t.pos.y - u.pos.y) as f32))
@@ -1623,6 +1630,7 @@ pub(crate) fn build_skirmish_render_frame(
                     UnitOrder::Unload { x, y } => ((*x, *y), [0.85, 0.80, 0.30, 0.2]),
                     UnitOrder::Board(_) | UnitOrder::Enhance(_) => continue,
                     UnitOrder::AttackGround { x, y } => ((*x, *y), [1.0, 0.45, 0.10, 0.2]),
+                    UnitOrder::Ferry { from, to } => (if u.cargo.is_empty() { *from } else { *to }, [0.85, 0.80, 0.30, 0.2]),
                     UnitOrder::Guard(tid) => match world.unit(*tid) {
                         Some(t) => ((t.pos.x, t.pos.y), [0.45, 1.0, 0.55, 0.2]),
                         None => continue,
@@ -3315,7 +3323,8 @@ impl ApplicationHandler for PlayApp {
                                     down.1 as f32,
                                     st.config.width,
                                     st.config.height,
-                                ) {
+                                ) && !self.session.finish_waypoint_drag(world_f32_to_milli(start_hit), world_xz, pick_r)
+                                {
                                     self.session.select_box(
                                         world_f32_to_milli(start_hit),
                                         world_xz,
@@ -3469,7 +3478,10 @@ impl ApplicationHandler for PlayApp {
                 use crate::keymap::Action as KA;
                 match action {
                     KA::CancelOrMenu => {
-                        if self.session.build_mode.is_some() || self.session.current_order_mode().is_some() {
+                        if self.session.build_mode.is_some()
+                            || self.session.current_order_mode().is_some()
+                            || self.session.ui.template_mode.is_some()
+                        {
                             self.session.build_mode = None;
                             self.session.clear_order_mode();
                             self.session.ui.build_drag = None;
@@ -3744,6 +3756,29 @@ impl ApplicationHandler for PlayApp {
                     }
                     KA::CardNextTab => {
                         self.session.cycle_card_tab();
+                        ui_changed = true;
+                    }
+                    KA::HotbuildFactory | KA::HotbuildDefense | KA::HotbuildEconomy | KA::HotbuildIntel => {
+                        use crate::roster::BuildGroup as G;
+                        let g = match action {
+                            KA::HotbuildFactory => G::Factory,
+                            KA::HotbuildDefense => G::Defense,
+                            KA::HotbuildEconomy => G::Economy,
+                            _ => G::Intel,
+                        };
+                        if !self.session.is_replay() {
+                            self.session.hotbuild(g);
+                        }
+                        ui_changed = true;
+                    }
+                    KA::TemplateSave => {
+                        self.session.save_template_from_selection();
+                        ui_changed = true;
+                    }
+                    KA::TemplateCycle => {
+                        if !self.session.is_replay() {
+                            self.session.cycle_template();
+                        }
                         ui_changed = true;
                     }
                     KA::CardSlot(i) => {

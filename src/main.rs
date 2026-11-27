@@ -44,6 +44,7 @@ mod sim;
 mod skirmish;
 mod skirmish_ai;
 mod spatial;
+mod templates;
 mod terrain;
 mod stats;
 mod ttf;

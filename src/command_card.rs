@@ -565,6 +565,8 @@ pub enum OrderKind {
     FireState,
     /// Phase 35: pause / resume construction & production.
     PauseBuild,
+    /// Phase 36: ferry route (click pick-up, then drop-off).
+    Ferry,
 }
 
 impl OrderKind {
@@ -591,6 +593,7 @@ impl OrderKind {
             OrderKind::AttackGround => "GROUND",
             OrderKind::FireState => "FIRE",
             OrderKind::PauseBuild => "HOLD BLD",
+            OrderKind::Ferry => "FERRY",
         }
     }
 
@@ -618,6 +621,7 @@ impl OrderKind {
             OrderKind::AttackGround => "attack_ground",
             OrderKind::FireState => "fire_state",
             OrderKind::PauseBuild => "pause_construction",
+            OrderKind::Ferry => "ferry",
         }
     }
 
@@ -660,6 +664,7 @@ impl OrderKind {
                 | OrderKind::Overcharge
                 | OrderKind::LaunchMissile
                 | OrderKind::AttackGround
+                | OrderKind::Ferry
         )
     }
 
@@ -685,14 +690,14 @@ impl OrderKind {
             OrderKind::Fog => A::ToggleFog,
             OrderKind::Ai => A::ToggleAi,
             OrderKind::IdleEngineer => A::IdleEngineer,
-            OrderKind::AttackGround | OrderKind::FireState | OrderKind::PauseBuild => return None,
+            OrderKind::AttackGround | OrderKind::FireState | OrderKind::PauseBuild | OrderKind::Ferry => return None,
         })
     }
 
     pub fn rgb(self) -> [f32; 3] {
         match self {
             OrderKind::Attack | OrderKind::Overcharge | OrderKind::LaunchMissile | OrderKind::AttackGround => [1.0, 0.35, 0.28],
-            OrderKind::Move | OrderKind::Patrol | OrderKind::Load | OrderKind::Unload => [0.40, 0.85, 1.0],
+            OrderKind::Move | OrderKind::Patrol | OrderKind::Load | OrderKind::Unload | OrderKind::Ferry => [0.40, 0.85, 1.0],
             OrderKind::Assist | OrderKind::Guard | OrderKind::Repair => [0.45, 1.0, 0.55],
             OrderKind::Reclaim => [1.0, 0.85, 0.35],
             _ => [0.9, 0.92, 0.96],
@@ -1190,6 +1195,8 @@ impl PlaySession {
         self.attack_move_mode = false;
         self.ui.unload_mode = false;
         self.ui.order_mode = None;
+        self.ui.ferry_from = None;
+        self.ui.template_mode = None;
     }
 
     fn selected_with(&self, pred: impl Fn(&crate::skirmish::Unit) -> bool) -> Vec<UnitId> {
@@ -1231,6 +1238,7 @@ impl PlaySession {
             push(OrderKind::Reclaim, builders);
             push(OrderKind::Load, !self.selected_passengers().is_empty());
             push(OrderKind::Unload, !self.selected_transports().is_empty());
+            push(OrderKind::Ferry, !self.selected_transports().is_empty());
             push(OrderKind::Overcharge, !self.selected_with(|u| u.role == Role::Commander).is_empty());
             push(OrderKind::LaunchMissile, !self.selected_with(|u| u.role == Role::MissileSilo).is_empty());
             // Phase 35: ground fire, fire state (lit unless firing at will) and build pause.
@@ -1325,6 +1333,24 @@ impl PlaySession {
             return false;
         };
         let army = self.human_army;
+        // Phase 36: ferry = two clicks (pick-up, then drop-off).
+        if kind == OrderKind::Ferry {
+            match self.ui.ferry_from.take() {
+                None => {
+                    self.ui.ferry_from = Some(p);
+                    self.status_banner = "Ferry: now click the drop-off point".into();
+                }
+                Some(from) => {
+                    let transports = self.selected_transports();
+                    if !transports.is_empty() {
+                        self.world.issue(army, Command::Ferry { transports, from, to: p, queue });
+                        self.status_banner = "Ferry route set".into();
+                    }
+                    self.ui.order_mode = None;
+                }
+            }
+            return true;
+        }
         let mobiles = self.selected_with(|u| u.speed > 0);
         let builders = self.selected_builders();
         let ally_at = self.world.unit_at(p, pick_radius, Some(army), None);

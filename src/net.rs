@@ -67,7 +67,8 @@ pub const DEFAULT_INPUT_DELAY: u64 = 2;
 /// v10 (Phase 33): sim rules v6 (Novax, EMP stun, death weapons, kamikaze).
 /// v11 (Phase 34): sim rules v7 (prop & live-unit reclaim).
 /// v12 (Phase 35): sim rules v8 (fire states, ground fire, guard, build pause).
-pub const PROTOCOL_VERSION: u32 = 12;
+/// v13 (Phase 36): sim rules v9 (waypoint moves, ferries).
+pub const PROTOCOL_VERSION: u32 = 13;
 /// The host's army (star-topology relay); only it may change the game speed.
 pub const HOST_ARMY: ArmyId = 0;
 /// Sender id of host-generated control messages (`Dropped`).

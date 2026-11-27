@@ -399,10 +399,23 @@ bumps `SIM_VERSION`, re-baselines golden hashes deliberately, and keeps
 
 ### Arc B — Controls & UX (36–39)
 
-### Phase 36 — Build templates, hotbuild & waypoint editing (planned)
-- Saved build templates (base layouts), hotbuild key cycling, dragging queued
-  waypoints, ferry routes for transports, shift-queue visual editing.
-- Exit: a template placed in-game builds identically in a replay.
+### Phase 36 — Build templates, hotbuild, waypoint editing & ferries (done)
+- Build templates (`src/templates.rs`): `Alt+S` saves the selected own structures as a
+  layout (blueprint + offset from the lowest-id anchor) to
+  `$XDG_CONFIG_HOME/farust/templates.txt`; `Alt+T` enters / cycles placement; LMB queues
+  every free site as ordinary `Command::Build`s on the best builder, so a placed template
+  replays exactly. Malformed lines and non-id blueprints are rejected on load.
+- Hotbuild: `Alt+F` / `Alt+D` / `Alt+E` / `Alt+R` cycle the selected builder's factory /
+  defense / economy / intel roster options into build mode (rebindable in Options).
+- Waypoint editing: an LMB drag that starts on a queued Move / AttackMove / Patrol point of
+  the selection moves it (`Command::MoveWaypoint`) instead of box-selecting.
+- Ferries: FERRY order (pick-up click, drop-off click) → `UnitOrder::Ferry` loops: load idle
+  own land units within 12 m of the pick-up point, fly, unload in formation, return.
+  Replay tags 27/28, rules v9. EN/DE tooltips.
+- Exit: template layout → identical queued builds, waypoint drag, ferry delivery and the
+  replay codec (every command) tests pass (322/322); keymap defaults stay conflict-free;
+  `skirmish SCMP_009 --record` → `replay verify` OK. Done.
+- Not done: ghost preview of a template before placing, cross-faction template mapping.
 
 ### Phase 37 — Localization & tooltips (done)
 - Never-panic FA `loc` parser (`src/loc.rs`, fuzzed via `Kind::Loc` in `src/fuzz.rs`):

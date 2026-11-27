@@ -158,6 +158,14 @@ pub struct UiState {
     /// HUD element under the cursor (redraw when it changes).
     pub hud_hover: Option<crate::hud::HudAction>,
     epoch: Option<Instant>,
+    // ----- Phase 36 -----
+    /// Saved build templates (loaded on first use) and the one being placed.
+    pub templates: Option<Vec<crate::templates::BuildTemplate>>,
+    pub template_mode: Option<usize>,
+    /// Hotbuild cycle: (card group label, index of the option last chosen).
+    pub hotbuild: Option<(&'static str, usize)>,
+    /// Ferry order: pick-up point chosen, waiting for the drop-off click.
+    pub ferry_from: Option<(i64, i64)>,
 }
 
 impl UiState {
@@ -291,6 +299,140 @@ pub fn drag_wall_sites(a: (i64, i64), b: (i64, i64), radius: i64) -> Vec<(i64, i
     (0..=n)
         .map(|i| (centre(ax + step(dx, i)), centre(ay + step(dy, i))))
         .collect()
+}
+
+/// Phase 36: build templates, hotbuild, waypoint dragging.
+impl PlaySession {
+    fn templates_mut(&mut self) -> &mut Vec<crate::templates::BuildTemplate> {
+        self.ui.templates.get_or_insert_with(crate::templates::load_all)
+    }
+
+    /// Saves the selected own structures as a new template (`Alt+S`).
+    pub fn save_template_from_selection(&mut self) {
+        let own: Vec<UnitId> = self
+            .selected
+            .iter()
+            .copied()
+            .filter(|id| self.world.unit(*id).is_some_and(|u| u.army == self.human_army))
+            .collect();
+        let n = self.templates_mut().len() + 1;
+        let Some(t) = crate::templates::BuildTemplate::from_structures(&self.world, &own, &format!("Template {n}")) else {
+            self.status_banner = "Template: select own structures first".to_string();
+            return;
+        };
+        let count = t.items.len();
+        self.templates_mut().push(t);
+        let list = self.templates_mut().clone();
+        self.status_banner = match crate::templates::save_all(&list) {
+            Ok(()) => format!("Saved Template {n} ({count} structures)"),
+            Err(e) => format!("Template {n} kept for this session (save failed: {e})"),
+        };
+    }
+
+    /// Enters / advances template placement mode (`Alt+T`).
+    pub fn cycle_template(&mut self) {
+        let len = self.templates_mut().len();
+        if len == 0 {
+            self.status_banner = "No templates yet (select structures, Alt+S)".to_string();
+            return;
+        }
+        let next = self.ui.template_mode.map_or(0, |i| (i + 1) % len);
+        self.ui.template_mode = Some(next);
+        self.build_mode = None;
+        let t = &self.templates_mut()[next];
+        self.status_banner = format!("Place {} ({} structures): LMB, Esc cancels", t.name, t.items.len());
+    }
+
+    /// Places the active template with its anchor at `at`: valid sites become queued builds
+    /// on the best builder. Returns `true` if the click was consumed.
+    pub fn place_template(&mut self, at: (i64, i64), queue: bool) -> bool {
+        let Some(i) = self.ui.template_mode else {
+            return false;
+        };
+        let Some(t) = self.templates_mut().get(i).cloned() else {
+            self.ui.template_mode = None;
+            return false;
+        };
+        let mut placed = 0;
+        for (k, (ty, (x, y))) in t.sites(at).into_iter().enumerate() {
+            if !self.world.site_is_free(&ty, x, y) {
+                continue;
+            }
+            let Some(builder) = self.builder_for(&ty) else { continue };
+            self.world.issue(self.human_army, Command::Build { builder, unit_type: ty, x, y, queue: queue || k > 0 || placed > 0 });
+            placed += 1;
+        }
+        self.status_banner = format!("{}: {placed}/{} structures queued", t.name, t.items.len());
+        if !queue {
+            self.ui.template_mode = None;
+        }
+        true
+    }
+
+    /// Hotbuild: each press of a group key (Alt+F factory, Alt+D defense, Alt+E economy,
+    /// Alt+R intel) selects the next structure of that group the selected builder can build.
+    pub fn hotbuild(&mut self, group: crate::roster::BuildGroup) {
+        let Some(&b) = self.selected_builders().first() else {
+            self.status_banner = "Hotbuild: select a builder".to_string();
+            return;
+        };
+        let Some(bt) = self.world.unit(b).map(|u| u.type_id.clone()) else { return };
+        let opts: Vec<String> = self
+            .world
+            .catalog()
+            .build_options(&bt.to_ascii_uppercase())
+            .iter()
+            .filter(|o| o.kind == crate::roster::BuildKind::Build && o.group == group && self.world.catalog().get(&o.id).is_some())
+            .map(|o| o.id.clone())
+            .collect();
+        if opts.is_empty() {
+            self.status_banner = format!("Hotbuild: nothing in {}", group.label());
+            return;
+        }
+        let idx = match self.ui.hotbuild {
+            Some((g, i)) if g == group.label() => (i + 1) % opts.len(),
+            _ => 0,
+        };
+        self.ui.hotbuild = Some((group.label(), idx));
+        self.ui.template_mode = None;
+        self.build_mode = Some(opts[idx].clone());
+        self.status_banner = format!("Hotbuild {} {}/{}: {}", group.label(), idx + 1, opts.len(), opts[idx]);
+    }
+
+    /// Queued waypoint (Move / AttackMove / Patrol) of a selected own unit within `r` of `p`.
+    pub fn waypoint_at(&self, p: (i64, i64), r: i64) -> Option<u32> {
+        let lim = (r as i128) * (r as i128);
+        self.selected
+            .iter()
+            .filter_map(|id| self.world.unit(*id))
+            .filter(|u| u.army == self.human_army)
+            .flat_map(|u| u.orders.iter().enumerate())
+            .find_map(|(i, o)| match o {
+                crate::skirmish::UnitOrder::Move { x, y }
+                | crate::skirmish::UnitOrder::AttackMove { x, y }
+                | crate::skirmish::UnitOrder::Patrol { x, y } => {
+                    let (dx, dy) = ((x - p.0) as i128, (y - p.1) as i128);
+                    (dx * dx + dy * dy <= lim).then_some(i as u32)
+                }
+                _ => None,
+            })
+    }
+
+    /// LMB drag that started on a queued waypoint moves it to `to` for the whole selection.
+    pub fn finish_waypoint_drag(&mut self, from: (i64, i64), to: (i64, i64), r: i64) -> bool {
+        let Some(index) = self.waypoint_at(from, r) else {
+            return false;
+        };
+        let units: Vec<UnitId> = self
+            .selected
+            .iter()
+            .copied()
+            .filter(|id| self.world.unit(*id).is_some_and(|u| u.army == self.human_army))
+            .collect();
+        self.world.issue(self.human_army, Command::MoveWaypoint { units, index, x: to.0, y: to.1 });
+        self.status_banner = format!("Waypoint {} moved", index + 1);
+        true
+    }
 }
 
 /// Replay seek decision.
@@ -1489,6 +1631,46 @@ mod tests {
         assert_eq!(sess.human_army, 1);
         sess.cycle_replay_perspective();
         assert!(!sess.fog_of_war);
+    }
+
+    #[test]
+    fn templates_waypoint_drag_and_ferry_issue_commands() {
+        use crate::skirmish::tests::test_world;
+        // Template from two own structures, placed elsewhere as queued builds on the ACU.
+        let mut w = test_world(3);
+        let f = w.spawn_unit(0, "RF", (80 * SCALE, 80 * SCALE)).unwrap();
+        let p = w.spawn_unit(0, "RP", (90 * SCALE, 80 * SCALE)).unwrap();
+        w.rebuild_spatial();
+        let t = crate::templates::BuildTemplate::from_structures(&w, &[p, f], "t").unwrap();
+        assert_eq!(t.items, vec![("RF".to_string(), 0, 0), ("RP".to_string(), 10 * SCALE, 0)]);
+        let mut s = PlaySession::new(w, 0, false, 1);
+        let _ = s.world.drain_pending();
+        s.ui.templates = Some(vec![t]);
+        s.cycle_template();
+        assert!(s.place_template((150 * SCALE, 150 * SCALE), false));
+        let cmds = s.world.drain_pending();
+        let sites: Vec<(String, i64, i64, bool)> = cmds
+            .iter()
+            .filter_map(|(_, c)| match c {
+                Command::Build { unit_type, x, y, queue, .. } => Some((unit_type.clone(), *x, *y, *queue)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sites, vec![("RF".into(), 150 * SCALE, 150 * SCALE, false), ("RP".into(), 160 * SCALE, 150 * SCALE, true)]);
+        assert!(s.ui.template_mode.is_none());
+
+        // Waypoint drag: grabbing the second queued move retargets it.
+        let tank = s.world.spawn_unit(0, "RT", (40 * SCALE, 40 * SCALE)).unwrap();
+        s.world.apply_command_direct(0, Command::Move { units: vec![tank], x: 60 * SCALE, y: 40 * SCALE, queue: false });
+        s.world.apply_command_direct(0, Command::Move { units: vec![tank], x: 80 * SCALE, y: 40 * SCALE, queue: true });
+        s.selected = vec![tank];
+        assert_eq!(s.waypoint_at((80 * SCALE + 500, 40 * SCALE), 2 * SCALE), Some(1));
+        assert!(s.finish_waypoint_drag((80 * SCALE, 40 * SCALE), (80 * SCALE, 70 * SCALE), 2 * SCALE));
+        let (_, cmd) = s.world.drain_pending().pop().unwrap();
+        assert_eq!(cmd, Command::MoveWaypoint { units: vec![tank], index: 1, x: 80 * SCALE, y: 70 * SCALE });
+        s.world.apply_command_direct(0, cmd);
+        assert_eq!(s.world.unit(tank).unwrap().orders[1], crate::skirmish::UnitOrder::Move { x: 80 * SCALE, y: 70 * SCALE });
+        assert!(!s.finish_waypoint_drag((10 * SCALE, 10 * SCALE), (0, 0), 2 * SCALE), "no waypoint there");
     }
 
     #[test]

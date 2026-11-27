@@ -1340,6 +1340,8 @@ const BUILTIN_US: &[(&str, &str)] = &[
     ("order.fire_state.help", "Cycle fire at will, return fire and hold fire."),
     ("order.pause_construction.title", "Pause Construction"),
     ("order.pause_construction.help", "Pause or resume construction and production."),
+    ("order.ferry.title", "Ferry Route"),
+    ("order.ferry.help", "Click a pick-up point, then a drop-off point: transports shuttle idle units."),
 ];
 
 const BUILTIN_DE: &[(&str, &str)] = &[
@@ -1486,6 +1488,8 @@ const BUILTIN_DE: &[(&str, &str)] = &[
     ("order.fire_state.help", "Wechselt zwischen Feuer frei, Erwidern und Feuer einstellen."),
     ("order.pause_construction.title", "Bau pausieren"),
     ("order.pause_construction.help", "Pausiert oder setzt Bau und Produktion fort."),
+    ("order.ferry.title", "Fährroute"),
+    ("order.ferry.help", "Abholpunkt, dann Zielpunkt anklicken: Transporter pendeln untätige Einheiten."),
     // Compact order-panel button labels (<= 8 chars)
     ("order.move.short", "BEWEGEN"),
     ("order.attack.short", "ANGRIFF"),
@@ -1508,6 +1512,7 @@ const BUILTIN_DE: &[(&str, &str)] = &[
     ("order.attack_ground.short", "BODEN"),
     ("order.fire_state.short", "FEUER"),
     ("order.pause_construction.short", "BAU-P"),
+    ("order.ferry.short", "FÄHRE"),
 ];
 
 const DE_PHRASES: &[(&str, &str)] = &[

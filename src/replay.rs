@@ -361,6 +361,21 @@ pub(crate) fn encode_command(out: &mut Vec<u8>, cmd: &Command) {
             write_ids(out, units);
             out.push(u8::from(*paused));
         }
+        Command::MoveWaypoint { units, index, x, y } => {
+            out.push(27);
+            write_ids(out, units);
+            out.extend_from_slice(&index.to_le_bytes());
+            out.extend_from_slice(&x.to_le_bytes());
+            out.extend_from_slice(&y.to_le_bytes());
+        }
+        Command::Ferry { transports, from, to, queue } => {
+            out.push(28);
+            write_ids(out, transports);
+            for v in [from.0, from.1, to.0, to.1] {
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            out.push(u8::from(*queue));
+        }
         Command::Enhance { unit, name } => {
             out.push(18);
             out.extend_from_slice(&unit.to_le_bytes());
@@ -507,6 +522,18 @@ pub(crate) fn decode_command(data: &[u8], pos: &mut usize) -> Result<Command, St
             units: read_ids(data, pos)?,
             paused: read_u8(data, pos)? != 0,
         }),
+        27 => Ok(Command::MoveWaypoint {
+            units: read_ids(data, pos)?,
+            index: read_u32(data, pos)?,
+            x: read_i64(data, pos)?,
+            y: read_i64(data, pos)?,
+        }),
+        28 => {
+            let transports = read_ids(data, pos)?;
+            let from = (read_i64(data, pos)?, read_i64(data, pos)?);
+            let to = (read_i64(data, pos)?, read_i64(data, pos)?);
+            Ok(Command::Ferry { transports, from, to, queue: read_u8(data, pos)? != 0 })
+        }
         18 => Ok(Command::Enhance {
             unit: read_u32(data, pos)?,
             name: read_str(data, pos)?,
@@ -818,6 +845,8 @@ mod tests {
             Command::AttackGround { units: vec![4], x: -5, y: 9_000, queue: true },
             Command::Guard { units: vec![5, 6], target: 7, queue: false },
             Command::SetBuildPaused { units: vec![8], paused: true },
+            Command::MoveWaypoint { units: vec![1, 9], index: 2, x: 777, y: -3 },
+            Command::Ferry { transports: vec![30], from: (1_000, 2_000), to: (-5, 90_000), queue: true },
         ];
         let mut buf = Vec::new();
         for c in &all {

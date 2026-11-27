@@ -495,8 +495,8 @@ pub const LOF_CLEARANCE: i64 = SCALE / 4;
 /// 3 = Phase 30 air fuel & staging; 4 = Phase 31 engineering stations & pod drones;
 /// 5 = Phase 32 mobile factories, mobile staging & hatching eggs; 6 = Phase 33 Novax
 /// satellite, EMP stun, death explosions & kamikaze weapons; 7 = Phase 34 prop reclaim;
-/// 8 = Phase 35 fire states, ground fire, guard & build pause.
-pub const RULES_VERSION: u32 = 8;
+/// 8 = Phase 35 fire states, ground fire, guard & build pause; 9 = Phase 36 ferries.
+pub const RULES_VERSION: u32 = 9;
 
 /// Phase 29: milliradians per degree, scaled by 1000 (17.453 mrad / deg).
 const MRAD_PER_DEG_MILLI: i64 = 17_453;
@@ -1858,6 +1858,8 @@ pub enum UnitOrder {
     AttackGround { x: i64, y: i64 },
     /// Phase 35: follow and protect a friendly unit.
     Guard(UnitId),
+    /// Phase 36: (air transport) shuttle idle land units from `from` to `to`, forever.
+    Ferry { from: (i64, i64), to: (i64, i64) },
 }
 
 /// Phase 35: automatic engagement rule of a unit (FA `RULEUCC_RetaliateToggle`).
@@ -1937,6 +1939,10 @@ pub enum Command {
     Guard { units: Vec<UnitId>, target: UnitId, queue: bool },
     /// Phase 35: pause / resume construction and production.
     SetBuildPaused { units: Vec<UnitId>, paused: bool },
+    /// Phase 36: move the `index`-th queued Move / AttackMove / Patrol point of each unit.
+    MoveWaypoint { units: Vec<UnitId>, index: u32, x: i64, y: i64 },
+    /// Phase 36: set up a ferry route for air transports.
+    Ferry { transports: Vec<UnitId>, from: (i64, i64), to: (i64, i64), queue: bool },
     /// Phase 18: `transports` fly to `(x, y)` and drop their cargo.
     Unload { transports: Vec<UnitId>, x: i64, y: i64, queue: bool },
     /// Phase 18: install ACU/SCU enhancement `name` (blueprint `Enhancements` key).
@@ -2274,6 +2280,9 @@ enum ReclaimKind {
     Prop,
     Unit,
 }
+
+/// Phase 36: idle land units this close to a ferry's pick-up point board it.
+pub const FERRY_RADIUS: i64 = 12 * SCALE;
 
 /// Phase 34: snap radius for prop reclaim orders.
 pub const PROP_SNAP: i64 = 3 * SCALE;
@@ -3888,6 +3897,44 @@ impl Skirmish {
                 }
                 !v.is_empty()
             }
+            Command::MoveWaypoint { units, index, x, y } => {
+                let p = self.clamp_to_map(x, y);
+                let mut any = false;
+                for id in units {
+                    let Some(u) = self.units.get_mut(&id).filter(|u| u.army == army && u.alive) else { continue };
+                    let Some(o) = u.orders.get_mut(index as usize) else { continue };
+                    match o {
+                        UnitOrder::Move { x, y } | UnitOrder::AttackMove { x, y } | UnitOrder::Patrol { x, y } => {
+                            (*x, *y) = p;
+                            any = true;
+                            if index == 0 {
+                                u.path.clear();
+                                u.path_goal = None;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                any
+            }
+            Command::Ferry { transports, from, to, queue } => {
+                let (from, to) = (self.clamp_to_map(from.0, from.1), self.clamp_to_map(to.0, to.1));
+                let mut v: Vec<UnitId> = transports
+                    .iter()
+                    .copied()
+                    .filter(|id| {
+                        self.unit(*id).is_some_and(|u| {
+                            u.army == army && u.carried_by.is_none() && self.catalog.get(&u.type_id).is_some_and(|t| t.ext.transport.is_some())
+                        })
+                    })
+                    .collect();
+                v.sort_unstable();
+                v.dedup();
+                for id in &v {
+                    self.push_order(*id, UnitOrder::Ferry { from, to }, queue);
+                }
+                !v.is_empty()
+            }
             Command::SetAutoRefuel { units, enabled } => {
                 let mut any = false;
                 for id in units {
@@ -4310,7 +4357,7 @@ impl Skirmish {
         }
         { let _p = scope("sim.movement"); self.step_movement(); }
         { let _p = scope("sim.separation"); self.step_separation(); }
-        { let _p = scope("sim.transport"); self.step_transport(); self.step_staging(); }
+        { let _p = scope("sim.transport"); self.step_transport(); self.step_ferries(); self.step_staging(); }
         for u in self.units.values_mut() {
             u.vel = (u.pos.x - u.vel.0, u.pos.y - u.vel.1);
         }
@@ -5479,6 +5526,13 @@ impl Skirmish {
                         return None;
                     }
                     return Some(((x, y), SCALE));
+                }
+                UnitOrder::Ferry { from, to } => {
+                    let goal = if u.cargo.is_empty() { from } else { to };
+                    if pos == goal {
+                        return None;
+                    }
+                    return Some((goal, SCALE));
                 }
                 UnitOrder::AttackGround { x, y } => {
                     let reach = (u.max_range - SCALE).max(SCALE) as i128;
@@ -6965,6 +7019,76 @@ impl Skirmish {
         }
     }
 
+    /// Phase 36 ferries (ascending transport id): at the pick-up point an empty-ish
+    /// transport loads idle own land units within [`FERRY_RADIUS`] (ascending id, capacity
+    /// checked) and leaves as soon as it carries anyone; at the drop-off point it unloads
+    /// in formation and heads back. The route repeats until another order replaces it.
+    fn step_ferries(&mut self) {
+        type Route = (UnitId, (i64, i64), (i64, i64));
+        let ferries: Vec<Route> = self
+            .units
+            .values()
+            .filter(|u| u.alive && u.carried_by.is_none())
+            .filter_map(|u| match u.orders.front() {
+                Some(UnitOrder::Ferry { from, to }) => Some((u.id, *from, *to)),
+                _ => None,
+            })
+            .collect();
+        for (tid, from, to) in ferries {
+            let (tpos, army, cargo) = {
+                let t = &self.units[&tid];
+                ((t.pos.x, t.pos.y), t.army, t.cargo.clone())
+            };
+            if cargo.is_empty() && tpos == from {
+                let lim = (FERRY_RADIUS as i128).pow(2);
+                let waiting: Vec<UnitId> = self
+                    .units
+                    .values()
+                    .filter(|u| {
+                        u.alive
+                            && u.army == army
+                            && u.domain != NavDomain::Air
+                            && u.carried_by.is_none()
+                            && u.orders.is_empty()
+                            && u.build.is_none()
+                            && dist_sq((u.pos.x, u.pos.y), from) <= lim
+                    })
+                    .map(|u| u.id)
+                    .collect();
+                for pid in waiting {
+                    if !self.can_board(pid, tid) {
+                        continue;
+                    }
+                    let p = self.units.get_mut(&pid).unwrap();
+                    p.carried_by = Some(tid);
+                    p.path.clear();
+                    p.path_goal = None;
+                    p.moving = false;
+                    self.units.get_mut(&tid).unwrap().cargo.push(pid);
+                }
+            } else if !cargo.is_empty() && tpos == to {
+                let n = cargo.len();
+                for (i, &c) in cargo.iter().enumerate() {
+                    let (sx, sy) = Self::formation_slot(i, n, to.0, to.1);
+                    let (sx, sy) = self.walkable_near(c, self.clamp_to_map(sx, sy));
+                    if let Some(u) = self.units.get_mut(&c) {
+                        u.carried_by = None;
+                        u.pos = Vec2 { x: sx, y: sy };
+                        u.altitude = 0;
+                        u.orders.clear();
+                        u.path.clear();
+                        u.path_goal = None;
+                    }
+                }
+                let t = self.units.get_mut(&tid).unwrap();
+                t.cargo.clear();
+                t.path.clear();
+                t.path_goal = None;
+                self.emit_event(SimEvent::BuildSpark { pos: (to.0, to.1, SCALE), army });
+            }
+        }
+    }
+
     fn step_cleanup(&mut self) {
         // Phase 18: passengers die with their transport (FA behaviour).
         let doomed: Vec<(Vec<UnitId>, Option<ArmyId>, Option<UnitId>)> = self
@@ -8218,6 +8342,35 @@ pub(crate) mod tests {
         w.issue(0, Command::SetBuildPaused { units: vec![fac], paused: false });
         w.run(20);
         assert!(w.unit(fac).unwrap().build.as_ref().is_none_or(|b| b.project.progress > p2), "resumes");
+    }
+
+    #[test]
+    fn ferries_shuttle_idle_land_units_between_two_points() {
+        let mut w = wall_world();
+        let mut tr = ty("RTRANS", Role::Mobile, 300, 10, 0, 0);
+        tr.domain = NavDomain::Air;
+        tr.elevation = 8 * SCALE;
+        tr.ext.transport = Some(TransportSpec { small: 6, medium: 2, large: 1, class2_size: 2, class3_size: 4, carries_commander: false });
+        w.catalog.types.insert("RTRANS".into(), tr);
+        let t = w.spawn_unit(0, "RTRANS", (40 * SCALE, 40 * SCALE)).unwrap();
+        let pax: Vec<UnitId> = (0..3).map(|i| w.spawn_unit(0, "RT", (60 * SCALE + i * 2 * SCALE, 60 * SCALE)).unwrap()).collect();
+        let busy = w.spawn_unit(0, "RT", (61 * SCALE, 62 * SCALE)).unwrap();
+        w.issue(0, Command::Move { units: vec![busy], x: 30 * SCALE, y: 200 * SCALE, queue: false });
+        w.issue(0, Command::Ferry { transports: vec![t], from: (60 * SCALE, 60 * SCALE), to: (180 * SCALE, 160 * SCALE), queue: false });
+        let mut delivered = false;
+        for _ in 0..400 {
+            w.step();
+            if pax.iter().all(|p| {
+                let u = w.unit(*p).unwrap();
+                u.carried_by.is_none() && dist_sq((u.pos.x, u.pos.y), (180 * SCALE, 160 * SCALE)) <= (10 * SCALE as i128).pow(2)
+            }) {
+                delivered = true;
+                break;
+            }
+        }
+        assert!(delivered, "all idle units at the pick-up point were ferried across");
+        assert!(w.unit(busy).unwrap().pos.y > 70 * SCALE, "a unit with its own orders was not picked up");
+        assert!(matches!(w.unit(t).unwrap().orders.front(), Some(UnitOrder::Ferry { .. })), "the route repeats");
     }
 
     #[test]
