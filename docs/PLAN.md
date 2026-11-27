@@ -534,12 +534,30 @@ bumps `SIM_VERSION`, re-baselines golden hashes deliberately, and keeps
 
 ### Arc D — Netcode & online (44–47)
 
-### Phase 44 — UDP lockstep & NAT hole punching (planned)
-- UDP transport with sequence/ack/resend, NAT hole punching through the
-  Phase 26 rendezvous server, TCP relay kept as fallback, adaptive input
-  delay from measured RTT.
-- Exit: a match survives 5% simulated packet loss with no desync; the netem
-  loopback test passes.
+### Phase 44 — UDP lockstep & NAT hole punching (done)
+- Reliable-ordered UDP transport (`src/udp_transport.rs`, `std::net::UdpSocket` only):
+  shared `UdpMux` + `UdpChannel` with sequence numbers, cumulative + 64-bit SACK,
+  fast retransmit, Karn/Jacobson SRTT/RTTVAR/RTO (with Karn Part 2 RTO backoff),
+  duplicate suppression, MTU-safe fragmentation (`1180` B chunks, up to 2 MiB frames),
+  keepalive/idle timeout, graceful FIN drain, and a seeded in-process `NetemSocket`
+  impairment shim (`loss`, `dup`, `reorder`, `delay`, `jitter`, `seed`).
+- Transport abstraction & adaptive input delay (`src/net.rs`, protocol v14): `PeerStream`
+  runs `LockstepHost` / `LockstepClient` over TCP or UDP identically; `AdaptiveDelayController`
+  samples worst-peer `(srtt, rttvar)` and emits `NetControl::InputDelay` (`SYSTEM_SENDER`,
+  clamped `2..=8` turns with down-step hysteresis) so all peers switch `input_delay` on the
+  exact same turn boundary. CLI: `--udp` and `--netem loss=5,dup=2,reorder=3` on `host`/`join`.
+- NAT hole punching (`src/rendezvous.rs`): `RendezvousServer` binds TCP+UDP on the same port,
+  observes peer public UDP endpoints (`PKT_RV_REG`/`PKT_RV_ACK`), and coordinates simultaneous
+  punches (`ClientPunch`/`HostPunch`/`PunchInfo`, backward-compatible v1 extensions); punch
+  failure or `--relay` falls back seamlessly to direct TCP / TCP relay.
+- Exit: 336/336 release tests pass (2- and 3-peer UDP loopback with 5% loss / 2% dup / reorder 3
+  matches TCP hash, high-RTT adaptive delay syncs identically across peers, rendezvous UDP punch
+  and TCP fallback pass); localhost 2-peer `SCMP_001` 600-tick runs over TCP, clean UDP, lossy
+  `--netem` UDP (46 drops / 17 dups / 282 reorders), and rendezvous `--code --udp --netem`
+  (`udp-punch`, 48 drops / 13 dups / 291 reorders) all end on identical hash `4f868f25ff409113`;
+  `sim-run --ticks 10000` `35db8f2bd7a6faf2` and `skirmish SCMP_001` `0fe934990406d829` unchanged. Done.
+- Not done: menu lobby (`net_lobby.rs`) still runs its pre-game handshake over TCP; symmetric-NAT
+  port prediction (falls back to TCP relay).
 
 ### Phase 45 — Reconnect & late join (planned)
 - Rejoin after a drop: savegame snapshot transfer + catch-up re-sim, AI

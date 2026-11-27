@@ -20,6 +20,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::net::{lobby_read_frame, lobby_write_frame};
 use crate::replay::{read_str, read_u8, read_u64, write_str};
+use crate::udp_transport::{
+    NetemConfig, ROLE_CLIENT, ROLE_HOST, UdpChannel, UdpMux, decode_rv_reg, encode_rv_ack,
+    next_punch_token,
+};
 
 pub const DEFAULT_ADDR: &str = "127.0.0.1:15050";
 
@@ -42,6 +46,12 @@ const MSG_HOST_TUNNEL: u8 = 10;
 const MSG_TUNNEL_GO: u8 = 11;
 const MSG_RELAY_READY: u8 = 12;
 const MSG_ERROR: u8 = 13;
+// Phase 44 backward-compatible extensions (UDP NAT hole punching):
+const MSG_REGISTER_UDP: u8 = 14;
+const MSG_UDP_REGISTERED: u8 = 15;
+const MSG_CLIENT_PUNCH: u8 = 16;
+const MSG_HOST_PUNCH: u8 = 17;
+const MSG_PUNCH_INFO: u8 = 18;
 
 const CTRL_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const RELAY_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -186,6 +196,24 @@ enum RvMsg {
         host_addr: SocketAddr,
     },
     Error(String),
+    RegisterUdp {
+        code: String,
+        token: u64,
+        udp_local_addrs: Vec<SocketAddr>,
+    },
+    UdpRegistered,
+    ClientPunch {
+        code: String,
+        punch_token: u64,
+        client_udp_addrs: Vec<SocketAddr>,
+    },
+    HostPunch {
+        punch_token: u64,
+        client_udp_addrs: Vec<SocketAddr>,
+    },
+    PunchInfo {
+        host_udp_addrs: Vec<SocketAddr>,
+    },
 }
 
 fn write_u16(out: &mut Vec<u8>, v: u16) {
@@ -318,6 +346,28 @@ fn encode_msg(m: &RvMsg) -> Vec<u8> {
             out.push(MSG_ERROR);
             write_str(&mut out, e);
         }
+        RvMsg::RegisterUdp { code, token, udp_local_addrs } => {
+            out.push(MSG_REGISTER_UDP);
+            write_str(&mut out, code);
+            out.extend_from_slice(&token.to_le_bytes());
+            write_addrs(&mut out, udp_local_addrs);
+        }
+        RvMsg::UdpRegistered => out.push(MSG_UDP_REGISTERED),
+        RvMsg::ClientPunch { code, punch_token, client_udp_addrs } => {
+            out.push(MSG_CLIENT_PUNCH);
+            write_str(&mut out, code);
+            out.extend_from_slice(&punch_token.to_le_bytes());
+            write_addrs(&mut out, client_udp_addrs);
+        }
+        RvMsg::HostPunch { punch_token, client_udp_addrs } => {
+            out.push(MSG_HOST_PUNCH);
+            out.extend_from_slice(&punch_token.to_le_bytes());
+            write_addrs(&mut out, client_udp_addrs);
+        }
+        RvMsg::PunchInfo { host_udp_addrs } => {
+            out.push(MSG_PUNCH_INFO);
+            write_addrs(&mut out, host_udp_addrs);
+        }
     }
     out
 }
@@ -371,6 +421,24 @@ fn decode_msg(data: &[u8]) -> Result<RvMsg, String> {
         MSG_TUNNEL_GO => RvMsg::TunnelGo,
         MSG_RELAY_READY => RvMsg::RelayReady { host_addr: read_addr(data, &mut pos)? },
         MSG_ERROR => RvMsg::Error(read_str(data, &mut pos)?),
+        MSG_REGISTER_UDP => RvMsg::RegisterUdp {
+            code: read_str(data, &mut pos)?,
+            token: read_u64(data, &mut pos)?,
+            udp_local_addrs: read_addrs(data, &mut pos)?,
+        },
+        MSG_UDP_REGISTERED => RvMsg::UdpRegistered,
+        MSG_CLIENT_PUNCH => RvMsg::ClientPunch {
+            code: read_str(data, &mut pos)?,
+            punch_token: read_u64(data, &mut pos)?,
+            client_udp_addrs: read_addrs(data, &mut pos)?,
+        },
+        MSG_HOST_PUNCH => RvMsg::HostPunch {
+            punch_token: read_u64(data, &mut pos)?,
+            client_udp_addrs: read_addrs(data, &mut pos)?,
+        },
+        MSG_PUNCH_INFO => RvMsg::PunchInfo {
+            host_udp_addrs: read_addrs(data, &mut pos)?,
+        },
         other => return Err(format!("unknown rendezvous message {other}")),
     };
     if pos != data.len() {
@@ -411,6 +479,8 @@ struct RoomEntry {
     token: u64,
     ctrl_writer: Arc<Mutex<TcpStream>>,
     addrs: Vec<SocketAddr>,
+    udp_observed: Option<SocketAddr>,
+    udp_local_addrs: Vec<SocketAddr>,
     host_name: String,
     map_id: String,
 }
@@ -423,6 +493,7 @@ struct PendingTunnel {
 struct ServerState {
     rooms: Mutex<HashMap<String, RoomEntry>>,
     tunnels: Mutex<HashMap<(String, u64), PendingTunnel>>,
+    client_udp: Mutex<HashMap<(String, u64), (SocketAddr, Instant)>>,
     next_tunnel: AtomicU64,
 }
 
@@ -431,6 +502,7 @@ impl ServerState {
         Self {
             rooms: Mutex::new(HashMap::new()),
             tunnels: Mutex::new(HashMap::new()),
+            client_udp: Mutex::new(HashMap::new()),
             next_tunnel: AtomicU64::new(1),
         }
     }
@@ -444,6 +516,9 @@ impl ServerState {
         if let Ok(mut tunnels) = self.tunnels.lock() {
             tunnels.retain(|(c, _), p| c != code || p.token != token);
         }
+        if let Ok(mut cudp) = self.client_udp.lock() {
+            cudp.retain(|(c, _), _| c != code);
+        }
     }
 }
 
@@ -451,16 +526,43 @@ pub struct RendezvousServer {
     local_addr: SocketAddr,
     stop: Arc<AtomicBool>,
     accept_thread: Option<JoinHandle<()>>,
+    udp_thread: Option<JoinHandle<()>>,
 }
 
 impl RendezvousServer {
     pub fn bind(addr: &str) -> Result<Self, String> {
-        let listener = TcpListener::bind(addr)
-            .map_err(|e| format!("cannot bind rendezvous server on {addr}: {e}"))?;
-        let local_addr = listener.local_addr().map_err(|e| format!("local_addr: {e}"))?;
+        let mut last_err = String::new();
+        let (listener, udp_sock, local_addr) = {
+            let mut bound = None;
+            for _ in 0..5 {
+                let l = TcpListener::bind(addr)
+                    .map_err(|e| format!("cannot bind rendezvous server on {addr}: {e}"))?;
+                let la = l.local_addr().map_err(|e| format!("local_addr: {e}"))?;
+                match UdpSocket::bind(la) {
+                    Ok(u) => {
+                        bound = Some((l, u, la));
+                        break;
+                    }
+                    Err(e) => {
+                        last_err = format!("cannot bind rendezvous UDP on {la}: {e}");
+                        // Only retry if caller asked for an ephemeral port.
+                        if !addr.ends_with(":0") {
+                            break;
+                        }
+                    }
+                }
+            }
+            match bound {
+                Some(v) => v,
+                None => return Err(last_err),
+            }
+        };
         listener
             .set_nonblocking(true)
             .map_err(|e| format!("set_nonblocking: {e}"))?;
+        udp_sock
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .map_err(|e| format!("udp set_read_timeout: {e}"))?;
         let state = Arc::new(ServerState::new());
         let stop = Arc::new(AtomicBool::new(false));
         let (st, sp) = (state.clone(), stop.clone());
@@ -484,7 +586,46 @@ impl RendezvousServer {
                 }
             }
         });
-        Ok(Self { local_addr, stop, accept_thread: Some(accept_thread) })
+        let (ust, usp) = (state, stop.clone());
+        let udp_thread = std::thread::spawn(move || {
+            let mut buf = [0u8; 512];
+            while !usp.load(Ordering::Relaxed) {
+                let (n, src) = match udp_sock.recv_from(&mut buf) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let Some((role, token, code)) = decode_rv_reg(&buf[..n]) else {
+                    continue;
+                };
+                let Some(norm) = normalize_code(&code) else {
+                    continue;
+                };
+                if role == ROLE_HOST {
+                    if let Ok(mut rooms) = ust.rooms.lock()
+                        && let Some(r) = rooms.get_mut(&norm)
+                        && r.token == token
+                    {
+                        r.udp_observed = Some(src);
+                        let ack = encode_rv_ack(token, src);
+                        let _ = udp_sock.send_to(&ack, src);
+                    }
+                } else if role == ROLE_CLIENT {
+                    let now = Instant::now();
+                    if let Ok(mut cudp) = ust.client_udp.lock() {
+                        cudp.retain(|_, (_, ts)| now.duration_since(*ts) < Duration::from_secs(60));
+                        cudp.insert((norm, token), (src, now));
+                    }
+                    let ack = encode_rv_ack(token, src);
+                    let _ = udp_sock.send_to(&ack, src);
+                }
+            }
+        });
+        Ok(Self {
+            local_addr,
+            stop,
+            accept_thread: Some(accept_thread),
+            udp_thread: Some(udp_thread),
+        })
     }
 
     pub fn local_addr(&self) -> SocketAddr {
@@ -507,12 +648,16 @@ impl RendezvousServer {
                 ip if ip.is_unspecified() => IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
                 ip => ip,
             };
-            let _ = TcpStream::connect_timeout(
-                &SocketAddr::new(wake_ip, self.local_addr.port()),
-                Duration::from_millis(100),
-            );
+            let wake_sa = SocketAddr::new(wake_ip, self.local_addr.port());
+            let _ = TcpStream::connect_timeout(&wake_sa, Duration::from_millis(100));
+            if let Ok(u) = UdpSocket::bind(if wake_sa.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" }) {
+                let _ = u.send_to(&[0u8], wake_sa);
+            }
         }
         if let Some(h) = self.accept_thread.take() {
+            let _ = h.join();
+        }
+        if let Some(h) = self.udp_thread.take() {
             let _ = h.join();
         }
     }
@@ -574,6 +719,8 @@ fn handle_server_conn(mut stream: TcpStream, peer: SocketAddr, state: Arc<Server
                         token,
                         ctrl_writer: ctrl_writer.clone(),
                         addrs: addrs.clone(),
+                        udp_observed: None,
+                        udp_local_addrs: Vec::new(),
                         host_name,
                         map_id,
                     },
@@ -594,6 +741,26 @@ fn handle_server_conn(mut stream: TcpStream, peer: SocketAddr, state: Arc<Server
                             && send_msg(&mut w, &RvMsg::Pong).is_err()
                         {
                             break;
+                        }
+                    }
+                    Ok(RvMsg::RegisterUdp { code: c, token: t, udp_local_addrs }) => {
+                        if let Some(nc) = normalize_code(&c)
+                            && nc == norm
+                            && t == token
+                        {
+                            if let Ok(mut rooms) = state.rooms.lock()
+                                && let Some(r) = rooms.get_mut(&norm)
+                            {
+                                r.udp_local_addrs = udp_local_addrs
+                                    .into_iter()
+                                    .filter(|a| !a.ip().is_unspecified() && a.port() > 0)
+                                    .collect();
+                            }
+                            if let Ok(mut w) = ctrl_writer.lock()
+                                && send_msg(&mut w, &RvMsg::UdpRegistered).is_err()
+                            {
+                                break;
+                            }
                         }
                     }
                     Ok(RvMsg::Unregister { code: c, token: t }) => {
@@ -701,6 +868,84 @@ fn handle_server_conn(mut stream: TcpStream, peer: SocketAddr, state: Arc<Server
                 let _ = tx.send(stream);
             }
         }
+        RvMsg::ClientPunch { code, punch_token, client_udp_addrs } => {
+            let Some(norm) = normalize_code(&code) else {
+                let _ = send_msg(&mut stream, &RvMsg::Error(format!("invalid invite code '{code}'")));
+                return;
+            };
+            let (ctrl_writer, host_targets) = {
+                let rooms = state.rooms.lock().unwrap();
+                let Some(r) = rooms.get(&norm) else {
+                    drop(rooms);
+                    let _ = send_msg(
+                        &mut stream,
+                        &RvMsg::Error(format!("unknown or expired invite code '{norm}'")),
+                    );
+                    return;
+                };
+                let mut h_addrs: Vec<SocketAddr> = Vec::new();
+                if let Some(obs) = r.udp_observed
+                    && !obs.ip().is_unspecified()
+                    && obs.port() > 0
+                {
+                    h_addrs.push(obs);
+                }
+                for &a in &r.udp_local_addrs {
+                    if !a.ip().is_unspecified() && a.port() > 0 && !h_addrs.contains(&a) {
+                        h_addrs.push(a);
+                    }
+                }
+                if h_addrs.is_empty() {
+                    drop(rooms);
+                    let _ = send_msg(
+                        &mut stream,
+                        &RvMsg::Error("host does not support UDP hole punching".into()),
+                    );
+                    return;
+                }
+                (r.ctrl_writer.clone(), h_addrs)
+            };
+            let client_observed = state
+                .client_udp
+                .lock()
+                .ok()
+                .and_then(|mut m| m.remove(&(norm.clone(), punch_token)))
+                .map(|(sa, _)| sa);
+            let mut client_targets: Vec<SocketAddr> = Vec::new();
+            if let Some(obs) = client_observed
+                && !obs.ip().is_unspecified()
+                && obs.port() > 0
+            {
+                client_targets.push(obs);
+            }
+            for a in client_udp_addrs {
+                if !a.ip().is_unspecified() && a.port() > 0 && !client_targets.contains(&a) {
+                    client_targets.push(a);
+                }
+            }
+            if client_targets.is_empty() {
+                let _ = send_msg(&mut stream, &RvMsg::Error("no client UDP endpoint observed".into()));
+                return;
+            }
+            // Trigger both peers simultaneously: host via control channel, client via reply.
+            let host_res = ctrl_writer
+                .lock()
+                .map_err(|_| "host control poisoned".to_string())
+                .and_then(|mut w| {
+                    send_msg(
+                        &mut w,
+                        &RvMsg::HostPunch {
+                            punch_token,
+                            client_udp_addrs: client_targets,
+                        },
+                    )
+                });
+            if host_res.is_err() {
+                let _ = send_msg(&mut stream, &RvMsg::Error("host control connection lost".into()));
+                return;
+            }
+            let _ = send_msg(&mut stream, &RvMsg::PunchInfo { host_udp_addrs: host_targets });
+        }
         _ => {
             let _ = send_msg(&mut stream, &RvMsg::Error("unexpected initial rendezvous message".into()));
         }
@@ -736,8 +981,12 @@ pub struct HostRegistration {
     token: u64,
     stop: Arc<AtomicBool>,
     ctrl_writer: Arc<Mutex<TcpStream>>,
+    udp_mux: Option<Arc<UdpMux>>,
     thread: Option<JoinHandle<()>>,
 }
+
+type TunnelCallback = Arc<dyn Fn(TcpStream, SocketAddr) + Send + Sync + 'static>;
+type PunchCallback = Arc<dyn Fn(u64, Vec<SocketAddr>) + Send + Sync + 'static>;
 
 impl HostRegistration {
     /// Registers a listening match/lobby at `rendezvous_addr` and spawns a control loop that
@@ -750,7 +999,51 @@ impl HostRegistration {
         connect_timeout: Duration,
         on_tunnel: Box<dyn Fn(TcpStream, SocketAddr) + Send + Sync + 'static>,
     ) -> Result<Self, String> {
-        let on_tunnel: Arc<dyn Fn(TcpStream, SocketAddr) + Send + Sync + 'static> = Arc::from(on_tunnel);
+        Self::register_inner(
+            rendezvous_addr,
+            bound,
+            host_name,
+            map_id,
+            connect_timeout,
+            Arc::from(on_tunnel),
+            None,
+        )
+    }
+
+    /// Registers a host supporting both UDP NAT hole punching (`udp_mux` + `on_punch`) and
+    /// TCP direct/relay fallback (`on_tunnel`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_with_udp(
+        rendezvous_addr: &str,
+        tcp_bound: SocketAddr,
+        udp_mux: Arc<UdpMux>,
+        host_name: &str,
+        map_id: &str,
+        connect_timeout: Duration,
+        on_tunnel: Box<dyn Fn(TcpStream, SocketAddr) + Send + Sync + 'static>,
+        on_punch: Box<dyn Fn(u64, Vec<SocketAddr>) + Send + Sync + 'static>,
+    ) -> Result<Self, String> {
+        Self::register_inner(
+            rendezvous_addr,
+            tcp_bound,
+            host_name,
+            map_id,
+            connect_timeout,
+            Arc::from(on_tunnel),
+            Some((udp_mux, Arc::from(on_punch))),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn register_inner(
+        rendezvous_addr: &str,
+        bound: SocketAddr,
+        host_name: &str,
+        map_id: &str,
+        connect_timeout: Duration,
+        on_tunnel: TunnelCallback,
+        udp: Option<(Arc<UdpMux>, PunchCallback)>,
+    ) -> Result<Self, String> {
         let local_addrs = discover_local_addrs(bound);
         let token = generate_token();
         let mut last_err = String::new();
@@ -775,17 +1068,54 @@ impl HostRegistration {
             )?;
             match recv_msg(&mut ctrl)? {
                 RvMsg::Registered { code: assigned, .. } => {
-                    let ctrl_writer = Arc::new(Mutex::new(ctrl.try_clone().map_err(|e| format!("ctrl clone: {e}"))?));
+                    let (udp_mux, on_punch) = match &udp {
+                        Some((mux, cb)) => {
+                            // Best-effort UDP endpoint observation + local UDP addr publication.
+                            // Even if UDP registration fails (e.g. strict firewall), TCP relay still works.
+                            if mux
+                                .register_rendezvous_udp(
+                                    rv_sa,
+                                    ROLE_HOST,
+                                    token,
+                                    assigned.clone(),
+                                    connect_timeout.min(Duration::from_secs(2)),
+                                    true,
+                                )
+                                .is_ok()
+                            {
+                                let udp_local_addrs = discover_local_addrs(mux.local_addr());
+                                if send_msg(
+                                    &mut ctrl,
+                                    &RvMsg::RegisterUdp {
+                                        code: assigned.clone(),
+                                        token,
+                                        udp_local_addrs,
+                                    },
+                                )
+                                .is_ok()
+                                {
+                                    let _ = recv_msg(&mut ctrl);
+                                }
+                            }
+                            (Some(mux.clone()), Some(cb.clone()))
+                        }
+                        None => (None, None),
+                    };
+
+                    let ctrl_writer = Arc::new(Mutex::new(
+                        ctrl.try_clone().map_err(|e| format!("ctrl clone: {e}"))?,
+                    ));
                     let stop = Arc::new(AtomicBool::new(false));
                     let _ = ctrl.set_read_timeout(Some(Duration::from_millis(400)));
 
                     let (c_code, c_stop, c_writer) = (assigned.clone(), stop.clone(), ctrl_writer.clone());
+                    let c_tunnel = on_tunnel.clone();
                     let thread = std::thread::spawn(move || {
                         let mut last_ping = Instant::now();
                         while !c_stop.load(Ordering::Relaxed) {
                             match recv_msg(&mut ctrl) {
                                 Ok(RvMsg::OpenTunnel { tunnel_id, client_addr }) => {
-                                    let cb = on_tunnel.clone();
+                                    let cb = c_tunnel.clone();
                                     let t_code = c_code.clone();
                                     std::thread::spawn(move || {
                                         if let Ok(mut s) = TcpStream::connect_timeout(&rv_sa, RELAY_HANDSHAKE_TIMEOUT) {
@@ -802,7 +1132,12 @@ impl HostRegistration {
                                         }
                                     });
                                 }
-                                Ok(RvMsg::Pong) => {}
+                                Ok(RvMsg::HostPunch { punch_token, client_udp_addrs }) => {
+                                    if let Some(cb) = &on_punch {
+                                        cb(punch_token, client_udp_addrs);
+                                    }
+                                }
+                                Ok(RvMsg::Pong | RvMsg::UdpRegistered) => {}
                                 Ok(_) => {}
                                 Err(e) if e.contains("TimedOut") || e.contains("WouldBlock") => {
                                     if last_ping.elapsed() >= CTRL_HEARTBEAT_INTERVAL {
@@ -824,6 +1159,7 @@ impl HostRegistration {
                         token,
                         stop,
                         ctrl_writer,
+                        udp_mux,
                         thread: Some(thread),
                     });
                 }
@@ -835,6 +1171,9 @@ impl HostRegistration {
     }
 
     pub fn close(&mut self) {
+        if let Some(mux) = self.udp_mux.take() {
+            mux.clear_rendezvous_keepalive();
+        }
         if !self.stop.swap(true, Ordering::Relaxed) {
             if let Ok(mut w) = self.ctrl_writer.lock() {
                 let _ = send_msg(&mut w, &RvMsg::Unregister { code: self.code.clone(), token: self.token });
@@ -854,12 +1193,13 @@ impl Drop for HostRegistration {
 }
 
 // ---------------------------------------------------------------------------
-// Client lookup + direct-first / relay-fallback connection
+// Client lookup + UDP hole punch + TCP direct / relay fallback
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectVia {
     Direct(SocketAddr),
+    UdpPunched(SocketAddr),
     Relayed(SocketAddr),
 }
 
@@ -868,11 +1208,107 @@ impl ConnectVia {
         matches!(self, ConnectVia::Relayed(_))
     }
 
+    #[allow(dead_code)]
+    pub fn is_udp(self) -> bool {
+        matches!(self, ConnectVia::UdpPunched(_))
+    }
+
     pub fn addr(self) -> SocketAddr {
         match self {
-            ConnectVia::Direct(a) | ConnectVia::Relayed(a) => a,
+            ConnectVia::Direct(a) | ConnectVia::UdpPunched(a) | ConnectVia::Relayed(a) => a,
         }
     }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ConnectVia::Direct(_) => "direct-tcp",
+            ConnectVia::UdpPunched(_) => "udp-punch",
+            ConnectVia::Relayed(_) => "tcp-relay",
+        }
+    }
+}
+
+pub enum RendezvousStream {
+    Udp(UdpChannel),
+    Tcp(TcpStream),
+}
+
+/// Resolves an invite code on `rendezvous_addr`, attempts simultaneous UDP NAT hole punching
+/// first (unless `force_relay` or `FARUST_FORCE_RELAY=1`), and falls back seamlessly to
+/// direct TCP and finally a server-spliced TCP relay tunnel.
+pub fn connect_via_code_udp(
+    rendezvous_addr: &str,
+    code_raw: &str,
+    force_relay: bool,
+    netem: NetemConfig,
+    punch_timeout: Duration,
+    direct_tcp_timeout: Duration,
+) -> Result<(RendezvousStream, ConnectVia), String> {
+    let code = normalize_code(code_raw)
+        .ok_or_else(|| format!("invalid invite code '{}' (expected 8 characters like XXXX-XXXX)", code_raw.trim()))?;
+    let env_relay = std::env::var("FARUST_FORCE_RELAY").is_ok_and(|v| v == "1");
+    let env_no_punch = std::env::var("FARUST_FORCE_TCP_FALLBACK").is_ok_and(|v| v == "1");
+    if !force_relay && !env_relay && !env_no_punch {
+        match try_udp_hole_punch(rendezvous_addr, &code, netem, punch_timeout) {
+            Ok((ch, peer)) => return Ok((RendezvousStream::Udp(ch), ConnectVia::UdpPunched(peer))),
+            Err(e) if e.contains("unknown or expired") || e.contains("invalid invite code") => {
+                return Err(e);
+            }
+            Err(_) => {
+                // Hole punch failed (e.g. symmetric NAT, UDP blocked, or TCP-only host): fall back.
+            }
+        }
+    }
+    let (stream, via) = connect_via_code(rendezvous_addr, &code, force_relay, direct_tcp_timeout)?;
+    Ok((RendezvousStream::Tcp(stream), via))
+}
+
+fn try_udp_hole_punch(
+    rendezvous_addr: &str,
+    code: &str,
+    netem: NetemConfig,
+    punch_timeout: Duration,
+) -> Result<(UdpChannel, SocketAddr), String> {
+    let (mut q, rv_sa) = connect_with_timeout(rendezvous_addr, Duration::from_secs(4))?;
+    let _ = q.set_nodelay(true);
+    let _ = q.set_read_timeout(Some(RELAY_HANDSHAKE_TIMEOUT));
+    let _ = q.set_write_timeout(Some(Duration::from_secs(4)));
+
+    let bind_local = match rv_sa {
+        SocketAddr::V4(v4) if v4.ip().is_loopback() => "127.0.0.1:0",
+        SocketAddr::V4(_) => "0.0.0.0:0",
+        SocketAddr::V6(v6) if v6.ip().is_loopback() => "[::1]:0",
+        SocketAddr::V6(_) => "[::]:0",
+    };
+    let client_mux = UdpMux::bind(bind_local, netem)?;
+    let punch_token = next_punch_token();
+    let _observed = client_mux.register_rendezvous_udp(
+        rv_sa,
+        ROLE_CLIENT,
+        punch_token,
+        code.to_string(),
+        punch_timeout.min(Duration::from_secs(2)),
+        false,
+    )?;
+    let client_udp_addrs = discover_local_addrs(client_mux.local_addr());
+    send_msg(
+        &mut q,
+        &RvMsg::ClientPunch {
+            code: code.to_string(),
+            punch_token,
+            client_udp_addrs,
+        },
+    )?;
+    let host_udp_addrs = match recv_msg(&mut q)? {
+        RvMsg::PunchInfo { host_udp_addrs } => host_udp_addrs,
+        RvMsg::Error(e) => return Err(e),
+        other => return Err(format!("unexpected punch reply {other:?}")),
+    };
+    drop(q);
+
+    let punched_host = client_mux.punch(punch_token, ROLE_CLIENT, host_udp_addrs, punch_timeout)?;
+    let ch = client_mux.connect(punched_host, punch_timeout.max(Duration::from_secs(2)))?;
+    Ok((ch, punched_host))
 }
 
 /// Resolves an invite code on `rendezvous_addr`, tries direct host addresses first (unless
@@ -992,5 +1428,112 @@ mod tests {
         reg.close();
         let gone = connect_via_code(&rv_addr, &code, true, Duration::from_millis(200)).unwrap_err();
         assert!(gone.contains("unknown or expired"), "{gone}");
+    }
+
+    #[test]
+    fn rendezvous_udp_hole_punch_and_tcp_fallback() {
+        let rv = RendezvousServer::bind("127.0.0.1:0").unwrap();
+        let rv_addr = rv.local_addr().to_string();
+
+        // 1. Host with UDP hole punching + TCP fallback.
+        let host_tcp = TcpListener::bind("127.0.0.1:0").unwrap();
+        let host_bound = host_tcp.local_addr().unwrap();
+        let host_mux = UdpMux::bind("127.0.0.1:0", NetemConfig::default()).unwrap();
+        host_mux.set_accepting(true);
+        let (tunnel_tx, tunnel_rx) = mpsc::channel();
+        let punch_mux = host_mux.clone();
+        let mut reg = HostRegistration::register_with_udp(
+            &rv_addr,
+            host_bound,
+            host_mux.clone(),
+            "UdpHost",
+            "SCMP_001",
+            Duration::from_secs(2),
+            Box::new(move |s, a| {
+                let _ = tunnel_tx.send((s, a));
+            }),
+            Box::new(move |token, targets| {
+                let _ = punch_mux.start_punch(token, ROLE_HOST, targets, Duration::from_secs(3));
+            }),
+        )
+        .unwrap();
+        let code = reg.code.clone();
+
+        // Client connects via UDP hole punching through the rendezvous server.
+        let accept_mux = host_mux.clone();
+        let accept_t = std::thread::spawn(move || {
+            let mut ch = accept_mux.accept(Some(Duration::from_secs(5))).unwrap();
+            assert_eq!(ch.read_frame().unwrap(), b"hello-over-punched-udp");
+            ch.write_frame(b"reply-over-punched-udp").unwrap();
+        });
+        let (stream, via) = connect_via_code_udp(
+            &rv_addr,
+            &code,
+            false,
+            NetemConfig::default(),
+            Duration::from_secs(3),
+            Duration::from_millis(400),
+        )
+        .unwrap();
+        assert!(via.is_udp(), "expected UdpPunched, got {via:?}");
+        let mut ch = match stream {
+            RendezvousStream::Udp(c) => c,
+            RendezvousStream::Tcp(_) => panic!("expected UDP stream"),
+        };
+        ch.write_frame(b"hello-over-punched-udp").unwrap();
+        assert_eq!(ch.read_frame().unwrap(), b"reply-over-punched-udp");
+        accept_t.join().unwrap();
+
+        // Forced relay falls back cleanly to TCP relay even on a UDP-registered host.
+        let (stream_r, via_r) = connect_via_code_udp(
+            &rv_addr,
+            &code,
+            true,
+            NetemConfig::default(),
+            Duration::from_secs(2),
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        assert!(via_r.is_relayed(), "expected Relayed, got {via_r:?}");
+        let mut cs_r = match stream_r {
+            RendezvousStream::Tcp(s) => s,
+            RendezvousStream::Udp(_) => panic!("expected TCP relay fallback"),
+        };
+        let (mut hs_r, _) = tunnel_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        lobby_write_frame(&mut cs_r, b"fallback-relay").unwrap();
+        assert_eq!(lobby_read_frame(&mut hs_r).unwrap(), b"fallback-relay");
+        reg.close();
+
+        // 2. TCP-only host (no UDP registered): UDP client falls back to TCP direct seamlessly.
+        let tcp_only = TcpListener::bind("127.0.0.1:0").unwrap();
+        let tcp_bound = tcp_only.local_addr().unwrap();
+        let mut reg_tcp = HostRegistration::register(
+            &rv_addr,
+            tcp_bound,
+            "TcpOnlyHost",
+            "SCMP_001",
+            Duration::from_secs(2),
+            Box::new(|_, _| {}),
+        )
+        .unwrap();
+        let tcp_code = reg_tcp.code.clone();
+        let (stream_fb, via_fb) = connect_via_code_udp(
+            &rv_addr,
+            &tcp_code,
+            false,
+            NetemConfig::default(),
+            Duration::from_secs(2),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        assert_eq!(via_fb, ConnectVia::Direct(tcp_bound));
+        let mut cs_fb = match stream_fb {
+            RendezvousStream::Tcp(s) => s,
+            RendezvousStream::Udp(_) => panic!("expected TCP direct fallback"),
+        };
+        let (mut hs_fb, _) = tcp_only.accept().unwrap();
+        lobby_write_frame(&mut cs_fb, b"tcp-direct-fallback").unwrap();
+        assert_eq!(lobby_read_frame(&mut hs_fb).unwrap(), b"tcp-direct-fallback");
+        reg_tcp.close();
     }
 }

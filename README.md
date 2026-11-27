@@ -258,3 +258,23 @@ cargo run --release -- audio coverage
 cargo run --release -- audio cues --all
 cargo run --release -- audio render-mix fa-unpack/audio/phase43_mix.wav SCMP_001 --from 11800 --ticks 1800
 ```
+
+## Step 44 — done: UDP lockstep, NAT hole punching & adaptive input delay
+
+- **Reliable-ordered UDP & Netem shim** (`src/udp_transport.rs`, `std::net::UdpSocket` only):
+  multiplexed UDP channel with sequence numbers, cumulative + 64-bit SACK, fast retransmit,
+  Karn/Jacobson RTT/RTO estimation with backoff, duplicate suppression, MTU-safe fragmentation,
+  keepalive/graceful FIN, and a seeded loss/duplicate/reorder/delay shim (`--netem`).
+- **UDP lockstep, hole punching & adaptive delay** (`src/net.rs`, `src/rendezvous.rs`, `src/main.rs`):
+  protocol v14 runs lockstep identically over TCP or UDP (`PeerStream`); the host adapts
+  `input_delay` from measured RTT + jitter and announces changes at agreed turn boundaries
+  (`NetControl::InputDelay`); `farust rendezvous` listens on TCP+UDP to observe public UDP
+  endpoints and coordinate simultaneous NAT hole punches with automatic TCP direct/relay fallback.
+
+```sh
+cargo run --release -- host 127.0.0.1:15000 SCMP_001 --udp --netem loss=5,dup=2,reorder=3 --headless-ticks 600
+cargo run --release -- join 127.0.0.1:15000 --udp --netem loss=5,dup=2,reorder=3
+cargo run --release -- rendezvous 0.0.0.0:15050
+cargo run --release -- host --code --udp SCMP_001 --rendezvous 127.0.0.1:15050
+cargo run --release -- join --code XXXX-XXXX --udp --rendezvous 127.0.0.1:15050
+```

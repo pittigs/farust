@@ -52,10 +52,17 @@ use crate::replay::{
 };
 use crate::skirmish::{ArmyId, ArmySetup, Command, Skirmish};
 use crate::skirmish_ai::ScriptedAi;
+use crate::udp_transport::{NetemConfig, NetemStats, ROLE_HOST, UdpChannel, UdpMux};
 
 pub const TURN_TICKS: u64 = 3;
 /// Turns between collecting a command and executing it (latency hiding).
 pub const DEFAULT_INPUT_DELAY: u64 = 2;
+pub const MIN_INPUT_DELAY: u64 = 1;
+pub const MAX_INPUT_DELAY: u64 = 8;
+pub const ADAPTIVE_MIN_DELAY: u64 = 2;
+pub const ADAPTIVE_MAX_DELAY: u64 = 8;
+const ADAPTIVE_EVAL_INTERVAL: u64 = 8;
+const ADAPTIVE_DOWN_HYSTERESIS: u8 = 2;
 /// v3: menu-hosted lobbies greet with `Welcome` (`net_lobby.rs`); in-game turns carry [`NetControl`]s.
 /// v4 (Phase 24): handshake carries the enabled mods' identities.
 /// v5 (Phase 28): wall sections are buildable and block pathing (older peers would reject
@@ -68,7 +75,8 @@ pub const DEFAULT_INPUT_DELAY: u64 = 2;
 /// v11 (Phase 34): sim rules v7 (prop & live-unit reclaim).
 /// v12 (Phase 35): sim rules v8 (fire states, ground fire, guard, build pause).
 /// v13 (Phase 36): sim rules v9 (waypoint moves, ferries).
-pub const PROTOCOL_VERSION: u32 = 13;
+/// v14 (Phase 44): reliable UDP lockstep transport & synchronized adaptive input delay (`NetControl::InputDelay`).
+pub const PROTOCOL_VERSION: u32 = 14;
 /// The host's army (star-topology relay); only it may change the game speed.
 pub const HOST_ARMY: ArmyId = 0;
 /// Sender id of host-generated control messages (`Dropped`).
@@ -132,12 +140,14 @@ pub enum NetControl {
     Dropped(ArmyId),
     /// Post-desync diagnostics: the sender's state summary at the desync turn.
     DesyncSummary { turn: u64, tick: u64, hash: u64, text: String },
+    /// Host-generated ([`SYSTEM_SENDER`]): all peers switch `input_delay` at this turn boundary.
+    InputDelay(u8),
 }
 
 impl NetControl {
     /// Controls a peer may put in its own packet (the host strips everything else).
     pub fn peer_may_send(&self) -> bool {
-        !matches!(self, NetControl::Dropped(_))
+        !matches!(self, NetControl::Dropped(_) | NetControl::InputDelay(_))
     }
 }
 
@@ -167,6 +177,10 @@ fn encode_control(out: &mut Vec<u8>, c: &NetControl) {
             let t: String = text.chars().take(4000).collect();
             write_str(out, &t);
         }
+        NetControl::InputDelay(d) => {
+            out.push(6);
+            out.push(*d);
+        }
     }
 }
 
@@ -189,6 +203,7 @@ fn decode_control(data: &[u8], pos: &mut usize) -> Result<NetControl, String> {
             hash: read_u64(data, pos)?,
             text: read_str(data, pos)?,
         }),
+        6 => Ok(NetControl::InputDelay(read_u8(data, pos)?)),
         t => Err(format!("unknown net control tag {t}")),
     }
 }
@@ -456,7 +471,7 @@ pub fn issue_bundle(world: &mut Skirmish, bundle: &TurnBundle) {
 }
 
 // ---------------------------------------------------------------------------
-// Transports: star-topology host & client
+// Transports: star-topology host & client (TCP + reliable-ordered UDP)
 // ---------------------------------------------------------------------------
 
 /// Blocking per-turn exchange: submit the local packet, get the canonical bundle back.
@@ -464,13 +479,167 @@ pub trait TurnTransport: Send {
     fn exchange(&mut self, pkt: TurnPacket) -> Result<TurnBundle, String>;
 }
 
+/// Transport abstraction so the lockstep core runs identically over TCP or reliable-ordered UDP.
+pub enum PeerStream {
+    Tcp(TcpStream),
+    Udp(UdpChannel),
+}
+
+impl PeerStream {
+    pub fn write_frame(&mut self, payload: &[u8]) -> Result<(), String> {
+        match self {
+            PeerStream::Tcp(s) => write_frame(s, payload),
+            PeerStream::Udp(c) => c.write_frame(payload),
+        }
+    }
+
+    pub fn read_frame(&mut self) -> Result<Vec<u8>, String> {
+        match self {
+            PeerStream::Tcp(s) => read_frame(s),
+            PeerStream::Udp(c) => c.read_frame(),
+        }
+    }
+
+    pub fn set_read_timeout(&mut self, timeout: Option<Duration>) {
+        match self {
+            PeerStream::Tcp(s) => {
+                let _ = s.set_read_timeout(timeout);
+            }
+            PeerStream::Udp(c) => c.set_read_timeout(timeout),
+        }
+    }
+
+    pub fn shutdown(&self) {
+        match self {
+            PeerStream::Tcp(s) => {
+                let _ = s.shutdown(Shutdown::Both);
+            }
+            PeerStream::Udp(c) => c.shutdown(),
+        }
+    }
+
+    pub fn rtt_stats(&self) -> Option<(f64, f64)> {
+        match self {
+            PeerStream::Tcp(_) => None,
+            PeerStream::Udp(c) => c.rtt_stats(),
+        }
+    }
+
+    pub fn netem_stats(&self) -> Option<NetemStats> {
+        match self {
+            PeerStream::Tcp(_) => None,
+            PeerStream::Udp(c) => Some(c.netem_stats()),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn is_udp(&self) -> bool {
+        matches!(self, PeerStream::Udp(_))
+    }
+}
+
+/// Computes the target lockstep `input_delay` (in turns) from measured `(srtt_ms, rttvar_ms)`.
+///
+/// Uses `srtt + 2 * rttvar` against half a nominal turn (`turn_ticks * 50 ms`, i.e. 150 ms for
+/// `TURN_TICKS = 3`), clamped to `[ADAPTIVE_MIN_DELAY, ADAPTIVE_MAX_DELAY]` (`2..=8`).
+/// Local/LAN/lossy-loopback links stay at `2` turns (`DEFAULT_INPUT_DELAY`); high-RTT links
+/// automatically scale up to prevent stalls.
+pub fn compute_adaptive_delay(srtt_ms: f64, rttvar_ms: f64, turn_ticks: u64) -> u64 {
+    let effective_ms = srtt_ms.max(0.0) + 2.0 * rttvar_ms.max(0.0);
+    let half_turn_ms = (turn_ticks.max(1) as f64) * 50.0;
+    let raw = (effective_ms / half_turn_ms).ceil() as u64 + 1;
+    raw.clamp(ADAPTIVE_MIN_DELAY, ADAPTIVE_MAX_DELAY)
+}
+
+/// Host-side adaptive input-delay controller with hysteresis to prevent oscillation.
+#[derive(Debug, Clone)]
+pub struct AdaptiveDelayController {
+    pub enabled: bool,
+    pub current_delay: u64,
+    pub turn_ticks: u64,
+    last_eval_turn: u64,
+    low_streak: u8,
+}
+
+impl AdaptiveDelayController {
+    pub fn new(enabled: bool, initial_delay: u64, turn_ticks: u64) -> Self {
+        Self {
+            enabled,
+            current_delay: initial_delay.clamp(MIN_INPUT_DELAY, MAX_INPUT_DELAY),
+            turn_ticks: turn_ticks.max(1),
+            last_eval_turn: 0,
+            low_streak: 0,
+        }
+    }
+
+    /// Evaluates worst-peer `(srtt_ms, rttvar_ms)` at `turn`; returns `Some(new_delay)` only
+    /// when a synchronized delay change should be emitted in this turn's bundle.
+    pub fn maybe_adjust(&mut self, turn: u64, worst_srtt_ms: f64, worst_rttvar_ms: f64) -> Option<u64> {
+        if !self.enabled || turn < 4 || turn.saturating_sub(self.last_eval_turn) < ADAPTIVE_EVAL_INTERVAL {
+            return None;
+        }
+        self.last_eval_turn = turn;
+        let desired = compute_adaptive_delay(worst_srtt_ms, worst_rttvar_ms, self.turn_ticks);
+        if desired > self.current_delay {
+            self.low_streak = 0;
+            self.current_delay = desired;
+            return Some(desired);
+        }
+        if desired < self.current_delay {
+            let effective_ms = worst_srtt_ms.max(0.0) + 2.0 * worst_rttvar_ms.max(0.0);
+            let half_turn_ms = (self.turn_ticks as f64) * 50.0;
+            let down_threshold = ((self.current_delay.saturating_sub(2)) as f64) * half_turn_ms;
+            if effective_ms + 30.0 <= down_threshold.max(half_turn_ms) {
+                self.low_streak = self.low_streak.saturating_add(1);
+                if self.low_streak >= ADAPTIVE_DOWN_HYSTERESIS {
+                    self.low_streak = 0;
+                    self.current_delay = self.current_delay.saturating_sub(1).max(ADAPTIVE_MIN_DELAY);
+                    return Some(self.current_delay);
+                }
+            } else {
+                self.low_streak = 0;
+            }
+        } else {
+            self.low_streak = 0;
+        }
+        None
+    }
+}
+
 pub struct LockstepHost {
-    clients: Vec<(ArmyId, TcpStream)>,
+    clients: Vec<(ArmyId, PeerStream)>,
     pub local_army: ArmyId,
     next_turn: u64,
+    adaptive: AdaptiveDelayController,
 }
 
 impl LockstepHost {
+    /// Enables or disables host-driven adaptive `input_delay` announcements.
+    #[allow(dead_code)]
+    pub fn set_adaptive_delay(&mut self, enabled: bool) {
+        self.adaptive.enabled = enabled;
+    }
+
+    /// Returns the worst-peer `(srtt_ms, rttvar_ms)` across UDP peers, if available.
+    #[allow(dead_code)]
+    pub fn worst_rtt_stats(&self) -> Option<(f64, f64)> {
+        let mut worst: Option<(f64, f64)> = None;
+        for (_, stream) in &self.clients {
+            if let Some((srtt, var)) = stream.rtt_stats() {
+                let score = srtt + 2.0 * var;
+                if worst.is_none_or(|(ws, wv)| score > ws + 2.0 * wv) {
+                    worst = Some((srtt, var));
+                }
+            }
+        }
+        worst
+    }
+
+    /// Returns Netem impairment counters from the host's UDP mux, if running over UDP.
+    pub fn netem_stats(&self) -> Option<NetemStats> {
+        self.clients.iter().find_map(|(_, s)| s.netem_stats())
+    }
+
     /// Binds `addr`, accepts `hs.player_count - 1` remote clients (`2..=8` players) and
     /// sends each its [`Handshake`] (with `assigned_army` filled in). `on_join` is called
     /// after every accepted client with `(army, peer_addr)`.
@@ -485,6 +654,204 @@ impl LockstepHost {
             .local_addr()
             .map_err(|e| format!("local_addr failed: {e}"))?;
         Self::accept_players(listener, hs, &mut on_join).map(|h| (h, local_addr))
+    }
+
+    /// Binds a UDP socket on `addr` (with optional `netem`), accepts `hs.player_count - 1`
+    /// reliable-ordered UDP clients, and sends each its [`Handshake`].
+    pub fn bind_players_udp(
+        addr: &str,
+        hs: &Handshake,
+        netem: NetemConfig,
+        mut on_join: impl FnMut(ArmyId, SocketAddr),
+    ) -> Result<(Self, SocketAddr), String> {
+        let mux = UdpMux::bind(addr, netem)?;
+        let local_addr = mux.local_addr();
+        Self::accept_players_udp(mux, hs, &mut on_join).map(|h| (h, local_addr))
+    }
+
+    /// Accepts `hs.player_count - 1` reliable-ordered UDP clients on an already-bound [`UdpMux`].
+    pub fn accept_players_udp(
+        mux: Arc<UdpMux>,
+        hs: &Handshake,
+        on_join: &mut dyn FnMut(ArmyId, SocketAddr),
+    ) -> Result<Self, String> {
+        let n = hs.player_count;
+        if !(2..=8).contains(&n) {
+            return Err(format!("player count {n} out of range 2..=8"));
+        }
+        if hs.setups.len() < n {
+            return Err(format!(
+                "{n} players need at least {n} armies, got {}",
+                hs.setups.len()
+            ));
+        }
+        mux.set_accepting(true);
+        let mut clients = Vec::with_capacity(n - 1);
+        for slot in 1..n {
+            let mut ch = mux
+                .accept(None)
+                .map_err(|e| format!("udp accept slot {slot} failed: {e}"))?;
+            let peer = ch.peer_addr();
+            ch.set_read_timeout(Some(NET_TIMEOUT));
+            let army = slot as ArmyId;
+            let mut client_hs = hs.clone();
+            client_hs.assigned_army = army;
+            ch.write_frame(&encode_handshake(&client_hs))?;
+            on_join(army, peer);
+            clients.push((army, PeerStream::Udp(ch)));
+        }
+        mux.set_accepting(false);
+        Ok(Self {
+            clients,
+            local_army: 0,
+            next_turn: 0,
+            adaptive: AdaptiveDelayController::new(true, hs.input_delay, hs.turn_ticks),
+        })
+    }
+
+    /// Binds BOTH UDP (reliable-ordered + NAT hole punching) and TCP (direct + relay fallback)
+    /// and registers an invite code on `rendezvous_addr`. Each client connects over punched UDP
+    /// when possible, or falls back transparently to TCP direct / TCP relay.
+    pub fn bind_players_udp_with_code(
+        addr: &str,
+        rendezvous_addr: &str,
+        hs: &Handshake,
+        netem: NetemConfig,
+        mut on_join: impl FnMut(ArmyId, SocketAddr, crate::rendezvous::ConnectVia),
+    ) -> Result<(Self, SocketAddr, String), String> {
+        let n = hs.player_count;
+        if !(2..=8).contains(&n) {
+            return Err(format!("player count {n} out of range 2..=8"));
+        }
+        if hs.setups.len() < n {
+            return Err(format!("{n} players need at least {n} armies, got {}", hs.setups.len()));
+        }
+        let listener =
+            TcpListener::bind(addr).map_err(|e| format!("failed to bind {addr}: {e}"))?;
+        let local_addr = listener
+            .local_addr()
+            .map_err(|e| format!("local_addr failed: {e}"))?;
+        listener
+            .set_nonblocking(true)
+            .map_err(|e| format!("set_nonblocking failed: {e}"))?;
+
+        let udp_mux = match UdpMux::bind(&local_addr.to_string(), netem.clone()) {
+            Ok(m) => m,
+            Err(_) => {
+                let fallback = if local_addr.is_ipv4() {
+                    if local_addr.ip().is_loopback() { "127.0.0.1:0" } else { "0.0.0.0:0" }
+                } else if local_addr.ip().is_loopback() {
+                    "[::1]:0"
+                } else {
+                    "[::]:0"
+                };
+                UdpMux::bind(fallback, netem)?
+            }
+        };
+        udp_mux.set_accepting(true);
+
+        let (tx, rx) = mpsc::channel::<(PeerStream, SocketAddr, crate::rendezvous::ConnectVia)>();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let (atx, astop) = (tx.clone(), stop.clone());
+        let tcp_thread = std::thread::spawn(move || {
+            while !astop.load(std::sync::atomic::Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((s, p)) => {
+                        let _ = s.set_nonblocking(false);
+                        if atx
+                            .send((PeerStream::Tcp(s), p, crate::rendezvous::ConnectVia::Direct(p)))
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+
+        let (utx, ustop, umux) = (tx.clone(), stop.clone(), udp_mux.clone());
+        let udp_thread = std::thread::spawn(move || {
+            while !ustop.load(std::sync::atomic::Ordering::Relaxed) {
+                if let Ok(ch) = umux.accept(Some(Duration::from_millis(50))) {
+                    let p = ch.peer_addr();
+                    if utx
+                        .send((PeerStream::Udp(ch), p, crate::rendezvous::ConnectVia::UdpPunched(p)))
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            }
+        });
+
+        let rtx = tx.clone();
+        let punch_mux = udp_mux.clone();
+        let reg = crate::rendezvous::HostRegistration::register_with_udp(
+            rendezvous_addr,
+            local_addr,
+            udp_mux.clone(),
+            "Host",
+            &hs.map_id,
+            Duration::from_secs(4),
+            Box::new(move |s, p| {
+                let _ = rtx.send((PeerStream::Tcp(s), p, crate::rendezvous::ConnectVia::Relayed(p)));
+            }),
+            Box::new(move |token, targets| {
+                let _ = punch_mux.start_punch(token, ROLE_HOST, targets, Duration::from_secs(3));
+            }),
+        );
+        let mut reg = match reg {
+            Ok(r) => r,
+            Err(e) => {
+                stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                udp_mux.set_accepting(false);
+                let _ = tcp_thread.join();
+                let _ = udp_thread.join();
+                return Err(e);
+            }
+        };
+        let code = reg.code.clone();
+        println!("Invite code: {code} (rendezvous {rendezvous_addr}, UDP punch + TCP relay)");
+
+        let mut clients = Vec::with_capacity(n - 1);
+        for slot in 1..n {
+            let (mut stream, peer, via) = rx
+                .recv()
+                .map_err(|_| format!("accept slot {slot} failed: listener closed"))?;
+            if let PeerStream::Tcp(s) = &stream {
+                let _ = s.set_nodelay(true);
+            }
+            stream.set_read_timeout(Some(NET_TIMEOUT));
+            let army = slot as ArmyId;
+            let mut client_hs = hs.clone();
+            client_hs.assigned_army = army;
+            stream.write_frame(&encode_handshake(&client_hs))?;
+            on_join(army, peer, via);
+            clients.push((army, stream));
+        }
+
+        reg.close();
+        udp_mux.set_accepting(false);
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = tcp_thread.join();
+        let _ = udp_thread.join();
+
+        let has_udp = clients.iter().any(|(_, s)| s.is_udp());
+        Ok((
+            Self {
+                clients,
+                local_army: 0,
+                next_turn: 0,
+                adaptive: AdaptiveDelayController::new(has_udp, hs.input_delay, hs.turn_ticks),
+            },
+            local_addr,
+            code,
+        ))
     }
 
     /// Binds `addr` AND registers an invite code on `rendezvous_addr`, accepting `hs.player_count - 1`
@@ -565,7 +932,7 @@ impl LockstepHost {
             client_hs.assigned_army = army;
             write_frame(&mut stream, &encode_handshake(&client_hs))?;
             on_join(army, peer, relayed);
-            clients.push((army, stream));
+            clients.push((army, PeerStream::Tcp(stream)));
         }
 
         reg.close();
@@ -577,6 +944,7 @@ impl LockstepHost {
                 clients,
                 local_army: 0,
                 next_turn: 0,
+                adaptive: AdaptiveDelayController::new(false, hs.input_delay, hs.turn_ticks),
             },
             local_addr,
             code,
@@ -610,12 +978,13 @@ impl LockstepHost {
             client_hs.assigned_army = army;
             write_frame(&mut stream, &encode_handshake(&client_hs))?;
             on_join(army, peer);
-            clients.push((army, stream));
+            clients.push((army, PeerStream::Tcp(stream)));
         }
         Ok(Self {
             clients,
             local_army: 0,
             next_turn: 0,
+            adaptive: AdaptiveDelayController::new(false, hs.input_delay, hs.turn_ticks),
         })
     }
 }
@@ -637,7 +1006,7 @@ impl TurnTransport for LockstepHost {
         // turn) is dropped instead of ending the match; the bundle announces it.
         let mut dropped: Vec<ArmyId> = Vec::new();
         for (army, stream) in &mut self.clients {
-            let p = match read_frame(stream).and_then(|raw| decode_turn(&raw)) {
+            let p = match stream.read_frame().and_then(|raw| decode_turn(&raw)) {
                 Ok(p) if p.turn == turn => p,
                 Ok(p) => {
                     eprintln!("lockstep host: army {army} sent turn {} at turn {turn}; dropping it", p.turn);
@@ -659,6 +1028,12 @@ impl TurnTransport for LockstepHost {
             self.clients.retain(|(a, _)| !dropped.contains(a));
             controls.extend(dropped.iter().map(|&a| (SYSTEM_SENDER, NetControl::Dropped(a))));
         }
+        // Phase 44: adaptive input delay announced at agreed turn boundary from measured RTT + jitter.
+        if let Some((srtt, rttvar)) = self.worst_rtt_stats()
+            && let Some(new_delay) = self.adaptive.maybe_adjust(turn, srtt, rttvar)
+        {
+            controls.push((SYSTEM_SENDER, NetControl::InputDelay(new_delay as u8)));
+        }
         let bundle = canonicalize_bundle(TurnBundle {
             turn,
             hashes,
@@ -667,10 +1042,10 @@ impl TurnTransport for LockstepHost {
         });
         let encoded = encode_turn_bundle(&bundle);
         for (army, stream) in &mut self.clients {
-            if let Err(e) = write_frame(stream, &encoded) {
+            if let Err(e) = stream.write_frame(&encoded) {
                 // The next read fails too, so the drop is announced in the next bundle.
                 eprintln!("lockstep host: send to army {army} failed: {e}");
-                let _ = stream.shutdown(Shutdown::Both);
+                stream.shutdown();
             }
         }
         self.next_turn += 1;
@@ -679,7 +1054,7 @@ impl TurnTransport for LockstepHost {
 }
 
 pub struct LockstepClient {
-    stream: TcpStream,
+    stream: PeerStream,
     pub local_army: ArmyId,
     next_turn: u64,
 }
@@ -698,7 +1073,19 @@ impl LockstepClient {
             hs
         };
         let client = Self {
-            stream,
+            stream: PeerStream::Tcp(stream),
+            local_army: hs.assigned_army,
+            next_turn: 0,
+        };
+        Ok((client, hs))
+    }
+
+    pub fn from_udp(mut channel: UdpChannel) -> Result<(Self, Handshake), String> {
+        channel.set_read_timeout(Some(NET_TIMEOUT));
+        let raw = channel.read_frame()?;
+        let hs = decode_handshake(&raw)?;
+        let client = Self {
+            stream: PeerStream::Udp(channel),
             local_army: hs.assigned_army,
             next_turn: 0,
         };
@@ -709,6 +1096,63 @@ impl LockstepClient {
         let stream =
             TcpStream::connect(addr).map_err(|e| format!("failed to connect {addr}: {e}"))?;
         Self::from_stream(stream)
+    }
+
+    pub fn connect_udp(addr: &str, netem: NetemConfig, timeout: Duration) -> Result<(Self, Handshake), String> {
+        let channel = UdpChannel::connect(addr, netem, timeout)?;
+        Self::from_udp(channel)
+    }
+
+    pub fn connect_udp_retry(
+        addr: &str,
+        netem: NetemConfig,
+        timeout: Duration,
+    ) -> Result<(Self, Handshake), String> {
+        let t0 = Instant::now();
+        loop {
+            let left = timeout.saturating_sub(t0.elapsed()).max(Duration::from_millis(200));
+            match Self::connect_udp(addr, netem.clone(), left.min(Duration::from_secs(2))) {
+                Ok(c) => return Ok(c),
+                Err(e) if t0.elapsed() >= timeout => return Err(e),
+                Err(_) => std::thread::sleep(Duration::from_millis(50)),
+            }
+        }
+    }
+
+    /// Connects via invite code trying UDP NAT hole punching first, then TCP direct / TCP relay.
+    pub fn connect_code_udp_retry(
+        rendezvous_addr: &str,
+        code: &str,
+        force_relay: bool,
+        netem: NetemConfig,
+        timeout: Duration,
+    ) -> Result<(Self, Handshake, crate::rendezvous::ConnectVia), String> {
+        let t0 = Instant::now();
+        loop {
+            match crate::rendezvous::connect_via_code_udp(
+                rendezvous_addr,
+                code,
+                force_relay,
+                netem.clone(),
+                Duration::from_secs(3),
+                Duration::from_millis(800),
+            ) {
+                Ok((crate::rendezvous::RendezvousStream::Udp(ch), via)) => match Self::from_udp(ch) {
+                    Ok((c, hs)) => return Ok((c, hs, via)),
+                    Err(e) if t0.elapsed() >= timeout => return Err(e),
+                    Err(_) => std::thread::sleep(Duration::from_millis(80)),
+                },
+                Ok((crate::rendezvous::RendezvousStream::Tcp(s), via)) => match Self::from_stream(s) {
+                    Ok((c, hs)) => return Ok((c, hs, via)),
+                    Err(e) if t0.elapsed() >= timeout => return Err(e),
+                    Err(_) => std::thread::sleep(Duration::from_millis(80)),
+                },
+                Err(e) if e.contains("invalid invite code") || t0.elapsed() >= timeout => {
+                    return Err(e);
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(100)),
+            }
+        }
     }
 
     /// Connects to a host via `XXXX-XXXX` invite code (direct TCP first, automatic TCP relay fallback).
@@ -750,6 +1194,15 @@ impl LockstepClient {
             }
         }
     }
+
+    #[allow(dead_code)]
+    pub fn rtt_stats(&self) -> Option<(f64, f64)> {
+        self.stream.rtt_stats()
+    }
+
+    pub fn netem_stats(&self) -> Option<NetemStats> {
+        self.stream.netem_stats()
+    }
 }
 
 impl TurnTransport for LockstepClient {
@@ -758,8 +1211,8 @@ impl TurnTransport for LockstepClient {
         if pkt.turn != turn {
             return Err(format!("client submitted turn {} but expected {turn}", pkt.turn));
         }
-        write_frame(&mut self.stream, &encode_turn(&pkt))?;
-        let raw = read_frame(&mut self.stream).map_err(|e| format!("host disconnected: {e}"))?;
+        self.stream.write_frame(&encode_turn(&pkt))?;
+        let raw = self.stream.read_frame().map_err(|e| format!("host disconnected: {e}"))?;
         let bundle = decode_turn_bundle(&raw)?;
         if bundle.turn != turn {
             return Err(format!(
@@ -804,13 +1257,14 @@ impl LockstepHost {
             let mut client_hs = hs.clone();
             client_hs.assigned_army = army;
             write_frame(&mut stream, &encode_handshake(&client_hs)).map_err(|e| format!("army {army}: {e}"))?;
-            clients.push((army, stream));
+            clients.push((army, PeerStream::Tcp(stream)));
         }
         clients.sort_by_key(|(a, _)| *a);
         Ok(Self {
             clients,
             local_army: 0,
             next_turn: 0,
+            adaptive: AdaptiveDelayController::new(false, hs.input_delay, hs.turn_ticks),
         })
     }
 }
@@ -821,7 +1275,7 @@ impl LockstepClient {
         let _ = stream.set_nodelay(true);
         let _ = stream.set_read_timeout(Some(NET_TIMEOUT));
         Self {
-            stream,
+            stream: PeerStream::Tcp(stream),
             local_army: hs.assigned_army,
             next_turn: 0,
         }
@@ -879,11 +1333,12 @@ impl fmt::Display for DesyncReport {
 pub enum TickOutcome {
     /// The next turn's bundle has not arrived; the sim did not advance.
     Stalled,
-    /// One tick ran; `Some(packet)` when a turn completed and its packet must be sent.
-    Stepped(Option<TurnPacket>),
+    /// One tick ran; contains 0, 1, or more turn packets when a turn completed (0 when shrinking
+    /// adaptive `input_delay`, >1 when growing `input_delay`).
+    Stepped(Vec<TurnPacket>),
     /// A synchronized pause is active: the turn advanced (null turn) but the simulation did
-    /// not step; `Some(packet)` exactly like [`TickOutcome::Stepped`].
-    Paused(Option<TurnPacket>),
+    /// not step; emitted packets follow the same rules as [`TickOutcome::Stepped`].
+    Paused(Vec<TurnPacket>),
 }
 
 /// Session events for the UI ([`LockstepCore::drain_events`]).
@@ -895,6 +1350,7 @@ pub enum NetEvent {
     Speed { by: ArmyId, speed: u32 },
     SpeedDenied { by: ArmyId },
     Dropped { army: ArmyId, tick: u64 },
+    InputDelay { turn: u64, delay: u64 },
 }
 
 /// A pause/speed/drop control as applied at a turn start — identical on every peer.
@@ -933,6 +1389,8 @@ pub struct LockstepCore {
     events: Vec<NetEvent>,
     applied: Vec<AppliedControl>,
     takeovers: Vec<(u64, ArmyId)>,
+    /// Synchronized `(turn, new_input_delay)` transitions applied at turn boundaries.
+    delay_changes: Vec<(u64, u64)>,
     /// Every command applied to the local world `(tick, army, command)` (all sources).
     recorded: Vec<(u64, ArmyId, Command)>,
     checkpoints: Vec<(u64, u64)>,
@@ -980,6 +1438,7 @@ impl LockstepCore {
             events: Vec::new(),
             applied: Vec::new(),
             takeovers: Vec::new(),
+            delay_changes: Vec::new(),
             recorded: Vec::new(),
             checkpoints: Vec::new(),
             map_id: String::from("UNKNOWN"),
@@ -1083,6 +1542,12 @@ impl LockstepCore {
     #[allow(dead_code)]
     pub fn takeovers(&self) -> &[(u64, ArmyId)] {
         &self.takeovers
+    }
+
+    /// Synchronized `(turn, new_input_delay)` transitions applied identically on all peers.
+    #[allow(dead_code)]
+    pub fn delay_changes(&self) -> &[(u64, u64)] {
+        &self.delay_changes
     }
 
     /// Applied pause/speed/drop controls in execution order.
@@ -1259,6 +1724,18 @@ impl LockstepCore {
                     self.events.push(NetEvent::Dropped { army: a, tick });
                     fresh
                 }
+                NetControl::InputDelay(d) if from == SYSTEM_SENDER => {
+                    let clamped = u64::from(*d).clamp(MIN_INPUT_DELAY, MAX_INPUT_DELAY);
+                    if clamped != self.input_delay {
+                        self.input_delay = clamped;
+                        self.delay_changes.push((bundle.turn, clamped));
+                        self.events.push(NetEvent::InputDelay {
+                            turn: bundle.turn,
+                            delay: clamped,
+                        });
+                    }
+                    continue;
+                }
                 _ => continue,
             };
             self.applied.push(AppliedControl {
@@ -1304,17 +1781,22 @@ impl LockstepCore {
             }
         }
         self.tick_in_turn += 1;
-        let pkt = if self.tick_in_turn >= self.turn_ticks {
+        let pkts = if self.tick_in_turn >= self.turn_ticks {
             self.tick_in_turn = 0;
             self.next_exec += 1;
-            Some(self.make_packet(world))
+            let target_submit = self.next_exec + self.input_delay;
+            let mut out = Vec::new();
+            while self.next_submit < target_submit {
+                out.push(self.make_packet(world));
+            }
+            out
         } else {
-            None
+            Vec::new()
         };
         if self.turn_paused {
-            TickOutcome::Paused(pkt)
+            TickOutcome::Paused(pkts)
         } else {
-            TickOutcome::Stepped(pkt)
+            TickOutcome::Stepped(pkts)
         }
     }
 
@@ -1472,14 +1954,18 @@ pub fn run_headless_with(
             TickOutcome::Stalled => {
                 return Err(format!("headless lockstep stalled at tick {}", world.tick()));
             }
-            TickOutcome::Stepped(Some(pkt)) | TickOutcome::Paused(Some(pkt)) => {
-                if world.tick() >= limit || world.result().is_some() {
-                    break;
+            TickOutcome::Stepped(pkts) | TickOutcome::Paused(pkts) => {
+                if !pkts.is_empty() {
+                    if world.tick() >= limit || world.result().is_some() {
+                        break;
+                    }
+                    let mut pending: VecDeque<TurnPacket> = pkts.into();
+                    while let Some(pkt) = pending.pop_front() {
+                        let b = transport.exchange(pkt)?;
+                        receive_or_dump(transport, core, world, b, &mut pending)?;
+                    }
                 }
-                let b = transport.exchange(pkt)?;
-                receive_or_dump(transport, core, world, b, &mut VecDeque::new())?;
             }
-            TickOutcome::Stepped(None) | TickOutcome::Paused(None) => {}
         }
     }
     Ok(world.state_hash())
@@ -1748,10 +2234,10 @@ impl NetHandle {
                 n.stalled_now = true;
                 n.stall_ticks += 1;
             }
-            TickOutcome::Stepped(pkt) | TickOutcome::Paused(pkt) => {
+            TickOutcome::Stepped(pkts) | TickOutcome::Paused(pkts) => {
                 n.stalled_now = false;
                 s.selected.retain(|id| s.world.unit(*id).is_some());
-                if let Some(pkt) = pkt {
+                for pkt in pkts {
                     if pkt.turn % 100 == 0 && std::env::var_os("FARUST_NET_LOG").is_some() {
                         println!(
                             "[net] army {} tick {} hash {:016x} | {}",
@@ -1763,6 +2249,7 @@ impl NetHandle {
                     }
                     if let Err(e) = n.bridge.submit(pkt) {
                         n.failure = Some(format!("NET ERROR: {e}"));
+                        break;
                     }
                 }
             }
@@ -1892,6 +2379,9 @@ fn flush_events(n: &mut NetPlay, s: &mut PlaySession) {
                 if let Some(rec) = s.recorder.as_mut() {
                     rec.ai_event(tick, army, true);
                 }
+            }
+            NetEvent::InputDelay { turn: _, delay } => {
+                s.chat.system(&format!("ADAPTIVE INPUT DELAY SET TO {delay} TURNS"));
             }
         }
     }
@@ -2121,7 +2611,7 @@ mod tests {
         let mut pkt = None;
         while pkt.is_none() {
             match core.tick(&mut w) {
-                TickOutcome::Stepped(p) => pkt = p,
+                TickOutcome::Stepped(mut pkts) => pkt = pkts.pop(),
                 TickOutcome::Stalled | TickOutcome::Paused(_) => panic!("bundle was buffered"),
             }
         }
@@ -2236,8 +2726,8 @@ mod tests {
                                 .expect("ok");
                             core.receive(bundle).unwrap();
                         }
-                        TickOutcome::Stepped(p) | TickOutcome::Paused(p) => {
-                            if let Some(p) = p {
+                        TickOutcome::Stepped(pkts) | TickOutcome::Paused(pkts) => {
+                            for p in pkts {
                                 b.submit(p).unwrap();
                             }
                             break;
@@ -2492,7 +2982,268 @@ mod tests {
         let w = world(&s, 1);
         let mut core = LockstepCore::new(&w, 1, 2, TURN_TICKS, 1);
         core.queue_control(NetControl::Dropped(0));
+        core.queue_control(NetControl::InputDelay(5));
         core.queue_control(NetControl::Pause(true));
         assert_eq!(core.prime(&w)[0].controls, vec![NetControl::Pause(true)]);
+    }
+
+    // ----- Phase 44: UDP lockstep, lossy netem, adaptive input delay & hole punching ----
+
+    struct UdpLoopbackRun {
+        hashes: Vec<u64>,
+        host_netem: NetemStats,
+        client_netem: Vec<NetemStats>,
+        delay_changes: Vec<Vec<(u64, u64)>>,
+    }
+
+    fn run_udp_loopback(
+        players: usize,
+        armies: usize,
+        ticks: u64,
+        host_netem: NetemConfig,
+        client_netem_base: NetemConfig,
+    ) -> UdpLoopbackRun {
+        let hs = handshake(players, armies, 4242, ticks);
+        let mux = UdpMux::bind("127.0.0.1:0", host_netem).unwrap();
+        let addr = mux.local_addr().to_string();
+        let hs_host = hs.clone();
+        let host = std::thread::spawn(move || {
+            let mut t = LockstepHost::accept_players_udp(mux, &hs_host, &mut |_, _| {}).unwrap();
+            let mut w = world(&hs_host.setups, hs_host.seed);
+            let mut core = LockstepCore::from_handshake(&w, &hs_host);
+            let h = run_headless(&mut t, &mut core, &mut w, hs_host.tick_limit).unwrap();
+            let st = t.netem_stats().unwrap_or_default();
+            (h, st, core.delay_changes().to_vec())
+        });
+        let clients: Vec<_> = (1..players)
+            .map(|idx| {
+                let addr = addr.clone();
+                let mut cn = client_netem_base.clone();
+                cn.seed = cn.seed.wrapping_add((idx as u64) * 7919);
+                std::thread::spawn(move || {
+                    let (mut c, hs) =
+                        LockstepClient::connect_udp_retry(&addr, cn, Duration::from_secs(15)).unwrap();
+                    let mut w = world(&hs.setups, hs.seed);
+                    let mut core = LockstepCore::from_handshake(&w, &hs);
+                    let h = run_headless(&mut c, &mut core, &mut w, hs.tick_limit).unwrap();
+                    let st = c.netem_stats().unwrap_or_default();
+                    (hs.assigned_army, h, w.tick(), st, core.delay_changes().to_vec())
+                })
+            })
+            .collect();
+        let (h_host, host_st, host_dc) = host.join().unwrap();
+        let mut hashes = vec![h_host];
+        let mut client_sts = Vec::new();
+        let mut dcs = vec![host_dc];
+        let mut seen = Vec::new();
+        for c in clients {
+            let (army, h, tick, st, dc) = c.join().unwrap();
+            assert_eq!(tick, ticks.div_ceil(TURN_TICKS) * TURN_TICKS);
+            seen.push(army);
+            hashes.push(h);
+            client_sts.push(st);
+            dcs.push(dc);
+        }
+        seen.sort();
+        assert_eq!(seen, (1..players as ArmyId).collect::<Vec<_>>());
+        UdpLoopbackRun {
+            hashes,
+            host_netem: host_st,
+            client_netem: client_sts,
+            delay_changes: dcs,
+        }
+    }
+
+    #[test]
+    fn udp_lossy_netem_2_and_3_peer_matches_tcp_hash() {
+        let lossy = NetemConfig {
+            loss_pct: 5.0,
+            dup_pct: 2.0,
+            reorder_window: 3,
+            delay_ms: 0,
+            jitter_ms: 0,
+            seed: 44_001,
+        };
+        for (players, armies, ticks) in [(2, 2, 240u64), (3, 4, 240u64)] {
+            let tcp_hashes = run_loopback(players, armies, ticks);
+            assert!(tcp_hashes.iter().all(|h| *h == tcp_hashes[0]));
+            let expected = tcp_hashes[0];
+
+            let clean = run_udp_loopback(players, armies, ticks, NetemConfig::default(), NetemConfig::default());
+            assert!(
+                clean.hashes.iter().all(|h| *h == expected),
+                "clean UDP ({players}p) mismatch: {:x?} vs tcp {expected:x}",
+                clean.hashes
+            );
+
+            let lossy_run = run_udp_loopback(players, armies, ticks, lossy.clone(), lossy.clone());
+            assert!(
+                lossy_run.hashes.iter().all(|h| *h == expected),
+                "lossy UDP ({players}p) mismatch: {:x?} vs tcp {expected:x}",
+                lossy_run.hashes
+            );
+            let total_dropped: u64 =
+                lossy_run.host_netem.dropped + lossy_run.client_netem.iter().map(|s| s.dropped).sum::<u64>();
+            let total_duped: u64 = lossy_run.host_netem.duplicated
+                + lossy_run.client_netem.iter().map(|s| s.duplicated).sum::<u64>();
+            let total_reordered: u64 = lossy_run.host_netem.reordered
+                + lossy_run.client_netem.iter().map(|s| s.reordered).sum::<u64>();
+            assert!(total_dropped > 0, "expected simulated drops ({players}p)");
+            assert!(total_duped > 0, "expected simulated duplicates ({players}p)");
+            assert!(total_reordered > 0, "expected simulated reorders ({players}p)");
+        }
+    }
+
+    #[test]
+    fn adaptive_input_delay_curve_core_sync_and_high_rtt_udp() {
+        // 1. Curve & clamping checks.
+        assert_eq!(compute_adaptive_delay(1.0, 0.5, TURN_TICKS), 2);
+        assert_eq!(compute_adaptive_delay(120.0, 10.0, TURN_TICKS), 2);
+        assert_eq!(compute_adaptive_delay(160.0, 20.0, TURN_TICKS), 3);
+        assert_eq!(compute_adaptive_delay(320.0, 40.0, TURN_TICKS), 4);
+        assert_eq!(compute_adaptive_delay(2000.0, 500.0, TURN_TICKS), ADAPTIVE_MAX_DELAY);
+
+        // 2. Controller step-up and hysteresis step-down.
+        let mut ctrl = AdaptiveDelayController::new(true, DEFAULT_INPUT_DELAY, TURN_TICKS);
+        assert_eq!(ctrl.maybe_adjust(2, 400.0, 50.0), None, "wait until turn 4");
+        assert_eq!(ctrl.maybe_adjust(8, 350.0, 50.0), Some(4));
+        assert_eq!(ctrl.maybe_adjust(16, 10.0, 2.0), None, "first low window builds hysteresis");
+        assert_eq!(ctrl.maybe_adjust(24, 10.0, 2.0), Some(3), "steps down by 1 after hysteresis");
+        assert_eq!(ctrl.maybe_adjust(32, 10.0, 2.0), None);
+        assert_eq!(ctrl.maybe_adjust(40, 10.0, 2.0), Some(2));
+        assert_eq!(ctrl.maybe_adjust(48, 10.0, 2.0), None, "clamped at ADAPTIVE_MIN_DELAY");
+
+        // 3. Synchronized delay increase (2 -> 4) AND decrease (4 -> 2) across two cores.
+        let s = setups(2);
+        let mut w0 = world(&s, 101);
+        let mut w1 = world(&s, 101);
+        let mut c0 = LockstepCore::new(&w0, 0, 2, TURN_TICKS, 2);
+        let mut c1 = LockstepCore::new(&w1, 1, 2, TURN_TICKS, 2);
+        let mut q0: VecDeque<TurnPacket> = c0.prime(&w0).into();
+        let mut q1: VecDeque<TurnPacket> = c1.prime(&w1).into();
+        let exchange_pair = |c0: &mut LockstepCore, c1: &mut LockstepCore, p0: TurnPacket, p1: TurnPacket| {
+            assert_eq!(p0.turn, p1.turn);
+            let turn = p0.turn;
+            let mut controls = Vec::new();
+            if turn == 5 {
+                controls.push((SYSTEM_SENDER, NetControl::InputDelay(4)));
+            } else if turn == 14 {
+                controls.push((SYSTEM_SENDER, NetControl::InputDelay(2)));
+            }
+            let b = canonicalize_bundle(TurnBundle {
+                turn,
+                hashes: vec![(0, p0.hash), (1, p1.hash)],
+                batches: vec![(0, p0.commands), (1, p1.commands)],
+                controls,
+            });
+            c0.receive(b.clone()).unwrap();
+            c1.receive(b).unwrap();
+        };
+        while let (Some(p0), Some(p1)) = (q0.pop_front(), q1.pop_front()) {
+            exchange_pair(&mut c0, &mut c1, p0, p1);
+        }
+        for _ in 0..90 {
+            let o0 = c0.tick(&mut w0);
+            let o1 = c1.tick(&mut w1);
+            let (TickOutcome::Stepped(pkts0), TickOutcome::Stepped(pkts1)) = (o0, o1) else {
+                panic!("expected both cores to step cleanly without stalling");
+            };
+            assert_eq!(pkts0.len(), pkts1.len());
+            for (p0, p1) in pkts0.into_iter().zip(pkts1) {
+                exchange_pair(&mut c0, &mut c1, p0, p1);
+            }
+        }
+        assert_eq!(w0.state_hash(), w1.state_hash());
+        assert_eq!(c0.delay_changes(), &[(5, 4), (14, 2)]);
+        assert_eq!(c1.delay_changes(), &[(5, 4), (14, 2)]);
+        assert_eq!(c0.input_delay, 2);
+        assert_eq!(c1.input_delay, 2);
+
+        // 4. Live high-RTT UDP loopback triggers host-driven adaptive delay and stays in sync.
+        let high_rtt = NetemConfig {
+            loss_pct: 2.0,
+            dup_pct: 1.0,
+            reorder_window: 0,
+            delay_ms: 95,
+            jitter_ms: 15,
+            seed: 44_999,
+        };
+        let run = run_udp_loopback(2, 2, 48, high_rtt.clone(), high_rtt);
+        assert_eq!(run.hashes[0], run.hashes[1], "high-RTT UDP peers desynced");
+        assert!(
+            !run.delay_changes[0].is_empty(),
+            "expected host to increase input_delay under ~200ms RTT"
+        );
+        assert_eq!(
+            run.delay_changes[0], run.delay_changes[1],
+            "all peers must apply identical delay changes on the same turns"
+        );
+        assert!(
+            run.delay_changes[0][0].1 > DEFAULT_INPUT_DELAY,
+            "expected delay > 2, got {:?}",
+            run.delay_changes[0]
+        );
+    }
+
+    #[test]
+    fn udp_rendezvous_hole_punch_lockstep_match() {
+        let rv = crate::rendezvous::RendezvousServer::bind("127.0.0.1:0").unwrap();
+        let rv_addr = rv.local_addr().to_string();
+        let hs = handshake(2, 2, 7744, 150);
+        let lossy = NetemConfig {
+            loss_pct: 5.0,
+            dup_pct: 2.0,
+            reorder_window: 3,
+            delay_ms: 0,
+            jitter_ms: 0,
+            seed: 44_777,
+        };
+        let (code_tx, code_rx) = mpsc::channel();
+        let hs_host = hs.clone();
+        let rv_h = rv_addr.clone();
+        let netem_h = lossy.clone();
+        let host_t = std::thread::spawn(move || {
+            // Register via code with UDP hole punching enabled; send invite code once bound.
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let tcp_addr = listener.local_addr().unwrap();
+            let udp_mux = UdpMux::bind("127.0.0.1:0", netem_h).unwrap();
+            udp_mux.set_accepting(true);
+            let punch_mux = udp_mux.clone();
+            let mut reg = crate::rendezvous::HostRegistration::register_with_udp(
+                &rv_h,
+                tcp_addr,
+                udp_mux.clone(),
+                "Host",
+                &hs_host.map_id,
+                Duration::from_secs(3),
+                Box::new(|_, _| {}),
+                Box::new(move |tok, targets| {
+                    let _ = punch_mux.start_punch(tok, ROLE_HOST, targets, Duration::from_secs(3));
+                }),
+            )
+            .unwrap();
+            let _ = code_tx.send(reg.code.clone());
+            let mut t = LockstepHost::accept_players_udp(udp_mux, &hs_host, &mut |_, _| {}).unwrap();
+            reg.close();
+            let mut w = world(&hs_host.setups, hs_host.seed);
+            let mut core = LockstepCore::from_handshake(&w, &hs_host);
+            run_headless(&mut t, &mut core, &mut w, hs_host.tick_limit).unwrap()
+        });
+
+        let code = code_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (mut client, c_hs, via) = LockstepClient::connect_code_udp_retry(
+            &rv_addr,
+            &code,
+            false,
+            lossy,
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        assert!(via.is_udp(), "expected punched UDP connection, got {via:?}");
+        let mut w_c = world(&c_hs.setups, c_hs.seed);
+        let mut core_c = LockstepCore::from_handshake(&w_c, &c_hs);
+        let h_client = run_headless(&mut client, &mut core_c, &mut w_c, c_hs.tick_limit).unwrap();
+        let h_host = host_t.join().unwrap();
+        assert_eq!(h_host, h_client, "punched UDP lockstep hashes must match");
     }
 }
