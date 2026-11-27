@@ -295,16 +295,7 @@ fn rect_hit(r: [f32; 4], px: f32, py: f32) -> bool {
 }
 
 impl TimelineLayout {
-    fn compute(w: f32, h: f32, minimap: [f32; 4], palette_right: f32, palette_top: f32) -> Self {
-        let mut x0 = palette_right + 10.0;
-        let mut x1 = minimap[0] - 14.0;
-        let mut y = h - 74.0;
-        if x1 - x0 < 300.0 {
-            x0 = 12.0;
-            x1 = (w - 12.0).min(minimap[0] - 14.0).max(x0 + 200.0);
-            y = palette_top - 4.0 - 70.0;
-        }
-        let pw = x1 - x0;
+    fn from_bounds(x0: f32, y: f32, pw: f32) -> Self {
         let by = y + 6.0;
         Self {
             panel: [x0, y, pw, 64.0],
@@ -314,6 +305,30 @@ impl TimelineLayout {
             faster: [x0 + 108.0, by, 26.0, 24.0],
             view: [x0 + pw - 8.0 - 104.0, by, 104.0, 24.0],
         }
+    }
+
+    fn compute(w: f32, h: f32, minimap: [f32; 4], palette_right: f32, palette_top: f32) -> Self {
+        let mut x0 = palette_right + 10.0;
+        let mut x1 = minimap[0] - 14.0;
+        let mut y = h - 74.0;
+        if x1 - x0 < 300.0 {
+            x0 = 12.0;
+            x1 = (w - 12.0).min(minimap[0] - 14.0).max(x0 + 200.0);
+            y = palette_top - 4.0 - 70.0;
+        }
+        Self::from_bounds(x0, y, x1 - x0)
+    }
+
+    fn compute_classic(w: f32, h: f32, dock_right: f32, dock_x: f32, dock_top: f32) -> Self {
+        let mut x0 = dock_right + 10.0;
+        let mut x1 = w - 12.0;
+        let mut y = h - 70.0;
+        if x1 - x0 < 300.0 {
+            x0 = dock_x;
+            x1 = (w - 12.0).max(x0 + 240.0);
+            y = (dock_top - 70.0).max(60.0);
+        }
+        Self::from_bounds(x0, y, (x1 - x0).max(200.0))
     }
 
     /// Fraction along the seek bar for screen x (clamped to `[0, 1]`).
@@ -496,6 +511,9 @@ impl EnhLayout {
 pub struct HudLayout {
     pub width: f32,
     pub height: f32,
+    pub classic: bool,
+    /// Additional chrome panels (used in `UiTheme::Classic` top-left econ & top-right clock pods).
+    pub top_panels: Vec<[f32; 4]>,
     /// Order / system buttons.
     pub buttons: Vec<HudButton>,
     pub minimap: [f32; 4], // [x, y, size, size] in screen pixels
@@ -505,21 +523,56 @@ pub struct HudLayout {
     pub orders_panel: [f32; 4],
     pub queue: Option<QueueLayout>,
     pub enh: Option<EnhLayout>,
-    /// Bounding box of the whole bottom-left cluster.
+    /// Bounding box of the whole bottom command cluster.
     pub cluster: [f32; 4],
+}
+
+fn faction_palette(session: &PlaySession) -> crate::ui_kit::ClassicPalette {
+    let key = session
+        .world
+        .faction(session.human_army)
+        .map(|f| f.key.as_str())
+        .unwrap_or("uef");
+    crate::ui_kit::ClassicPalette::for_faction_key(key)
 }
 
 impl HudLayout {
     pub fn compute(session: &PlaySession, width: u32, height: u32) -> Self {
+        Self::compute_with_theme(session, width, height, crate::settings::ui_theme())
+    }
+
+    pub fn compute_with_theme(
+        session: &PlaySession,
+        width: u32,
+        height: u32,
+        theme: crate::settings::UiTheme,
+    ) -> Self {
         let w = width.max(480) as f32;
         let h = height.max(360) as f32;
-        let mm_size = (h * 0.24).clamp(136.0, 220.0);
-        let minimap = [w - mm_size - 12.0, h - mm_size - 12.0, mm_size, mm_size];
+        let classic = theme == crate::settings::UiTheme::Classic;
 
-        let x0 = MARGIN;
+        let (minimap, dock_x, orders_x, card_x, top_panels) = if classic {
+            let mm_size = (h * 0.24).clamp(136.0, 200.0);
+            let full_w = ORD_W + MARGIN + CARD_W;
+            let (mm, dx) = if w >= 6.0 + mm_size + 10.0 + full_w + 6.0 {
+                ([6.0, h - mm_size - 6.0, mm_size, mm_size], 6.0 + mm_size + 10.0)
+            } else {
+                ([6.0, 62.0, mm_size.min(136.0), mm_size.min(136.0)], MARGIN)
+            };
+            let econ = [6.0, 6.0, 412.0f32.min((w - 140.0).max(240.0)), 50.0];
+            let cw = 264.0f32.min((w - econ[0] - econ[2] - 18.0).max(120.0));
+            let clock = [(w - cw - 6.0).max(econ[0] + econ[2] + 8.0), 6.0, cw, 38.0];
+            // Classic FA puts Orders immediately beside the minimap, followed by Build Card.
+            (mm, dx, dx, dx + ORD_W + MARGIN, vec![econ, clock])
+        } else {
+            let mm_size = (h * 0.24).clamp(136.0, 220.0);
+            let mm = [w - mm_size - 12.0, h - mm_size - 12.0, mm_size, mm_size];
+            (mm, MARGIN, MARGIN + CARD_W + MARGIN, MARGIN, Vec::new())
+        };
+
         let card_y = h - MARGIN - CARD_H;
-        let card = CardLayout::compute(session.card_model(), x0, card_y);
-        let orders_panel = [x0 + CARD_W + MARGIN, card_y, ORD_W, CARD_H];
+        let card = CardLayout::compute(session.card_model(), card_x, card_y);
+        let orders_panel = [orders_x, card_y, ORD_W, CARD_H];
         let mut buttons = Vec::new();
         for (i, (kind, active)) in session.order_buttons().into_iter().enumerate() {
             let (col, row) = (i % ORD_COLS, i / ORD_COLS);
@@ -538,22 +591,28 @@ impl HudLayout {
         }
         let full_w = CARD_W + MARGIN + ORD_W;
         let mut top = card_y;
-        let queue = QueueLayout::compute(session, x0, top, full_w);
+        let queue = QueueLayout::compute(session, dock_x, top, full_w);
         if let Some(q) = &queue {
             top = q.panel[1];
         }
-        let enh = EnhLayout::compute(session, x0, top, full_w);
+        let enh = EnhLayout::compute(session, dock_x, top, full_w);
         if let Some(e) = &enh {
             top = e.panel[1];
         }
-        let cluster = [x0, top, full_w, h - MARGIN - top];
-        let timeline = session
-            .is_replay()
-            .then(|| TimelineLayout::compute(w, h, minimap, x0 + full_w, card_y));
+        let cluster = [dock_x, top, full_w, h - MARGIN - top];
+        let timeline = session.is_replay().then(|| {
+            if classic {
+                TimelineLayout::compute_classic(w, h, dock_x + full_w, dock_x, top)
+            } else {
+                TimelineLayout::compute(w, h, minimap, dock_x + full_w, card_y)
+            }
+        });
 
         Self {
             width: w,
             height: h,
+            classic,
+            top_panels,
             buttons,
             minimap,
             timeline,
@@ -571,6 +630,7 @@ impl HudLayout {
             .into_iter()
             .chain([self.queue.as_ref().map(|q| q.panel), self.enh.as_ref().map(|e| e.panel)])
             .flatten()
+            .chain(self.top_panels.iter().copied())
     }
 
     /// True if `(px, py)` is over any HUD element that should swallow world hover/picks.
@@ -650,7 +710,27 @@ pub fn build_hud_geometry(
     Vec<HudVertex>,
     Vec<u32>,
 ) {
-    let layout = HudLayout::compute(session, width, height);
+    build_hud_geometry_with_theme(session, map, camera, width, height, crate::settings::ui_theme())
+}
+
+pub fn build_hud_geometry_with_theme(
+    session: &PlaySession,
+    map: &MapContext,
+    camera: &OrbitCamera,
+    width: u32,
+    height: u32,
+    theme: crate::settings::UiTheme,
+) -> (
+    Vec<HudVertex>,
+    Vec<u32>,
+    Vec<HudVertex>,
+    Vec<u32>,
+    Vec<HudVertex>,
+    Vec<u32>,
+    Vec<HudVertex>,
+    Vec<u32>,
+) {
+    let layout = HudLayout::compute_with_theme(session, width, height, theme);
     let w = layout.width;
     let h = layout.height;
 
@@ -663,113 +743,221 @@ pub fn build_hud_geometry(
     let mut fg_v = Vec::with_capacity(4096);
     let mut fg_i = Vec::with_capacity(6144);
 
+    let pal = layout.classic.then(|| faction_palette(session));
+    let (brd_default, hdr_bg_default, title_gold, panel_bg_default) = match pal {
+        Some(p) => (p.border_outer, p.header_bg, p.title_gold, p.panel_bot),
+        None => ([0.30, 0.44, 0.64, 0.95], [0.10, 0.18, 0.25, 0.96], [0.96, 0.84, 0.45, 1.0], [0.05, 0.07, 0.11, 0.88]),
+    };
+
     // 1. Minimap textured backdrop quad
     let [mx, my, mw, mh] = layout.minimap;
     push_quad_uv(&mut mm_v, &mut mm_i, mx, my, mw, mh, [1.0, 1.0, 1.0, 0.96], w, h);
 
     // 2. Top Economy & Status Bar
-    push_rect(&mut v, &mut i, 0.0, 0.0, w, 46.0, [0.06, 0.08, 0.12, 0.84], w, h);
-    push_rect(&mut v, &mut i, 0.0, 46.0, w, 2.0, [0.22, 0.45, 0.72, 0.85], w, h);
+    if let Some(p) = pal {
+        let econ = layout.top_panels.first().copied().unwrap_or([6.0, 6.0, 412.0, 50.0]);
+        let clock = layout.top_panels.get(1).copied().unwrap_or([w - 270.0, 6.0, 264.0, 38.0]);
+        push_classic_chrome(&mut v, &mut i, &mut fg_v, &mut fg_i, econ, &p, 4.0, w, h);
+        push_classic_chrome(&mut v, &mut i, &mut fg_v, &mut fg_i, clock, &p, 4.0, w, h);
+        let div_x = econ[0] + econ[2] * 0.5;
+        push_rect(&mut fg_v, &mut fg_i, div_x - 1.0, econ[1] + 7.0, 2.0, econ[3] - 14.0, p.border_inner, w, h);
 
-    if let Some(a) = session.world.army(session.human_army) {
-        let m_fill = (a.mass as f32 / a.mass_cap.max(1) as f32).clamp(0.0, 1.0);
-        let e_fill = (a.energy as f32 / a.energy_cap.max(1) as f32).clamp(0.0, 1.0);
+        if let Some(a) = session.world.army(session.human_army) {
+            let m_fill = (a.mass as f32 / a.mass_cap.max(1) as f32).clamp(0.0, 1.0);
+            let e_fill = (a.energy as f32 / a.energy_cap.max(1) as f32).clamp(0.0, 1.0);
+            let bw = (econ[2] * 0.5 - 20.0).max(60.0);
 
-        // Mass gauge
-        push_rect(&mut v, &mut i, 14.0, 10.0, 180.0, 11.0, [0.12, 0.15, 0.18, 0.95], w, h);
-        push_rect(&mut v, &mut i, 14.0, 10.0, 180.0 * m_fill, 11.0, [0.24, 0.86, 0.44, 0.95], w, h);
-        let m_txt = format!(
-            "M {}/{} (+{:.1})",
-            a.mass / SCALE,
-            a.mass_cap / SCALE,
-            a.income_mass as f64 * TICK_HZ as f64 / SCALE as f64
-        );
-        draw_text(&mut fg_v, &mut fg_i, 14.0, 26.0, 1.6, &m_txt, [0.55, 0.98, 0.65, 1.0], w, h);
+            let mx0 = econ[0] + 10.0;
+            push_rect(&mut v, &mut i, mx0, econ[1] + 10.0, bw, 11.0, [0.08, 0.12, 0.10, 0.96], w, h);
+            push_rect(&mut v, &mut i, mx0, econ[1] + 10.0, bw * m_fill, 11.0, [0.24, 0.88, 0.44, 0.96], w, h);
+            push_rect_outline(&mut fg_v, &mut fg_i, mx0, econ[1] + 10.0, bw, 11.0, 1.0, p.border_inner, w, h);
+            let m_txt = format!(
+                "M {}/{} (+{:.1})",
+                a.mass / SCALE,
+                a.mass_cap / SCALE,
+                a.income_mass as f64 * TICK_HZ as f64 / SCALE as f64
+            );
+            draw_text(&mut fg_v, &mut fg_i, mx0, econ[1] + 27.0, 1.5, &m_txt, [0.55, 0.98, 0.65, 1.0], w, h);
 
-        // Energy gauge
-        push_rect(&mut v, &mut i, 214.0, 10.0, 180.0, 11.0, [0.12, 0.15, 0.18, 0.95], w, h);
-        push_rect(&mut v, &mut i, 214.0, 10.0, 180.0 * e_fill, 11.0, [0.96, 0.80, 0.22, 0.95], w, h);
-        let e_txt = format!(
-            "E {}/{} (+{:.0})",
-            a.energy / SCALE,
-            a.energy_cap / SCALE,
-            a.income_energy as f64 * TICK_HZ as f64 / SCALE as f64
-        );
-        draw_text(&mut fg_v, &mut fg_i, 214.0, 26.0, 1.6, &e_txt, [1.0, 0.90, 0.42, 1.0], w, h);
-    }
+            let ex0 = div_x + 10.0;
+            push_rect(&mut v, &mut i, ex0, econ[1] + 10.0, bw, 11.0, [0.14, 0.12, 0.06, 0.96], w, h);
+            push_rect(&mut v, &mut i, ex0, econ[1] + 10.0, bw * e_fill, 11.0, [0.96, 0.80, 0.22, 0.96], w, h);
+            push_rect_outline(&mut fg_v, &mut fg_i, ex0, econ[1] + 10.0, bw, 11.0, 1.0, p.border_inner, w, h);
+            let e_txt = format!(
+                "E {}/{} (+{:.0})",
+                a.energy / SCALE,
+                a.energy_cap / SCALE,
+                a.income_energy as f64 * TICK_HZ as f64 / SCALE as f64
+            );
+            draw_text(&mut fg_v, &mut fg_i, ex0, econ[1] + 27.0, 1.5, &e_txt, [1.0, 0.90, 0.42, 1.0], w, h);
+        }
 
-    let secs = session.world.tick() / TICK_HZ;
-    let speed_str = if session.paused {
-        "PAUSED".to_string()
+        let secs = session.world.tick() / TICK_HZ;
+        let speed_str = if session.paused { "PAUSED".to_string() } else { format!("{}X", session.speed) };
+        let n_units = session.world.units().filter(|u| u.army == session.human_army && !u.role.is_structure()).count();
+        let top_txt = format!("{} {:02}:{:02} [{}]", p.name, secs / 60, secs % 60, speed_str);
+        draw_text(&mut fg_v, &mut fg_i, clock[0] + 10.0, clock[1] + 10.0, 1.55, &top_txt, p.title_gold, w, h);
+        let sub_txt = format!("UNITS:{n_units} SEL:{}", session.selected.len());
+        draw_text(&mut fg_v, &mut fg_i, clock[0] + 10.0, clock[1] + 24.0, 1.4, &sub_txt, [0.90, 0.95, 1.0, 1.0], w, h);
+
+        if let Some(res) = session.world.result() {
+            let banner = match res {
+                GameResult::Victory(a) if a == session.human_army => "VICTORY!",
+                GameResult::Victory(_) => "DEFEAT",
+                GameResult::Draw => "DRAW",
+            };
+            push_classic_chrome(&mut v, &mut i, &mut fg_v, &mut fg_i, [w * 0.5 - 120.0, 16.0, 240.0, 36.0], &p, 4.0, w, h);
+            draw_text(&mut fg_v, &mut fg_i, w * 0.5 - 64.0, 27.0, 2.5, banner, p.title_gold, w, h);
+        } else if !session.status_banner.is_empty() {
+            let trunc: String = session.status_banner.chars().take(40).collect();
+            let bw = (text_w(&trunc, 1.35) + 14.0).min(clock[2]);
+            let bx = clock[0] + clock[2] - bw;
+            push_rect(&mut v, &mut i, bx, clock[1] + clock[3] + 4.0, bw, 18.0, p.panel_bot, w, h);
+            push_rect_outline(&mut fg_v, &mut fg_i, bx, clock[1] + clock[3] + 4.0, bw, 18.0, 1.0, p.border_outer, w, h);
+            draw_text(&mut fg_v, &mut fg_i, bx + 7.0, clock[1] + clock[3] + 9.0, 1.35, &trunc, p.accent, w, h);
+        }
+        if let Some(net) = &session.net {
+            let ny = clock[1] + clock[3] + if session.status_banner.is_empty() { 6.0 } else { 26.0 };
+            let nline = net.hud_line();
+            let nw = text_w(&nline, 1.35) + 12.0;
+            draw_text(&mut fg_v, &mut fg_i, clock[0] + clock[2] - nw, ny, 1.35, &nline, [0.60, 0.95, 0.80, 0.95], w, h);
+            if let Some(fail) = net.failure_banner() {
+                let fail: String = fail.chars().take(60).collect();
+                push_rect(&mut v, &mut i, w * 0.5 - 260.0, 64.0, 520.0, 30.0, [0.55, 0.04, 0.04, 0.92], w, h);
+                draw_text(&mut fg_v, &mut fg_i, w * 0.5 - 250.0, 72.0, 2.0, &fail, [1.0, 0.92, 0.85, 1.0], w, h);
+            }
+        }
     } else {
-        format!("{}X", session.speed)
-    };
-    let n_units = session
-        .world
-        .units()
-        .filter(|u| u.army == session.human_army && !u.role.is_structure())
-        .count();
-    let mid_txt = format!(
-        "{:02}:{:02} [{}] UNITS:{} SEL:{}",
-        secs / 60,
-        secs % 60,
-        speed_str,
-        n_units,
-        session.selected.len()
-    );
-    draw_text(&mut fg_v, &mut fg_i, 420.0, 16.0, 1.9, &mid_txt, [0.92, 0.95, 1.0, 1.0], w, h);
+        push_rect(&mut v, &mut i, 0.0, 0.0, w, 46.0, [0.06, 0.08, 0.12, 0.84], w, h);
+        push_rect(&mut v, &mut i, 0.0, 46.0, w, 2.0, [0.22, 0.45, 0.72, 0.85], w, h);
 
-    if let Some(res) = session.world.result() {
-        let banner = match res {
-            GameResult::Victory(a) if a == session.human_army => "VICTORY!",
-            GameResult::Victory(_) => "DEFEAT",
-            GameResult::Draw => "DRAW",
+        if let Some(a) = session.world.army(session.human_army) {
+            let m_fill = (a.mass as f32 / a.mass_cap.max(1) as f32).clamp(0.0, 1.0);
+            let e_fill = (a.energy as f32 / a.energy_cap.max(1) as f32).clamp(0.0, 1.0);
+
+            // Mass gauge
+            push_rect(&mut v, &mut i, 14.0, 10.0, 180.0, 11.0, [0.12, 0.15, 0.18, 0.95], w, h);
+            push_rect(&mut v, &mut i, 14.0, 10.0, 180.0 * m_fill, 11.0, [0.24, 0.86, 0.44, 0.95], w, h);
+            let m_txt = format!(
+                "M {}/{} (+{:.1})",
+                a.mass / SCALE,
+                a.mass_cap / SCALE,
+                a.income_mass as f64 * TICK_HZ as f64 / SCALE as f64
+            );
+            draw_text(&mut fg_v, &mut fg_i, 14.0, 26.0, 1.6, &m_txt, [0.55, 0.98, 0.65, 1.0], w, h);
+
+            // Energy gauge
+            push_rect(&mut v, &mut i, 214.0, 10.0, 180.0, 11.0, [0.12, 0.15, 0.18, 0.95], w, h);
+            push_rect(&mut v, &mut i, 214.0, 10.0, 180.0 * e_fill, 11.0, [0.96, 0.80, 0.22, 0.95], w, h);
+            let e_txt = format!(
+                "E {}/{} (+{:.0})",
+                a.energy / SCALE,
+                a.energy_cap / SCALE,
+                a.income_energy as f64 * TICK_HZ as f64 / SCALE as f64
+            );
+            draw_text(&mut fg_v, &mut fg_i, 214.0, 26.0, 1.6, &e_txt, [1.0, 0.90, 0.42, 1.0], w, h);
+        }
+
+        let secs = session.world.tick() / TICK_HZ;
+        let speed_str = if session.paused {
+            "PAUSED".to_string()
+        } else {
+            format!("{}X", session.speed)
         };
-        push_rect(&mut v, &mut i, w * 0.5 - 120.0, 56.0, 240.0, 34.0, [0.06, 0.08, 0.12, 0.90], w, h);
-        draw_text(&mut fg_v, &mut fg_i, w * 0.5 - 64.0, 65.0, 2.5, banner, [1.0, 0.85, 0.20, 1.0], w, h);
-    } else if !session.status_banner.is_empty() {
-        let trunc: String = session.status_banner.chars().take(48).collect();
-        draw_text(&mut fg_v, &mut fg_i, 420.0, 32.0, 1.4, &trunc, [0.72, 0.82, 0.95, 0.95], w, h);
-    }
+        let n_units = session
+            .world
+            .units()
+            .filter(|u| u.army == session.human_army && !u.role.is_structure())
+            .count();
+        let mid_txt = format!(
+            "{:02}:{:02} [{}] UNITS:{} SEL:{}",
+            secs / 60,
+            secs % 60,
+            speed_str,
+            n_units,
+            session.selected.len()
+        );
+        draw_text(&mut fg_v, &mut fg_i, 420.0, 16.0, 1.9, &mid_txt, [0.92, 0.95, 1.0, 1.0], w, h);
 
-    // Phase 15 lockstep status (ping / turn buffer) and desync / network-failure banner.
-    if let Some(net) = &session.net {
-        draw_text(&mut fg_v, &mut fg_i, 420.0, 44.0, 1.4, &net.hud_line(), [0.60, 0.95, 0.80, 0.95], w, h);
-        if let Some(fail) = net.failure_banner() {
-            let fail: String = fail.chars().take(60).collect();
-            push_rect(&mut v, &mut i, w * 0.5 - 260.0, 96.0, 520.0, 30.0, [0.55, 0.04, 0.04, 0.92], w, h);
-            draw_text(&mut fg_v, &mut fg_i, w * 0.5 - 250.0, 104.0, 2.0, &fail, [1.0, 0.92, 0.85, 1.0], w, h);
+        if let Some(res) = session.world.result() {
+            let banner = match res {
+                GameResult::Victory(a) if a == session.human_army => "VICTORY!",
+                GameResult::Victory(_) => "DEFEAT",
+                GameResult::Draw => "DRAW",
+            };
+            push_rect(&mut v, &mut i, w * 0.5 - 120.0, 56.0, 240.0, 34.0, [0.06, 0.08, 0.12, 0.90], w, h);
+            draw_text(&mut fg_v, &mut fg_i, w * 0.5 - 64.0, 65.0, 2.5, banner, [1.0, 0.85, 0.20, 1.0], w, h);
+        } else if !session.status_banner.is_empty() {
+            let trunc: String = session.status_banner.chars().take(48).collect();
+            draw_text(&mut fg_v, &mut fg_i, 420.0, 32.0, 1.4, &trunc, [0.72, 0.82, 0.95, 0.95], w, h);
+        }
+
+        // Phase 15 lockstep status (ping / turn buffer) and desync / network-failure banner.
+        if let Some(net) = &session.net {
+            draw_text(&mut fg_v, &mut fg_i, 420.0, 44.0, 1.4, &net.hud_line(), [0.60, 0.95, 0.80, 0.95], w, h);
+            if let Some(fail) = net.failure_banner() {
+                let fail: String = fail.chars().take(60).collect();
+                push_rect(&mut v, &mut i, w * 0.5 - 260.0, 96.0, 520.0, 30.0, [0.55, 0.04, 0.04, 0.92], w, h);
+                draw_text(&mut fg_v, &mut fg_i, w * 0.5 - 250.0, 104.0, 2.0, &fail, [1.0, 0.92, 0.85, 1.0], w, h);
+            }
         }
     }
 
-    // 3. Phase 23 bottom-left command cluster (card, orders, queue, enhancements)
+    // 3. Phase 23 command cluster (card, orders, queue, enhancements)
     {
-        let mut hb = HudBufs { v: &mut v, i: &mut i, ic_v: &mut ic_v, ic_i: &mut ic_i, fg_v: &mut fg_v, fg_i: &mut fg_i, w, h };
+        let mut hb = HudBufs { v: &mut v, i: &mut i, ic_v: &mut ic_v, ic_i: &mut ic_i, fg_v: &mut fg_v, fg_i: &mut fg_i, w, h, pal };
         draw_command_interface(session, &layout, &mut hb);
     }
 
-    // 3b. Hover / selection stats card (above the minimap)
+    // 3b. Hover / selection stats card (above minimap in Modern, bottom-right Unit Avatar in Classic)
     if let Some((cid, count)) = session.card_unit() {
         let lines = crate::controls::unit_card_lines(&session.world, cid, count);
         if !lines.is_empty() {
             let ts = 1.5;
             let lh = 5.0 * ts + 5.0;
             let max_chars = lines.iter().map(|l| l.len()).max().unwrap_or(0) as f32;
-            let cw = (max_chars * 4.0 * ts + 22.0).clamp(160.0, 340.0);
-            let ch = lines.len() as f32 * lh + 12.0;
-            let cx = w - cw - 12.0;
-            let cy = (my - ch - 12.0).max(52.0);
-            push_rect(&mut v, &mut i, cx, cy, cw, ch, [0.05, 0.07, 0.11, 0.88], w, h);
-            if let Some(u) = session.world.unit(cid) {
-                let rgb = army_rgb(&session.world, u.army);
-                push_rect(&mut fg_v, &mut fg_i, cx, cy, 4.0, ch, [rgb[0], rgb[1], rgb[2], 1.0], w, h);
-                let frac = (u.hp as f32 / u.max_hp.max(1) as f32).clamp(0.0, 1.0);
-                push_rect(&mut fg_v, &mut fg_i, cx + 4.0, cy + ch - 3.0, (cw - 4.0) * frac, 3.0, [0.22, 0.92, 0.35, 0.95], w, h);
-            }
-            push_rect_outline(&mut fg_v, &mut fg_i, cx, cy, cw, ch, 1.2, [0.30, 0.44, 0.64, 0.95], w, h);
-            for (li, line) in lines.iter().enumerate() {
-                let col = if li == 0 { [1.0, 0.92, 0.55, 1.0] } else { [0.88, 0.93, 1.0, 1.0] };
-                draw_text(&mut fg_v, &mut fg_i, cx + 12.0, cy + 7.0 + li as f32 * lh, ts, line, col, w, h);
+            let portrait = if pal.is_some() { 54.0 } else { 0.0 };
+            let cw = (max_chars * 4.0 * ts + 22.0 + portrait).clamp(160.0 + portrait, 360.0);
+            let ch = (lines.len() as f32 * lh + 16.0).max(if pal.is_some() { 68.0 } else { 0.0 });
+            let cx = w - cw - (if pal.is_some() { 6.0 } else { 12.0 });
+            let cy = if pal.is_some() {
+                let floor_y = layout.timeline.as_ref().map(|tl| tl.panel[1] - 8.0).unwrap_or(h - 6.0);
+                (floor_y - ch).max(52.0)
+            } else {
+                (my - ch - 12.0).max(52.0)
+            };
+            if let Some(p) = pal {
+                push_classic_chrome(&mut v, &mut i, &mut fg_v, &mut fg_i, [cx, cy, cw, ch], &p, 4.0, w, h);
+                if let Some(u) = session.world.unit(cid) {
+                    let pr = [cx + 8.0, cy + 8.0, 44.0, 44.0];
+                    push_rect(&mut v, &mut i, pr[0], pr[1], pr[2], pr[3], [0.02, 0.03, 0.05, 0.96], w, h);
+                    push_rect_outline(&mut fg_v, &mut fg_i, pr[0], pr[1], pr[2], pr[3], 1.2, p.border_outer, w, h);
+                    let mut hb = HudBufs { v: &mut v, i: &mut i, ic_v: &mut ic_v, ic_i: &mut ic_i, fg_v: &mut fg_v, fg_i: &mut fg_i, w, h, pal };
+                    if !hb.icon(&u.type_id, [pr[0] + 2.0, pr[1] + 2.0, pr[2] - 4.0, pr[3] - 4.0], 0.98) {
+                        let rgb = army_rgb(&session.world, u.army);
+                        push_rect(&mut fg_v, &mut fg_i, pr[0] + 6.0, pr[1] + 6.0, pr[2] - 12.0, pr[3] - 12.0, [rgb[0], rgb[1], rgb[2], 0.9], w, h);
+                    }
+                    let frac = (u.hp as f32 / u.max_hp.max(1) as f32).clamp(0.0, 1.0);
+                    push_rect(&mut fg_v, &mut fg_i, pr[0], pr[1] + pr[3] + 3.0, pr[2], 4.0, [0.12, 0.15, 0.18, 0.95], w, h);
+                    push_rect(&mut fg_v, &mut fg_i, pr[0], pr[1] + pr[3] + 3.0, pr[2] * frac, 4.0, [0.22, 0.92, 0.35, 0.95], w, h);
+                }
+                for (li, line) in lines.iter().enumerate() {
+                    let col = if li == 0 { p.title_gold } else { [0.90, 0.94, 1.0, 1.0] };
+                    draw_text(&mut fg_v, &mut fg_i, cx + 60.0, cy + 8.0 + li as f32 * lh, ts, line, col, w, h);
+                }
+            } else {
+                push_rect(&mut v, &mut i, cx, cy, cw, ch, [0.05, 0.07, 0.11, 0.88], w, h);
+                if let Some(u) = session.world.unit(cid) {
+                    let rgb = army_rgb(&session.world, u.army);
+                    push_rect(&mut fg_v, &mut fg_i, cx, cy, 4.0, ch, [rgb[0], rgb[1], rgb[2], 1.0], w, h);
+                    let frac = (u.hp as f32 / u.max_hp.max(1) as f32).clamp(0.0, 1.0);
+                    push_rect(&mut fg_v, &mut fg_i, cx + 4.0, cy + ch - 3.0, (cw - 4.0) * frac, 3.0, [0.22, 0.92, 0.35, 0.95], w, h);
+                }
+                push_rect_outline(&mut fg_v, &mut fg_i, cx, cy, cw, ch, 1.2, [0.30, 0.44, 0.64, 0.95], w, h);
+                for (li, line) in lines.iter().enumerate() {
+                    let col = if li == 0 { [1.0, 0.92, 0.55, 1.0] } else { [0.88, 0.93, 1.0, 1.0] };
+                    draw_text(&mut fg_v, &mut fg_i, cx + 12.0, cy + 7.0 + li as f32 * lh, ts, line, col, w, h);
+                }
             }
         }
     }
@@ -830,7 +1018,17 @@ pub fn build_hud_geometry(
     }
 
     // 4. Minimap border + live unit dots + camera viewport target
-    push_rect_outline(&mut fg_v, &mut fg_i, mx - 2.0, my - 2.0, mw + 4.0, mh + 4.0, 2.0, [0.30, 0.44, 0.64, 0.95], w, h);
+    if let Some(p) = pal {
+        let hdr = [mx - 3.0, my - 18.0, mw + 6.0, 16.0];
+        push_rect(&mut v, &mut i, hdr[0], hdr[1], hdr[2], hdr[3], p.header_bg, w, h);
+        push_rect_outline(&mut fg_v, &mut fg_i, hdr[0], hdr[1], hdr[2], hdr[3], 1.5, p.border_outer, w, h);
+        draw_text(&mut fg_v, &mut fg_i, hdr[0] + 6.0, hdr[1] + 5.0, 1.35, "TACTICAL", p.title_gold, w, h);
+        push_rect_outline(&mut fg_v, &mut fg_i, mx - 3.0, my - 2.0, mw + 6.0, mh + 5.0, 2.2, p.border_outer, w, h);
+        push_rect_outline(&mut fg_v, &mut fg_i, mx, my, mw, mh, 1.0, p.border_inner, w, h);
+        push_brackets(&mut fg_v, &mut fg_i, [mx - 4.0, my - 19.0, mw + 8.0, mh + 23.0], 14.0, 2.2, p.bracket, w, h);
+    } else {
+        push_rect_outline(&mut fg_v, &mut fg_i, mx - 2.0, my - 2.0, mw + 4.0, mh + 4.0, 2.0, [0.30, 0.44, 0.64, 0.95], w, h);
+    }
     let map_w = (map.size.0 as f32 / SCALE as f32).max(1.0);
     let map_h = (map.size.1 as f32 / SCALE as f32).max(1.0);
 
@@ -896,8 +1094,12 @@ pub fn build_hud_geometry(
         h,
     );
 
-    // 5. Phase 21 in-game chat log + input bar (above the bottom-left palette)
-    let chat_base_y = layout.cluster[1] - 12.0;
+    // 5. Phase 21 in-game chat log + input bar (above bottom-left cluster / minimap)
+    let chat_base_y = if layout.classic {
+        layout.cluster[1].min(my - 22.0) - 10.0
+    } else {
+        layout.cluster[1] - 12.0
+    };
     let now = Instant::now();
     let vis_chat = session.chat.visible(now);
     let mut cy_chat = if session.chat.is_typing() { chat_base_y - 26.0 } else { chat_base_y };
@@ -954,7 +1156,7 @@ pub fn build_hud_geometry(
     if !session.menu.is_open()
         && let Some(cur) = session.ui.cursor_px
     {
-        let mut hb = HudBufs { v: &mut v, i: &mut i, ic_v: &mut ic_v, ic_i: &mut ic_i, fg_v: &mut fg_v, fg_i: &mut fg_i, w, h };
+        let mut hb = HudBufs { v: &mut v, i: &mut i, ic_v: &mut ic_v, ic_i: &mut ic_i, fg_v: &mut fg_v, fg_i: &mut fg_i, w, h, pal };
         if let Some(hit) = layout.hit_test_button(cur.0, cur.1) {
             let lines = hud_tooltip(session, &layout, hit);
             // Cluster elements show their tooltip above the whole cluster.
@@ -978,9 +1180,12 @@ pub fn build_hud_geometry(
     if let Some(ml) = MatchMenuLayout::compute(session, width, height) {
         push_rect(&mut fg_v, &mut fg_i, 0.0, 0.0, w, h, [0.0, 0.0, 0.0, 0.52], w, h);
         let [px, py, pw, ph] = ml.panel;
-        push_rect(&mut fg_v, &mut fg_i, px, py, pw, ph, [0.05, 0.07, 0.11, 0.96], w, h);
-        push_rect(&mut fg_v, &mut fg_i, px + 1.0, py + 1.0, pw - 2.0, 34.0, [0.10, 0.18, 0.25, 0.96], w, h);
-        push_rect_outline(&mut fg_v, &mut fg_i, px, py, pw, ph, 1.6, [0.40, 0.74, 0.94, 0.95], w, h);
+        push_rect(&mut fg_v, &mut fg_i, px, py, pw, ph, panel_bg_default, w, h);
+        push_rect(&mut fg_v, &mut fg_i, px + 1.0, py + 1.0, pw - 2.0, 34.0, hdr_bg_default, w, h);
+        push_rect_outline(&mut fg_v, &mut fg_i, px, py, pw, ph, 1.8, brd_default, w, h);
+        if let Some(p) = pal {
+            push_brackets(&mut fg_v, &mut fg_i, [px - 2.0, py - 2.0, pw + 4.0, ph + 4.0], 16.0, 2.2, p.bracket, w, h);
+        }
         let title_str = match &session.menu {
             MatchMenu::Pause => {
                 if session.net.is_some() { "MATCH PAUSED (NETWORK)" } else { "MATCH PAUSED" }
@@ -994,7 +1199,7 @@ pub fn build_hud_geometry(
             },
             MatchMenu::None => "",
         };
-        draw_text(&mut fg_v, &mut fg_i, px + 16.0, py + 12.0, 2.0, title_str, [0.96, 0.84, 0.45, 1.0], w, h);
+        draw_text(&mut fg_v, &mut fg_i, px + 16.0, py + 12.0, 2.0, title_str, title_gold, w, h);
 
         if let MatchMenu::LoadList { entries, selected } = &session.menu {
             if entries.is_empty() {
@@ -1100,6 +1305,53 @@ struct HudBufs<'a> {
     fg_i: &'a mut Vec<u32>,
     w: f32,
     h: f32,
+    pal: Option<crate::ui_kit::ClassicPalette>,
+}
+
+fn push_brackets(
+    verts: &mut Vec<HudVertex>,
+    indices: &mut Vec<u32>,
+    r: [f32; 4],
+    len: f32,
+    t: f32,
+    color: [f32; 4],
+    w: f32,
+    h: f32,
+) {
+    let l = len.min(r[2] * 0.5).min(r[3] * 0.5);
+    for (cx, cy, sx, sy) in [
+        (r[0], r[1], 1.0, 1.0),
+        (r[0] + r[2], r[1], -1.0, 1.0),
+        (r[0] + r[2], r[1] + r[3], -1.0, -1.0),
+        (r[0], r[1] + r[3], 1.0, -1.0),
+    ] {
+        let hx = if sx > 0.0 { cx } else { cx - l };
+        let vy = if sy > 0.0 { cy } else { cy - l };
+        let hy = if sy > 0.0 { cy } else { cy - t };
+        let vx = if sx > 0.0 { cx } else { cx - t };
+        push_rect(verts, indices, hx, hy, l, t, color, w, h);
+        push_rect(verts, indices, vx, vy, t, l, color, w, h);
+    }
+}
+
+fn push_classic_chrome(
+    v: &mut Vec<HudVertex>,
+    i: &mut Vec<u32>,
+    fg_v: &mut Vec<HudVertex>,
+    fg_i: &mut Vec<u32>,
+    r: [f32; 4],
+    pal: &crate::ui_kit::ClassicPalette,
+    header_h: f32,
+    w: f32,
+    h: f32,
+) {
+    push_rect(v, i, r[0], r[1], r[2], r[3], pal.panel_bot, w, h);
+    if header_h > 0.0 && r[3] > header_h + 4.0 {
+        push_rect(v, i, r[0] + 2.0, r[1] + 2.0, (r[2] - 4.0).max(0.0), header_h, pal.header_bg, w, h);
+    }
+    push_rect_outline(fg_v, fg_i, r[0], r[1], r[2], r[3], 1.8, pal.border_outer, w, h);
+    push_rect_outline(fg_v, fg_i, r[0] + 3.0, r[1] + 3.0, (r[2] - 6.0).max(0.0), (r[3] - 6.0).max(0.0), 1.0, pal.border_inner, w, h);
+    push_brackets(fg_v, fg_i, [r[0] - 1.0, r[1] - 1.0, r[2] + 2.0, r[3] + 2.0], 11.0, 2.0, pal.bracket, w, h);
 }
 
 impl HudBufs<'_> {
@@ -1111,6 +1363,14 @@ impl HudBufs<'_> {
     }
     fn outline(&mut self, r: [f32; 4], t: f32, c: [f32; 4]) {
         push_rect_outline(self.fg_v, self.fg_i, r[0], r[1], r[2], r[3], t, c, self.w, self.h);
+    }
+    fn panel(&mut self, r: [f32; 4]) {
+        if let Some(p) = self.pal {
+            push_classic_chrome(self.v, self.i, self.fg_v, self.fg_i, r, &p, 4.0, self.w, self.h);
+        } else {
+            self.bg(r, [0.04, 0.06, 0.10, 0.86]);
+            self.outline(r, 1.2, [0.30, 0.44, 0.64, 0.95]);
+        }
     }
     fn text(&mut self, x: f32, y: f32, scale: f32, s: &str, c: [f32; 4]) {
         draw_text(self.fg_v, self.fg_i, x, y, scale, s, c, self.w, self.h);
@@ -1133,17 +1393,20 @@ impl HudBufs<'_> {
         true
     }
     fn button(&mut self, r: [f32; 4], label: &str, active: bool, enabled: bool) {
-        let bg = if !enabled {
-            [0.07, 0.09, 0.11, 0.85]
-        } else if active {
-            [0.18, 0.48, 0.78, 0.95]
-        } else {
-            [0.11, 0.15, 0.22, 0.92]
+        let (bg, brd, col) = match self.pal {
+            Some(p) => (
+                if !enabled { [0.06, 0.07, 0.09, 0.86] } else if active { p.btn_active } else { p.btn },
+                if active { p.bracket } else { p.border_outer },
+                if enabled { if active { p.title_gold } else { [0.94, 0.97, 1.0, 1.0] } } else { [0.45, 0.50, 0.56, 1.0] },
+            ),
+            None => (
+                if !enabled { [0.07, 0.09, 0.11, 0.85] } else if active { [0.18, 0.48, 0.78, 0.95] } else { [0.11, 0.15, 0.22, 0.92] },
+                if active { [0.45, 0.92, 1.0, 1.0] } else { [0.26, 0.34, 0.46, 0.95] },
+                if enabled { [0.94, 0.97, 1.0, 1.0] } else { [0.45, 0.50, 0.56, 1.0] },
+            ),
         };
-        let brd = if active { [0.45, 0.92, 1.0, 1.0] } else { [0.26, 0.34, 0.46, 0.95] };
         self.bg(r, bg);
         self.outline(r, 1.2, brd);
-        let col = if enabled { [0.94, 0.97, 1.0, 1.0] } else { [0.45, 0.50, 0.56, 1.0] };
         let tw = text_w(label, 1.35);
         self.text(r[0] + ((r[2] - tw) * 0.5).max(3.0), r[1] + (r[3] - 6.75) * 0.5, 1.35, label, col);
     }
@@ -1162,17 +1425,25 @@ fn fmt_cost(v: i64) -> String {
     if whole >= 10_000 { format!("{}K", whole / 1000) } else { whole.to_string() }
 }
 
-/// Phase 23 bottom-left cluster: command card, orders, queue / upgrade, enhancements.
+/// Phase 23 bottom command cluster: command card, orders, queue / upgrade, enhancements.
 fn draw_command_interface(session: &PlaySession, layout: &HudLayout, b: &mut HudBufs) {
     let keymap = crate::keymap::active();
     let card_keys = crate::settings::card_hotkeys_enabled();
-    let panel_bg = [0.04, 0.06, 0.10, 0.86];
-    let panel_brd = [0.30, 0.44, 0.64, 0.95];
+    let (slot_bg, slot_hover, slot_active, slot_brd, slot_brd_active, title_col) = match b.pal {
+        Some(p) => (p.btn, p.btn_hover, p.btn_active, p.border_outer, p.bracket, p.title_gold),
+        None => (
+            [0.09, 0.12, 0.18, 0.95],
+            [0.16, 0.24, 0.34, 0.95],
+            [0.18, 0.48, 0.78, 0.95],
+            [0.24, 0.32, 0.44, 0.95],
+            [0.45, 0.92, 1.0, 1.0],
+            [1.0, 0.92, 0.55, 1.0],
+        ),
+    };
 
     // --- Command card -------------------------------------------------------
     let c = &layout.card;
-    b.bg(c.panel, panel_bg);
-    b.outline(c.panel, 1.2, panel_brd);
+    b.panel(c.panel);
     match c.model.source {
         None => {
             let msg = if session.is_replay() { "REPLAY" } else { "SELECT A BUILDER" };
@@ -1204,15 +1475,9 @@ fn draw_command_interface(session: &PlaySession, layout: &HudLayout, b: &mut Hud
             for (k, (r, item)) in c.slots.iter().zip(c.model.page_items()).enumerate() {
                 let placing = session.build_mode.as_deref() == Some(item.unit_type.as_str());
                 let hover = session.ui.hud_hover == Some(HudAction::CardItem(k as u16));
-                let bg = if placing {
-                    [0.18, 0.48, 0.78, 0.95]
-                } else if hover {
-                    [0.16, 0.24, 0.34, 0.95]
-                } else {
-                    [0.09, 0.12, 0.18, 0.95]
-                };
+                let bg = if placing { slot_active } else if hover { slot_hover } else { slot_bg };
                 b.bg(*r, bg);
-                let brd = if placing { [0.45, 0.92, 1.0, 1.0] } else { [0.24, 0.32, 0.44, 0.95] };
+                let brd = if placing { slot_brd_active } else { slot_brd };
                 b.outline(*r, 1.2, brd);
                 if !b.icon(&item.unit_type, [r[0] + 3.0, r[1] + 3.0, r[2] - 6.0, r[3] - 6.0], 0.98) {
                     b.text(r[0] + 4.0, r[1] + 16.0, 1.3, &trunc(&item.unit_type, 8), [0.92, 0.95, 1.0, 1.0]);
@@ -1238,25 +1503,18 @@ fn draw_command_interface(session: &PlaySession, layout: &HudLayout, b: &mut Hud
     }
 
     // --- Orders panel -------------------------------------------------------
-    b.bg(layout.orders_panel, panel_bg);
-    b.outline(layout.orders_panel, 1.2, panel_brd);
+    b.panel(layout.orders_panel);
     for btn in &layout.buttons {
         let r = [btn.x, btn.y, btn.w, btn.h];
         let HudAction::Order(kind) = btn.action else {
             continue;
         };
         let hover = session.ui.hud_hover == Some(btn.action);
-        let bg = if btn.active {
-            [0.18, 0.48, 0.78, 0.95]
-        } else if hover {
-            [0.16, 0.24, 0.34, 0.95]
-        } else {
-            [0.11, 0.15, 0.22, 0.92]
-        };
+        let bg = if btn.active { slot_active } else if hover { slot_hover } else { slot_bg };
         b.bg(r, bg);
         let rgb = kind.rgb();
         b.fg([r[0], r[1], 3.0, r[3]], [rgb[0], rgb[1], rgb[2], 0.95]);
-        b.outline(r, 1.2, if btn.active { [0.45, 0.92, 1.0, 1.0] } else { [0.26, 0.34, 0.46, 0.95] });
+        b.outline(r, 1.2, if btn.active { slot_brd_active } else { slot_brd });
         let label = if kind == OrderKind::IdleEngineer {
             format!("IDLE:{}", session.idle_engineers().len())
         } else if kind == OrderKind::LaunchMissile {
@@ -1279,20 +1537,19 @@ fn draw_command_interface(session: &PlaySession, layout: &HudLayout, b: &mut Hud
 
     // --- Factory queue / upgrade -------------------------------------------
     if let Some(q) = &layout.queue {
-        b.bg(q.panel, panel_bg);
-        b.outline(q.panel, 1.2, panel_brd);
+        b.panel(q.panel);
         let title = match session.queue_panel_unit().and_then(|id| session.world.unit(id)) {
             Some(u) => format!("QUEUE  {}", trunc(&session.world.catalog().get(&u.type_id).map(|t| t.name.trim().to_string()).unwrap_or_else(|| u.type_id.clone()), 28)),
             None => "UPGRADE".to_string(),
         };
-        b.text(q.panel[0] + 8.0, q.panel[1] + 7.0, 1.5, &title, [1.0, 0.92, 0.55, 1.0]);
+        b.text(q.panel[0] + 8.0, q.panel[1] + 7.0, 1.5, &title, title_col);
         if q.entries.is_empty() && session.queue_panel_unit().is_some() {
             b.text(q.panel[0] + 10.0, q.panel[1] + 40.0, 1.35, "EMPTY - CLICK A UNIT ON THE CARD", [0.50, 0.58, 0.66, 1.0]);
         }
         for (k, (r, e)) in q.entries.iter().enumerate() {
             let hover = session.ui.hud_hover == Some(HudAction::QueueItem(k as u16));
-            b.bg(*r, if hover { [0.30, 0.12, 0.12, 0.95] } else { [0.09, 0.12, 0.18, 0.95] });
-            b.outline(*r, 1.0, if e.progress.is_some() { [0.45, 0.92, 1.0, 1.0] } else { [0.24, 0.32, 0.44, 0.95] });
+            b.bg(*r, if hover { [0.30, 0.12, 0.12, 0.95] } else { slot_bg });
+            b.outline(*r, 1.0, if e.progress.is_some() { slot_brd_active } else { slot_brd });
             if !b.icon(&e.unit_type, [r[0] + 2.0, r[1] + 2.0, r[2] - 4.0, r[3] - 4.0], 0.98) {
                 b.text(r[0] + 3.0, r[1] + 16.0, 1.15, &trunc(&e.unit_type, 7), [0.92, 0.95, 1.0, 1.0]);
             }
@@ -1314,24 +1571,23 @@ fn draw_command_interface(session: &PlaySession, layout: &HudLayout, b: &mut Hud
         }
         if let Some((_, p)) = &q.upgrading {
             let r = [q.panel[0] + q.panel[2] - 136.0, q.panel[1] + 48.0, 128.0, 22.0];
-            b.bg(r, [0.09, 0.12, 0.18, 0.95]);
+            b.bg(r, slot_bg);
             b.bg([r[0], r[1], r[2] * *p as f32 / 1000.0, r[3]], [0.20, 0.55, 0.30, 0.95]);
-            b.outline(r, 1.0, [0.45, 0.92, 1.0, 1.0]);
+            b.outline(r, 1.0, slot_brd_active);
             b.text(r[0] + 5.0, r[1] + 8.0, 1.3, &format!("UPGRADING {}%", p / 10), [1.0, 1.0, 1.0, 1.0]);
         }
     }
 
     // --- Enhancements -------------------------------------------------------
     if let Some(e) = &layout.enh {
-        b.bg(e.panel, panel_bg);
-        b.outline(e.panel, 1.2, panel_brd);
+        b.panel(e.panel);
         let name = session
             .world
             .unit(e.unit)
             .and_then(|u| session.world.catalog().get(&u.type_id))
             .map(|t| t.name.trim().to_string())
             .unwrap_or_default();
-        b.text(e.panel[0] + 8.0, e.panel[1] + 7.0, 1.5, &format!("ENHANCEMENTS  {}", trunc(&name, 30)), [1.0, 0.92, 0.55, 1.0]);
+        b.text(e.panel[0] + 8.0, e.panel[1] + 7.0, 1.5, &format!("ENHANCEMENTS  {}", trunc(&name, 30)), title_col);
         for (r, slot) in &e.headers {
             b.text(r[0] + 2.0, r[1] + 2.0, 1.3, crate::command_card::slot_label(slot), [0.55, 0.72, 0.90, 1.0]);
         }
@@ -1340,17 +1596,17 @@ fn draw_command_interface(session: &PlaySession, layout: &HudLayout, b: &mut Hud
             let (bg, txt) = match row.state {
                 EnhState::Installed => ([0.10, 0.30, 0.16, 0.95], [0.70, 1.0, 0.72, 1.0]),
                 EnhState::Available => (
-                    if hover { [0.16, 0.30, 0.46, 0.95] } else { [0.11, 0.18, 0.28, 0.95] },
+                    if hover { slot_hover } else { slot_bg },
                     [0.94, 0.97, 1.0, 1.0],
                 ),
                 EnhState::Locked => ([0.07, 0.08, 0.10, 0.90], [0.45, 0.50, 0.56, 1.0]),
-                EnhState::InProgress(_) => ([0.09, 0.12, 0.18, 0.95], [1.0, 0.95, 0.70, 1.0]),
+                EnhState::InProgress(_) => (slot_bg, [1.0, 0.95, 0.70, 1.0]),
             };
             b.bg(*r, bg);
             if let EnhState::InProgress(p) = row.state {
                 b.bg([r[0], r[1], r[2] * p as f32 / 1000.0, r[3]], [0.22, 0.50, 0.28, 0.95]);
             }
-            b.outline(*r, 1.0, if hover { [0.45, 0.92, 1.0, 1.0] } else { [0.22, 0.30, 0.40, 0.95] });
+            b.outline(*r, 1.0, if hover { slot_brd_active } else { slot_brd });
             let cost = match row.state {
                 EnhState::Installed => "OK".to_string(),
                 EnhState::InProgress(p) => format!("{}%", p / 10),
@@ -1447,9 +1703,13 @@ fn draw_tooltip(b: &mut HudBufs, cursor: (f32, f32), lines: &[String]) {
     let x = (cursor.0 + 16.0).min(b.w - tw - 4.0).max(4.0);
     let y = (cursor.1 - th - 10.0).max(52.0);
     b.fg([x, y, tw, th], [0.02, 0.03, 0.05, 0.94]);
-    b.outline([x, y, tw, th], 1.2, [0.45, 0.80, 0.96, 0.95]);
+    let (brd, hdr_col) = match b.pal {
+        Some(p) => (p.border_outer, p.title_gold),
+        None => ([0.45, 0.80, 0.96, 0.95], [1.0, 0.92, 0.55, 1.0]),
+    };
+    b.outline([x, y, tw, th], 1.2, brd);
     for (k, l) in lines.iter().enumerate() {
-        let col = if k == 0 { [1.0, 0.92, 0.55, 1.0] } else { [0.88, 0.93, 1.0, 1.0] };
+        let col = if k == 0 { hdr_col } else { [0.88, 0.93, 1.0, 1.0] };
         b.text(x + 8.0, y + 6.0 + k as f32 * lh, ts, l, col);
     }
 }
@@ -1759,5 +2019,56 @@ mod tests {
             build_hud_geometry(&sess, &map, &cam, 1280, 800);
         assert!(!fg_v.is_empty() && !fg_i.is_empty());
         assert!(fg_v.iter().all(|vx| vx.pos.iter().all(|c| c.is_finite())));
+    }
+
+    #[test]
+    fn classic_hud_layout_factions_and_theme_switch() {
+        use crate::settings::UiTheme;
+        let w = test_world(52);
+        let sess = PlaySession::new(w, 0, false, 1);
+        let map = dummy_map();
+        let cam = OrbitCamera::for_map(256.0, 256.0, 10.0, 1.6);
+
+        let modern = HudLayout::compute_with_theme(&sess, 1280, 800, UiTheme::Modern);
+        let classic = HudLayout::compute_with_theme(&sess, 1280, 800, UiTheme::Classic);
+        assert!(!modern.classic && classic.classic);
+        assert!(modern.minimap[0] > 800.0, "modern minimap on right");
+        assert!(classic.minimap[0] < 40.0, "classic minimap on left");
+        assert!(classic.minimap[0] + classic.minimap[2] < classic.orders_panel[0], "minimap left of orders");
+        assert!(classic.orders_panel[0] + classic.orders_panel[2] < classic.card.panel[0], "orders left of build card");
+        assert_eq!(classic.top_panels.len(), 2);
+
+        // Hit-testing order buttons, command card slots/tabs, minimap, and top panels works identically.
+        let b0 = &classic.buttons[0];
+        assert_eq!(classic.hit_test_button(b0.x + 8.0, b0.y + 8.0), Some(HudAction::Order(OrderKind::Move)));
+        let s0 = classic.card.slots[0];
+        assert_eq!(classic.hit_test_button(s0[0] + 5.0, s0[1] + 5.0), Some(HudAction::CardItem(0)));
+        assert!(classic.over_hud(classic.top_panels[0][0] + 8.0, classic.top_panels[0][1] + 8.0));
+        let [mx, my, mw, mh] = classic.minimap;
+        let mm = classic.hit_test_minimap(mx + mw * 0.5, my + mh * 0.5).unwrap();
+        assert!((mm.0 - 0.5).abs() < 1e-4 && (mm.1 - 0.5).abs() < 1e-4);
+
+        // All 4 classic faction palettes + 1024x768 + 800x600 fit cleanly with finite geometry.
+        for fkey in crate::settings::FACTION_KEYS {
+            let p = crate::ui_kit::ClassicPalette::for_faction_key(fkey);
+            assert!(!p.name.is_empty());
+        }
+        let narrow = HudLayout::compute_with_theme(&sess, 800, 600, UiTheme::Classic);
+        for b in &narrow.buttons {
+            assert!(b.x + b.w <= 800.0 && b.y + b.h <= 600.0);
+        }
+
+        let (mv, mi, bg_v, bg_i, _ic_v, _ic_i, fg_v, fg_i) =
+            build_hud_geometry_with_theme(&sess, &map, &cam, 1280, 800, UiTheme::Classic);
+        assert_eq!(mv.len(), 4);
+        assert_eq!(mi.len(), 6);
+        assert!(!bg_v.is_empty() && !bg_i.is_empty());
+        assert!(!fg_v.is_empty() && !fg_i.is_empty());
+        assert!(fg_v.iter().all(|vx| vx.pos.iter().all(|c| c.is_finite())));
+        assert!(bg_v.iter().all(|vx| vx.pos.iter().all(|c| c.is_finite())));
+
+        // Switching back to Modern restores bottom-right minimap immediately.
+        let back = HudLayout::compute_with_theme(&sess, 1280, 800, UiTheme::Modern);
+        assert_eq!(back.minimap, modern.minimap);
     }
 }

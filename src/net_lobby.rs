@@ -484,7 +484,11 @@ fn push_chat(log: &mut Vec<ChatLine>, line: ChatLine) {
 // ---------------------------------------------------------------------------
 
 enum HostEvent {
-    Accepted(TcpStream, SocketAddr),
+    Accepted {
+        stream: TcpStream,
+        addr: SocketAddr,
+        relayed: bool,
+    },
     Frame(u8, LobbyMsg),
     Gone(u8, String),
     Acked(u8),
@@ -494,6 +498,7 @@ struct HostConn {
     id: u8,
     #[allow(dead_code)]
     addr: SocketAddr,
+    relayed: bool,
     stream: TcpStream,
     joined: bool,
     acked: bool,
@@ -537,11 +542,13 @@ pub struct NetLobbyHost {
     pub state: NetLobbyState,
     pub chat: Vec<ChatLine>,
     pub local_addr: SocketAddr,
+    pub invite_code: Option<String>,
     conns: Vec<HostConn>,
     tx: Sender<HostEvent>,
     rx: Receiver<HostEvent>,
     stop: Arc<AtomicBool>,
     accept: Option<JoinHandle<()>>,
+    registration: Option<crate::rendezvous::HostRegistration>,
     next_id: u8,
     starting: Option<Instant>,
     closed: bool,
@@ -560,7 +567,7 @@ impl NetLobbyHost {
                 match listener.accept() {
                     Ok((s, a)) => {
                         let _ = s.set_nonblocking(false);
-                        if atx.send(HostEvent::Accepted(s, a)).is_err() {
+                        if atx.send(HostEvent::Accepted { stream: s, addr: a, relayed: false }).is_err() {
                             return;
                         }
                     }
@@ -575,15 +582,40 @@ impl NetLobbyHost {
             state,
             chat,
             local_addr,
+            invite_code: None,
             conns: Vec::new(),
             tx,
             rx,
             stop,
             accept: Some(accept),
+            registration: None,
             next_id: 1,
             starting: None,
             closed: false,
         })
+    }
+
+    /// Registers an invite code with `rendezvous_addr` so friends can join by code with
+    /// automatic TCP relay fallback if direct UDP/TCP cannot pierce NAT.
+    pub fn register_invite(&mut self, rendezvous_addr: &str, timeout: Duration) -> Result<String, String> {
+        let host_name = self.state.peer(HOST_ID).map(|p| p.name.clone()).unwrap_or_default();
+        let map_id = self.state.map_id.clone();
+        let tx = self.tx.clone();
+        let reg = crate::rendezvous::HostRegistration::register(
+            rendezvous_addr,
+            self.local_addr,
+            &host_name,
+            &map_id,
+            timeout,
+            Box::new(move |stream, addr| {
+                let _ = tx.send(HostEvent::Accepted { stream, addr, relayed: true });
+            }),
+        )?;
+        let code = reg.code.clone();
+        self.invite_code = Some(code.clone());
+        self.registration = Some(reg);
+        push_chat(&mut self.chat, ChatLine { from: String::new(), text: format!("Invite code: {code}") });
+        Ok(code)
     }
 
     #[allow(dead_code)]
@@ -595,6 +627,10 @@ impl NetLobbyHost {
     #[allow(dead_code)]
     pub fn peer_addr(&self, id: u8) -> Option<SocketAddr> {
         self.conns.iter().find(|c| c.id == id).map(|c| c.addr)
+    }
+
+    pub fn peer_is_relayed(&self, id: u8) -> Option<bool> {
+        self.conns.iter().find(|c| c.id == id).map(|c| c.relayed)
     }
 
     fn broadcast(&mut self, m: &LobbyMsg) {
@@ -693,7 +729,7 @@ impl NetLobbyHost {
         while let Ok(ev) = self.rx.try_recv() {
             changed = true;
             match ev {
-                HostEvent::Accepted(mut s, addr) => {
+                HostEvent::Accepted { stream: mut s, addr, relayed } => {
                     let full = self.conns.len() + 1 >= self.state.max_players as usize;
                     if self.starting.is_some() || full {
                         let reason = if full { "lobby is full" } else { "game is starting" };
@@ -716,7 +752,7 @@ impl NetLobbyHost {
                     }
                     let tx = self.tx.clone();
                     std::thread::spawn(move || host_reader(id, reader, tx));
-                    self.conns.push(HostConn { id, addr, stream: s, joined: false, acked: false });
+                    self.conns.push(HostConn { id, addr, relayed, stream: s, joined: false, acked: false });
                 }
                 HostEvent::Frame(id, m) => self.on_frame(id, m),
                 HostEvent::Gone(id, e) => {
@@ -815,6 +851,9 @@ impl NetLobbyHost {
     fn take_launch(&mut self) -> NetHostLaunch {
         self.stop.store(true, Ordering::Relaxed);
         self.closed = true;
+        if let Some(mut r) = self.registration.take() {
+            r.close();
+        }
         let peers = self.conns.drain(..).filter(|c| c.joined).map(|c| (c.id, c.stream)).collect();
         NetHostLaunch { state: self.state.clone(), peers }
     }
@@ -826,6 +865,9 @@ impl NetLobbyHost {
         }
         self.closed = true;
         self.stop.store(true, Ordering::Relaxed);
+        if let Some(mut r) = self.registration.take() {
+            r.close();
+        }
         let ids: Vec<u8> = self.conns.iter().map(|c| c.id).collect();
         for id in ids {
             self.drop_conn(id, Some(reason));
@@ -870,6 +912,7 @@ fn host_reader(id: u8, mut stream: TcpStream, tx: Sender<HostEvent>) {
 // ---------------------------------------------------------------------------
 
 enum ClientEvent {
+    Connected { relayed: bool },
     Welcome { peer_id: u8, host_name: String },
     Msg(LobbyMsg),
     Handshake(Handshake),
@@ -894,6 +937,7 @@ pub struct NetLobbyClient {
     pub addr: String,
     pub peer_id: Option<u8>,
     pub host_name: String,
+    pub via_relay: Option<bool>,
     pub state: Option<NetLobbyState>,
     pub chat: Vec<ChatLine>,
     pub ready: bool,
@@ -929,6 +973,42 @@ impl NetLobbyClient {
             addr: addr.to_string(),
             peer_id: None,
             host_name: String::new(),
+            via_relay: None,
+            state: None,
+            chat: Vec::new(),
+            ready: false,
+            starting: false,
+            writer,
+            rx,
+            done: false,
+        }
+    }
+
+    /// Connects via a Phase 26 invite code (`XXXX-XXXX`), trying direct TCP first and
+    /// falling back automatically to the rendezvous relay tunnel.
+    pub fn connect_code(rendezvous_addr: &str, code: &str, force_relay: bool, name: &str) -> Self {
+        let (tx, rx) = mpsc::channel();
+        let writer = Arc::new(Mutex::new(Writer::default()));
+        let rv = rendezvous_addr.to_string();
+        let cd = code.to_string();
+        let nm = name.to_string();
+        let wr = writer.clone();
+        std::thread::spawn(move || {
+            match crate::rendezvous::connect_via_code(&rv, &cd, force_relay, Duration::from_millis(800)) {
+                Ok((stream, via)) => {
+                    let _ = tx.send(ClientEvent::Connected { relayed: via.is_relayed() });
+                    run_client_stream(stream, nm, wr, tx);
+                }
+                Err(e) => {
+                    let _ = tx.send(ClientEvent::Gone(e));
+                }
+            }
+        });
+        Self {
+            addr: format!("code:{}", crate::rendezvous::normalize_code(code).unwrap_or_else(|| code.to_string())),
+            peer_id: None,
+            host_name: String::new(),
+            via_relay: None,
             state: None,
             chat: Vec::new(),
             ready: false,
@@ -989,9 +1069,13 @@ impl NetLobbyClient {
         while let Ok(ev) = self.rx.try_recv() {
             changed = true;
             match ev {
+                ClientEvent::Connected { relayed } => self.via_relay = Some(relayed),
                 ClientEvent::Welcome { peer_id, host_name } => {
                     self.peer_id = Some(peer_id);
                     self.host_name = host_name;
+                    if self.via_relay.is_none() {
+                        self.via_relay = Some(false);
+                    }
                 }
                 ClientEvent::Msg(LobbyMsg::State(s)) => {
                     if let Some(me) = self.peer_id.and_then(|id| s.peer(id)) {
@@ -1036,12 +1120,20 @@ impl Drop for NetLobbyClient {
 }
 
 fn client_thread(addr: String, name: String, writer: Arc<Mutex<Writer>>, tx: Sender<ClientEvent>) {
+    let stream = match connect_any(&addr, Duration::from_secs(5)) {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = tx.send(ClientEvent::Gone(e));
+            return;
+        }
+    };
+    let _ = tx.send(ClientEvent::Connected { relayed: false });
+    run_client_stream(stream, name, writer, tx);
+}
+
+fn run_client_stream(mut stream: TcpStream, name: String, writer: Arc<Mutex<Writer>>, tx: Sender<ClientEvent>) {
     let fail = |tx: &Sender<ClientEvent>, e: String| {
         let _ = tx.send(ClientEvent::Gone(e));
-    };
-    let mut stream = match connect_any(&addr, Duration::from_secs(5)) {
-        Ok(s) => s,
-        Err(e) => return fail(&tx, e),
     };
     let _ = stream.set_nodelay(true);
     let _ = stream.set_write_timeout(Some(Duration::from_secs(3)));
@@ -1356,6 +1448,104 @@ mod tests {
     impl ClientPoll {
         fn is_live(&self) -> bool {
             matches!(self, ClientPoll::Idle | ClientPoll::Changed)
+        }
+    }
+
+    #[test]
+    fn invite_code_lobby_direct_and_relayed_lockstep_match() {
+        use crate::net::{LockstepCore, NetHandle, run_headless};
+        use crate::pathfinding::PathGrid;
+        use crate::sim::SCALE;
+        use crate::skirmish::Skirmish;
+        use crate::skirmish::tests::test_catalog;
+
+        let rv = crate::rendezvous::RendezvousServer::bind("127.0.0.1:0").unwrap();
+        let rv_addr = rv.local_addr().to_string();
+
+        for (force_relay, seed) in [(false, 5150u64), (true, 6161u64)] {
+            let mut st = NetLobbyState::new("LOOP", "Loop", 4, seed, 3, "Host", 0);
+            // Map all 4 slots onto FACTION_TABLE indices < 2 (0=uef, 2=cybran) for test_catalog().
+            st.slots[1].faction = 2;
+            st.slots[2].faction = 0;
+            st.slots[3].faction = 2;
+            let mut host = NetLobbyHost::bind("127.0.0.1:0", st).unwrap();
+            let code = host.register_invite(&rv_addr, Duration::from_secs(2)).unwrap();
+
+            let mut a = NetLobbyClient::connect_code(&rv_addr, &code, force_relay, "Alice");
+            let mut b = NetLobbyClient::connect_code(&rv_addr, &code, force_relay, "Bob");
+            pump(&mut host, &mut [&mut a, &mut b], |h, cs| {
+                h.state.peers.len() == 3 && cs.iter().all(|c| c.state.as_ref().is_some_and(|s| s.peers.len() == 3))
+            });
+            assert_eq!(a.via_relay, Some(force_relay));
+            assert_eq!(b.via_relay, Some(force_relay));
+            let aid = a.peer_id.unwrap();
+            assert_eq!(host.peer_is_relayed(aid), Some(force_relay));
+
+            a.set_ready(true);
+            b.set_ready(true);
+            pump(&mut host, &mut [&mut a, &mut b], |h, _| h.state.start_check().is_ok());
+
+            host.begin_start().unwrap();
+            let t0 = Instant::now();
+            let launch = loop {
+                assert!(t0.elapsed() < Duration::from_secs(10));
+                match host.poll() {
+                    HostPoll::Launch(l) => break l,
+                    HostPoll::Failed(e) => panic!("{e}"),
+                    _ => std::thread::sleep(Duration::from_millis(5)),
+                }
+            };
+            let _ = a.poll();
+            let _ = b.poll();
+            let map_starts = vec![
+                ("ARMY_1".into(), (60 * SCALE, 60 * SCALE)),
+                ("ARMY_2".into(), (190 * SCALE, 190 * SCALE)),
+                ("ARMY_3".into(), (60 * SCALE, 190 * SCALE)),
+                ("ARMY_4".into(), (190 * SCALE, 60 * SCALE)),
+            ];
+            let (hs_host, mut t_host) = launch.into_transport(&map_starts).unwrap();
+            let mut clients = Vec::new();
+            for c in [&mut a, &mut b] {
+                let t0 = Instant::now();
+                loop {
+                    assert!(t0.elapsed() < Duration::from_secs(10));
+                    match c.poll() {
+                        ClientPoll::Launch(hs, t) => {
+                            clients.push((hs, t));
+                            break;
+                        }
+                        ClientPoll::Closed(e) => panic!("{e}"),
+                        _ => std::thread::sleep(Duration::from_millis(5)),
+                    }
+                }
+            }
+            // Registration closes cleanly at match launch so late lookups cannot rejoin.
+            let lookup_after = crate::rendezvous::connect_via_code(&rv_addr, &code, true, Duration::from_millis(200));
+            assert!(lookup_after.is_err());
+
+            let make_world = |hs: &Handshake| {
+                let grid = PathGrid::new(64, 64, 4 * SCALE);
+                let mass = vec![(40 * SCALE, 40 * SCALE), (210 * SCALE, 210 * SCALE)];
+                Skirmish::new(test_catalog(), grid, (256 * SCALE, 256 * SCALE), mass, &hs.setups, hs.seed).unwrap()
+            };
+
+            let workers: Vec<_> = clients
+                .into_iter()
+                .map(|(hs, mut t)| {
+                    std::thread::spawn(move || {
+                        let mut w = make_world(&hs);
+                        let mut core = LockstepCore::from_handshake(&w, &hs);
+                        run_headless(&mut t, &mut core, &mut w, 60).unwrap()
+                    })
+                })
+                .collect();
+            let mut w_host = make_world(&hs_host);
+            let mut core_host = LockstepCore::from_handshake(&w_host, &hs_host);
+            let h_host = run_headless(&mut t_host, &mut core_host, &mut w_host, 60).unwrap();
+            let _ = NetHandle::start;
+            for w in workers {
+                assert_eq!(w.join().unwrap(), h_host, "relay={force_relay} lockstep hash mismatch");
+            }
         }
     }
 }

@@ -61,6 +61,41 @@ impl ShadowQuality {
     }
 }
 
+/// Front-end & in-match HUD visual theme (`modern` = default FARust gunmetal/cyan,
+/// `classic` = old-school Forged Alliance bottom console + faction skins).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UiTheme {
+    #[default]
+    Modern,
+    Classic,
+}
+
+impl UiTheme {
+    pub const ALL: [UiTheme; 2] = [Self::Modern, Self::Classic];
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Modern => "modern",
+            Self::Classic => "classic",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Modern => "Modern",
+            Self::Classic => "Classic (FA)",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "modern" => Some(Self::Modern),
+            "classic" | "fa" | "oldschool" => Some(Self::Classic),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Settings {
     pub resolution: (u32, u32),
@@ -80,6 +115,10 @@ pub struct Settings {
     /// Phase 23: FA grid hotkeys (Q W E R T / A S D F G / Z X C V B) on the command card
     /// while a builder or factory is selected (off = legacy single-key bindings win).
     pub card_hotkeys: bool,
+    /// Phase 27: UI layout & skin theme (`modern` or `classic`).
+    pub ui_theme: UiTheme,
+    /// Phase 26: lightweight TCP rendezvous + relay server (`HOST:PORT`).
+    pub rendezvous_server: String,
     /// Phase 23: remappable key bindings (`key.<action>=Ctrl+Shift+K`).
     pub keys: crate::keymap::KeyMap,
 }
@@ -99,6 +138,8 @@ impl Default for Settings {
             edge_scroll: true,
             last_host: "127.0.0.1:15000".to_string(),
             card_hotkeys: false,
+            ui_theme: UiTheme::Modern,
+            rendezvous_server: crate::rendezvous::DEFAULT_ADDR.to_string(),
             keys: crate::keymap::KeyMap::default(),
         }
     }
@@ -106,7 +147,7 @@ impl Default for Settings {
 
 /// Every key written to / understood in `settings.ini`, in file order (followed by one
 /// `key.<action>` line per bindable action, see [`crate::keymap`]).
-pub const KEYS: [&str; 12] = [
+pub const KEYS: [&str; 14] = [
     "resolution",
     "fullscreen",
     "vsync",
@@ -119,6 +160,8 @@ pub const KEYS: [&str; 12] = [
     "edge_scroll",
     "last_host",
     "card_hotkeys",
+    "ui_theme",
+    "rendezvous_server",
 ];
 
 fn parse_bool(v: &str) -> Result<bool, String> {
@@ -208,6 +251,11 @@ impl Settings {
             "edge_scroll" => self.edge_scroll = parse_bool(v)?,
             "last_host" => self.last_host = validate_host_addr(v)?,
             "card_hotkeys" => self.card_hotkeys = parse_bool(v)?,
+            "ui_theme" => {
+                self.ui_theme =
+                    UiTheme::parse(v).ok_or_else(|| format!("'{v}' is not modern/classic"))?
+            }
+            "rendezvous_server" => self.rendezvous_server = validate_host_addr(v)?,
             other => match other.strip_prefix("key.") {
                 Some(id) => self.keys.set_from_setting(id, v)?,
                 None => return Err(format!("unknown key '{other}'")),
@@ -232,6 +280,8 @@ impl Settings {
             "edge_scroll" => b(self.edge_scroll),
             "last_host" => self.last_host.clone(),
             "card_hotkeys" => b(self.card_hotkeys),
+            "ui_theme" => self.ui_theme.key().to_string(),
+            "rendezvous_server" => self.rendezvous_server.clone(),
             other => {
                 let id = other.strip_prefix("key.")?;
                 let action = crate::keymap::action_by_id(id)?;
@@ -406,6 +456,29 @@ pub fn card_hotkeys_enabled() -> bool {
     input_settings().card_hotkeys || std::env::var("FARUST_CARD_HOTKEYS").is_ok_and(|v| v == "1")
 }
 
+/// Active UI visual theme (`FARUST_UI_THEME` env var overrides `settings.ini`, default `Modern`).
+pub fn ui_theme() -> UiTheme {
+    if let Ok(v) = std::env::var("FARUST_UI_THEME")
+        && let Some(t) = UiTheme::parse(&v)
+    {
+        return t;
+    }
+    input_settings().ui_theme
+}
+
+/// Active rendezvous server address (`FARUST_RENDEZVOUS` env var overrides `settings.ini`).
+pub fn effective_rendezvous(override_s: Option<&Settings>) -> String {
+    if let Ok(v) = std::env::var("FARUST_RENDEZVOUS") {
+        let t = v.trim();
+        if !t.is_empty() {
+            return t.to_string();
+        }
+    }
+    override_s
+        .map(|s| s.rendezvous_server.clone())
+        .unwrap_or_else(|| input_settings().rendezvous_server)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -425,6 +498,8 @@ mod tests {
             edge_scroll: false,
             last_host: "192.168.1.20:15400".into(),
             card_hotkeys: true,
+            ui_theme: UiTheme::Classic,
+            rendezvous_server: "relay.example.org:15050".into(),
             keys: {
                 let mut k = crate::keymap::KeyMap::default();
                 k.set_from_setting("build_factory", "Ctrl+Shift+K").unwrap();
@@ -528,5 +603,25 @@ mod tests {
         let (d, w) = Settings::load_from(&dir.join("missing.ini"));
         assert_eq!(d, Settings::default());
         assert!(w.is_empty());
+    }
+
+    #[test]
+    fn ui_theme_and_rendezvous_round_trip_and_defaults() {
+        assert_eq!(UiTheme::parse("CLASSIC"), Some(UiTheme::Classic));
+        assert_eq!(UiTheme::parse("fa"), Some(UiTheme::Classic));
+        assert_eq!(UiTheme::parse("modern"), Some(UiTheme::Modern));
+        assert_eq!(UiTheme::parse("unknown"), None);
+
+        let (s, w) = Settings::parse("ui_theme=retro\nrendezvous_server=badaddr\n");
+        assert_eq!(s.ui_theme, UiTheme::Modern);
+        assert_eq!(s.rendezvous_server, crate::rendezvous::DEFAULT_ADDR);
+        assert_eq!(w.len(), 2, "{w:?}");
+
+        let (c, cw) = Settings::parse("ui_theme=classic\nrendezvous_server=10.0.0.5:15050\n");
+        assert!(cw.is_empty(), "{cw:?}");
+        assert_eq!(c.ui_theme, UiTheme::Classic);
+        assert_eq!(c.rendezvous_server, "10.0.0.5:15050");
+        assert_eq!(c.get("ui_theme").as_deref(), Some("classic"));
+        assert_eq!(c.get("rendezvous_server").as_deref(), Some("10.0.0.5:15050"));
     }
 }

@@ -26,6 +26,7 @@ mod perf_cmds;
 mod play;
 mod profiler;
 mod render_prep;
+mod rendezvous;
 mod replay;
 mod roster;
 mod savegame;
@@ -85,20 +86,26 @@ fn print_usage() {
     eprintln!("  farust ai-arena [GAME_DIR] [--maps M1,M2] [--seeds N|S1,S2] [--matchups A:B,C:D] [--factions F0,F1] [--max-ticks N] [--victory V] [--unit-cap N] [--threads K] [--json [FILE]]");
     eprintln!("  farust play [MAP] [GAME_DIR] [--armies 1,2] [--factions uef,cybran] [--ai D] [--victory V] [--unit-cap N] [--seed S] [--speed N] [--load FILE] [--spectate] [--lobby [--lobby-autostart]] [--fow] [--mute] [--no-record] [--record FILE] [--camera-dist F] [--size WxH] [--snapshot OUT.png] [--snapshot-ticks N]");
     eprintln!("  farust replay <verify|play> <FILE> [GAME_DIR] [--speed N] [--mute] [--size WxH] [--snapshot OUT.png] [--snapshot-ticks N]");
-    eprintln!("  farust host <ADDR:PORT> [MAP] [GAME_DIR] [--players N] [--armies 1,2] [--factions uef,cybran] [--seed S] [--play] [--mute] [--size WxH] [--headless-ticks N]");
-    eprintln!("  farust join <ADDR:PORT> [GAME_DIR] [--play] [--mute] [--size WxH] [--headless-ticks N]");
+    eprintln!("  farust host [<ADDR:PORT>] [MAP] [GAME_DIR] [--code] [--rendezvous ADDR] [--players N] [--armies 1,2] [--factions uef,cybran] [--seed S] [--play] [--mute] [--size WxH] [--headless-ticks N]");
+    eprintln!("  farust join <ADDR:PORT | CODE> [GAME_DIR] [--code CODE] [--rendezvous ADDR] [--relay] [--play] [--mute] [--size WxH] [--headless-ticks N]");
+    eprintln!("  farust rendezvous [BIND_ADDR]                     (run lightweight invite-code + TCP relay server)");
+    eprintln!("  global: +connect_lobby <CODE|ADDR:PORT>           (Steam-compatible lobby auto-join arg)");
     eprintln!();
     eprintln!("env:");
-    eprintln!("  FA_PATH  override for the game install dir");
-    eprintln!("  FARUST_PROFILE  enable the scoped profiler (=overlay also shows the F12 overlay)");
-    eprintln!("  FARUST_PROFILE_EXIT  print the profiler span table on exit");
+    eprintln!("  FA_PATH             override for the game install dir");
+    eprintln!("  FARUST_RENDEZVOUS   override rendezvous server host:port (default 127.0.0.1:15050)");
+    eprintln!("  FARUST_FORCE_RELAY  =1 forces client relay fallback through rendezvous server");
+    eprintln!("  FARUST_UI_THEME     modern | classic (old-school FA console layout + faction skins)");
+    eprintln!("  FARUST_PROFILE      enable the scoped profiler (=overlay also shows the F12 overlay)");
+    eprintln!("  FARUST_PROFILE_EXIT print the profiler span table on exit");
 }
 
 fn main() {
     let raw: Vec<String> = std::env::args().collect();
-    // Phase 24: `--mod <DIR|NAME>` (repeatable) is global; strip it before dispatch.
+    // Phase 24/26: `--mod <DIR|NAME>` and `+connect_lobby <CODE>` are global; strip before dispatch.
     let mut args: Vec<String> = Vec::with_capacity(raw.len());
     let mut mod_specs = Vec::new();
+    let mut connect_lobby: Option<String> = None;
     let mut it = raw.into_iter();
     while let Some(a) = it.next() {
         if a == "--mod" {
@@ -109,12 +116,20 @@ fn main() {
                     std::process::exit(1);
                 }
             }
+        } else if a == "+connect_lobby" {
+            match it.next() {
+                Some(t) => connect_lobby = Some(t),
+                None => {
+                    eprintln!("error: +connect_lobby needs an invite code or HOST:PORT");
+                    std::process::exit(1);
+                }
+            }
         } else {
             args.push(a);
         }
     }
     mods::set_enabled(mod_specs);
-    let result = run(&args);
+    let result = run(&args, connect_lobby.as_deref());
     if std::env::var_os("FARUST_PROFILE_EXIT").is_some() {
         profiler::end_frame(None);
         eprintln!("{}", profiler::report_table(None));
@@ -126,17 +141,18 @@ fn main() {
     }
 }
 
-fn run(args: &[String]) -> Result<(), String> {
+fn run(args: &[String], connect_lobby: Option<&str>) -> Result<(), String> {
     profiler::init_from_env();
     if args.len() < 2 {
-        return cmd_menu(args);
+        return cmd_menu(args, connect_lobby);
     }
     match args[1].as_str() {
         "-h" | "--help" | "help" => {
             print_usage();
             Ok(())
         }
-        "menu" => cmd_menu(args),
+        "menu" => cmd_menu(args, connect_lobby),
+        "rendezvous" => cmd_rendezvous(args),
         "ai-arena" => cmd_ai_arena(args),
         "inventory" => {
             let game_dir = positional_after(args, 2).unwrap_or_else(scd::default_game_dir);
@@ -291,7 +307,7 @@ fn run(args: &[String]) -> Result<(), String> {
         "play" => cmd_play(args),
         "replay" => cmd_replay(args),
         "host" => cmd_host(args),
-        "join" => cmd_join(args),
+        "join" => cmd_join(args, connect_lobby),
         cmd => Err(format!("unknown command: {cmd}")),
     }
 }
@@ -1296,6 +1312,7 @@ fn positional_after(args: &[String], start: usize) -> Option<PathBuf> {
             || a == "--players"
             || a == "--camera-dist"
             || a == "--out"
+            || a == "--rendezvous"
         {
             i += 2;
             continue;
@@ -1824,17 +1841,56 @@ fn cmd_replay(args: &[String]) -> Result<(), String> {
     }
 }
 
-fn cmd_host(args: &[String]) -> Result<(), String> {
-    if args.len() < 3 {
-        return Err("usage: farust host <ADDR:PORT> [MAP] [GAME_DIR] [--players N] [--armies 1,2,3] [--factions uef,cybran] [--seed S] [--play] [--headless-ticks N]".to_string());
-    }
-    let addr = &args[2];
-    let map_name = args
-        .get(3)
+fn cmd_rendezvous(args: &[String]) -> Result<(), String> {
+    let bind_addr = args
+        .get(2)
         .filter(|a| !a.starts_with("--"))
         .map(String::as_str)
-        .unwrap_or("SCMP_001");
-    let game_dir = positional_after(args, 4).unwrap_or_else(scd::default_game_dir);
+        .unwrap_or("0.0.0.0:15050");
+    let srv = rendezvous::RendezvousServer::bind(bind_addr)?;
+    println!("FARust rendezvous + TCP relay listening on {}", srv.local_addr());
+    srv.run_forever();
+    Ok(())
+}
+
+fn cmd_host(args: &[String]) -> Result<(), String> {
+    let use_code = has_flag(args, "--code");
+    let rv_addr = flag_str(args, "--rendezvous")
+        .map(str::to_string)
+        .unwrap_or_else(|| settings::effective_rendezvous(None));
+
+    // Positional args (skipping value flags): optional ADDR:PORT (if contains ':'), MAP, GAME_DIR.
+    let mut pos: Vec<&str> = Vec::new();
+    let mut i = 2usize;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if matches!(
+            a,
+            "--seed" | "--headless-ticks" | "--players" | "--armies" | "--factions" | "--size" | "--rendezvous"
+        ) {
+            i += 2;
+            continue;
+        }
+        if a.starts_with("--") {
+            i += 1;
+            continue;
+        }
+        pos.push(a);
+        i += 1;
+    }
+
+    let (addr, map_idx) = match pos.first().copied() {
+        Some(first) if first.contains(':') => (first, 1usize),
+        _ if use_code => ("0.0.0.0:0", 0usize),
+        _ => {
+            return Err("usage: farust host [<ADDR:PORT>] [MAP] [GAME_DIR] [--code] [--rendezvous ADDR] [--players N] [--armies 1,2,3] [--factions uef,cybran] [--seed S] [--play] [--headless-ticks N]".to_string());
+        }
+    };
+    let map_name = pos.get(map_idx).copied().unwrap_or("SCMP_001");
+    let game_dir = pos
+        .get(map_idx + 1)
+        .map(PathBuf::from)
+        .unwrap_or_else(scd::default_game_dir);
     let seed = flag_str(args, "--seed")
         .map(|s| s.parse::<u64>().map_err(|_| format!("invalid --seed '{s}'")))
         .transpose()?
@@ -1892,9 +1948,22 @@ fn cmd_host(args: &[String]) -> Result<(), String> {
         hs.setups.len() - players,
         players - 1
     );
-    let (host, bound) = net::LockstepHost::bind_players(addr, &hs, |army, peer| {
-        println!("  army {army} joined from {peer}");
-    })?;
+    let (host, bound) = if use_code {
+        let (h, b, _code) = net::LockstepHost::bind_players_with_code(
+            addr,
+            &rv_addr,
+            &hs,
+            |army, peer, relayed| {
+                let via = if relayed { "relay" } else { "direct" };
+                println!("  army {army} joined from {peer} ({via})");
+            },
+        )?;
+        (h, b)
+    } else {
+        net::LockstepHost::bind_players(addr, &hs, |army, peer| {
+            println!("  army {army} joined from {peer}");
+        })?
+    };
     println!("All players connected on {bound}");
     let meshes = interactive.then(|| play::UnitMeshCache::load(Some(&game_dir), &catalog));
     let world = net::world_from_handshake(catalog, &map, &hs)?;
@@ -1908,17 +1977,61 @@ fn cmd_host(args: &[String]) -> Result<(), String> {
     run_headless_peer("host", Box::new(host), world, &hs, ticks)
 }
 
-fn cmd_join(args: &[String]) -> Result<(), String> {
-    if args.len() < 3 {
-        return Err("usage: farust join <ADDR:PORT> [GAME_DIR] [--play] [--headless-ticks N]".to_string());
+fn cmd_join(args: &[String], connect_lobby: Option<&str>) -> Result<(), String> {
+    let code_flag = flag_str(args, "--code")
+        .map(str::to_string)
+        .or_else(|| connect_lobby.map(str::to_string));
+    let rv_addr = flag_str(args, "--rendezvous")
+        .map(str::to_string)
+        .unwrap_or_else(|| settings::effective_rendezvous(None));
+    let force_relay = has_flag(args, "--relay");
+
+    let mut pos: Vec<&str> = Vec::new();
+    let mut i = 2usize;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if matches!(a, "--code" | "--rendezvous" | "--headless-ticks" | "--size") {
+            i += 2;
+            continue;
+        }
+        if a.starts_with("--") {
+            i += 1;
+            continue;
+        }
+        pos.push(a);
+        i += 1;
     }
-    let addr = &args[2];
-    let game_dir = positional_after(args, 3).unwrap_or_else(scd::default_game_dir);
+
+    let (target, dir_idx) = match code_flag {
+        Some(c) => (c, 0usize),
+        None => {
+            let first = pos.first().copied().ok_or_else(|| {
+                "usage: farust join <ADDR:PORT | CODE> [GAME_DIR] [--code CODE] [--rendezvous ADDR] [--relay] [--play] [--headless-ticks N]".to_string()
+            })?;
+            (first.to_string(), 1usize)
+        }
+    };
+    let game_dir = pos
+        .get(dir_idx)
+        .map(PathBuf::from)
+        .unwrap_or_else(scd::default_game_dir);
     let interactive = has_flag(args, "--play");
 
-    let (client, hs) = net::LockstepClient::connect_retry(addr, std::time::Duration::from_secs(30))?;
+    let (client, hs) = if rendezvous::looks_like_code(&target) {
+        let (c, hs, via) = net::LockstepClient::connect_code_retry(
+            &rv_addr,
+            &target,
+            force_relay,
+            std::time::Duration::from_secs(30),
+        )?;
+        let kind = if via.is_relayed() { "relay" } else { "direct" };
+        println!("Connected via code {target} ({kind} @ {})", via.addr());
+        (c, hs)
+    } else {
+        net::LockstepClient::connect_retry(&target, std::time::Duration::from_secs(30))?
+    };
     println!(
-        "Joined {addr} as army {} of {} players ({} armies) on {} seed {}",
+        "Joined {target} as army {} of {} players ({} armies) on {} seed {}",
         hs.assigned_army,
         hs.player_count,
         hs.setups.len(),
@@ -2171,7 +2284,7 @@ fn cmd_bench_scale(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn cmd_menu(args: &[String]) -> Result<(), String> {
+fn cmd_menu(args: &[String], connect_lobby: Option<&str>) -> Result<(), String> {
     let start_idx = if args.get(1).is_some_and(|s| s == "menu") { 2 } else { 1 };
     let game_dir = positional_after(args, start_idx).unwrap_or_else(scd::default_game_dir);
     let screen = match flag_str(args, "--screen") {
@@ -2188,6 +2301,7 @@ fn cmd_menu(args: &[String]) -> Result<(), String> {
         initial_map: flag_str(args, "--map").map(str::to_string),
         seed,
         autostart: has_flag(args, "--lobby-autostart"),
+        connect_lobby: connect_lobby.map(str::to_string),
     };
     menu::run(&game_dir, opts)
 }

@@ -103,6 +103,89 @@ pub mod theme {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 27 Classic FA Faction Palettes
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ClassicPalette {
+    pub name: &'static str,
+    pub panel_top: [f32; 4],
+    pub panel_bot: [f32; 4],
+    pub header_bg: [f32; 4],
+    pub border_outer: [f32; 4],
+    pub border_inner: [f32; 4],
+    pub bracket: [f32; 4],
+    pub btn: [f32; 4],
+    pub btn_hover: [f32; 4],
+    pub btn_active: [f32; 4],
+    pub accent: [f32; 4],
+    pub title_gold: [f32; 4],
+}
+
+impl ClassicPalette {
+    pub fn for_faction_key(key: &str) -> Self {
+        match key.trim().to_ascii_lowercase().as_str() {
+            "aeon" => Self {
+                name: "AEON",
+                panel_top: [0.05, 0.15, 0.10, 0.94],
+                panel_bot: [0.02, 0.07, 0.05, 0.95],
+                header_bg: [0.08, 0.25, 0.16, 0.96],
+                border_outer: [0.38, 0.84, 0.56, 1.0],
+                border_inner: [0.62, 0.56, 0.24, 0.85],
+                bracket: [0.94, 0.84, 0.44, 0.95],
+                btn: [0.06, 0.18, 0.12, 0.96],
+                btn_hover: [0.11, 0.30, 0.20, 0.98],
+                btn_active: [0.16, 0.46, 0.30, 0.98],
+                accent: [0.52, 0.95, 0.68, 1.0],
+                title_gold: [0.98, 0.90, 0.54, 1.0],
+            },
+            "cybran" => Self {
+                name: "CYBRAN",
+                panel_top: [0.15, 0.05, 0.05, 0.94],
+                panel_bot: [0.07, 0.02, 0.02, 0.95],
+                header_bg: [0.28, 0.07, 0.07, 0.96],
+                border_outer: [0.90, 0.24, 0.18, 1.0],
+                border_inner: [0.48, 0.12, 0.10, 0.85],
+                bracket: [1.0, 0.42, 0.32, 0.95],
+                btn: [0.18, 0.06, 0.06, 0.96],
+                btn_hover: [0.32, 0.10, 0.10, 0.98],
+                btn_active: [0.52, 0.14, 0.12, 0.98],
+                accent: [1.0, 0.38, 0.28, 1.0],
+                title_gold: [1.0, 0.78, 0.36, 1.0],
+            },
+            "seraphim" => Self {
+                name: "SERAPHIM",
+                panel_top: [0.15, 0.11, 0.04, 0.94],
+                panel_bot: [0.07, 0.05, 0.02, 0.95],
+                header_bg: [0.28, 0.20, 0.06, 0.96],
+                border_outer: [0.96, 0.74, 0.22, 1.0],
+                border_inner: [0.54, 0.38, 0.12, 0.85],
+                bracket: [1.0, 0.86, 0.42, 0.95],
+                btn: [0.18, 0.13, 0.05, 0.96],
+                btn_hover: [0.32, 0.23, 0.08, 0.98],
+                btn_active: [0.50, 0.36, 0.10, 0.98],
+                accent: [1.0, 0.82, 0.32, 1.0],
+                title_gold: [1.0, 0.90, 0.50, 1.0],
+            },
+            _ => Self {
+                name: "UEF",
+                panel_top: [0.07, 0.13, 0.22, 0.94],
+                panel_bot: [0.03, 0.06, 0.11, 0.95],
+                header_bg: [0.10, 0.22, 0.38, 0.96],
+                border_outer: [0.28, 0.62, 0.94, 1.0],
+                border_inner: [0.14, 0.32, 0.52, 0.85],
+                bracket: [0.52, 0.82, 1.0, 0.95],
+                btn: [0.08, 0.16, 0.26, 0.96],
+                btn_hover: [0.14, 0.28, 0.46, 0.98],
+                btn_active: [0.18, 0.44, 0.72, 0.98],
+                accent: [0.45, 0.82, 1.0, 1.0],
+                title_gold: [0.98, 0.86, 0.44, 1.0],
+            },
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Fonts
 // ---------------------------------------------------------------------------
 
@@ -326,12 +409,22 @@ pub struct Canvas<'a> {
     pub fonts: &'a Fonts,
     pub images: &'a ImageStore,
     pub hover: Option<(f32, f32)>,
+    pub classic: Option<ClassicPalette>,
     pub batches: Vec<Batch>,
 }
 
 impl<'a> Canvas<'a> {
     pub fn new(w: f32, h: f32, fonts: &'a Fonts, images: &'a ImageStore, hover: Option<(f32, f32)>) -> Self {
-        Self { w, h, fonts, images, hover, batches: Vec::new() }
+        let classic = if crate::settings::ui_theme() == crate::settings::UiTheme::Classic {
+            Some(ClassicPalette::for_faction_key(crate::settings::input_settings().faction_key()))
+        } else {
+            None
+        };
+        Self { w, h, fonts, images, hover, classic, batches: Vec::new() }
+    }
+
+    pub fn set_classic(&mut self, pal: Option<ClassicPalette>) {
+        self.classic = pal;
     }
 
     pub fn is_hover(&self, r: Rect) -> bool {
@@ -502,6 +595,14 @@ impl<'a> Canvas<'a> {
 
     /// Dark translucent panel with border, top highlight and corner brackets.
     pub fn panel(&mut self, r: Rect) {
+        if let Some(pal) = self.classic {
+            self.gradient_v(r, pal.panel_top, pal.panel_bot);
+            self.outline(r, 2.0, pal.border_outer);
+            self.outline(r.inset(3.0), 1.0, pal.border_inner);
+            self.rect(Rect::new(r.x + 2.0, r.y + 2.0, r.w - 4.0, 1.0), pal.accent);
+            self.brackets(r.inset(-2.0), 18.0, 2.5, pal.bracket);
+            return;
+        }
         self.gradient_v(r, theme::PANEL_HI, theme::PANEL);
         self.outline(r, 1.0, theme::BORDER);
         self.rect(Rect::new(r.x + 1.0, r.y + 1.0, r.w - 2.0, 1.0), [0.45, 0.55, 0.62, 0.35]);
@@ -512,6 +613,13 @@ impl<'a> Canvas<'a> {
     pub fn titled_panel(&mut self, r: Rect, title_text: &str) -> Rect {
         self.panel(r);
         let hdr = Rect::new(r.x + 1.0, r.y + 1.0, r.w - 2.0, 30.0);
+        if let Some(pal) = self.classic {
+            let chdr = Rect::new(r.x + 2.0, r.y + 2.0, r.w - 4.0, 30.0);
+            self.gradient_h(chdr, pal.header_bg, pal.panel_bot);
+            self.rect(Rect::new(r.x + 2.0, chdr.bottom(), r.w - 4.0, 1.5), pal.border_outer);
+            self.text_in(Rect::new(r.x + 14.0, chdr.y, hdr.w - 20.0, chdr.h), bold(16.0), title_text, pal.title_gold, Align::Left);
+            return Rect::new(r.x + 12.0, chdr.bottom() + 10.0, r.w - 24.0, r.h - chdr.h - 22.0);
+        }
         self.gradient_h(hdr, [0.10, 0.17, 0.21, 0.95], [0.04, 0.06, 0.08, 0.0]);
         self.rect(Rect::new(r.x + 1.0, hdr.bottom(), r.w - 2.0, 1.0), [0.47, 0.86, 0.96, 0.35]);
         self.text_in(Rect::new(r.x + 14.0, hdr.y, hdr.w - 20.0, hdr.h), bold(16.0), title_text, theme::GOLD, Align::Left);
@@ -519,6 +627,36 @@ impl<'a> Canvas<'a> {
     }
 
     pub fn button(&mut self, r: Rect, label: &str, st: WState) {
+        if let Some(pal) = self.classic {
+            let bg = if st.disabled {
+                [0.05, 0.06, 0.07, 0.9]
+            } else if st.primary {
+                if st.hover { pal.btn_active } else { pal.header_bg }
+            } else if st.hover || st.active {
+                pal.btn_hover
+            } else {
+                pal.btn
+            };
+            let top = [bg[0] * 1.45 + 0.03, bg[1] * 1.45 + 0.03, bg[2] * 1.45 + 0.03, bg[3]];
+            self.gradient_v(r, top, bg);
+            let border = if st.disabled {
+                [0.18, 0.20, 0.22, 1.0]
+            } else if st.hover || st.active {
+                pal.bracket
+            } else {
+                pal.border_outer
+            };
+            self.outline(r, 1.5, border);
+            self.outline(r.inset(2.0), 1.0, pal.border_inner);
+            if !st.disabled && (st.hover || st.active || st.primary) {
+                self.rect(Rect::new(r.x + 3.0, r.y + 2.0, r.w - 6.0, 1.0), pal.accent);
+            }
+            let color = if st.disabled { theme::FAINT } else if st.primary { pal.title_gold } else { theme::TEXT };
+            let px = (r.h * 0.48).clamp(12.0, 22.0);
+            let label = self.fonts.fit(bold(px), label, r.w - 12.0);
+            self.text_in(r, bold(px), &label, color, Align::Center);
+            return;
+        }
         let bg = if st.disabled {
             [0.05, 0.06, 0.07, 0.9]
         } else if st.primary {
@@ -549,6 +687,18 @@ impl<'a> Canvas<'a> {
 
     /// `< VALUE >` selector.
     pub fn cycler(&mut self, r: Rect, value: &str, st: WState) {
+        if let Some(pal) = self.classic {
+            self.rect(r, if st.hover && !st.disabled { pal.btn_hover } else { pal.btn });
+            self.outline(r, 1.5, if st.hover && !st.disabled { pal.bracket } else { pal.border_outer });
+            let arrow = if st.disabled { theme::FAINT } else { pal.title_gold };
+            let px = (r.h * 0.55).clamp(11.0, 17.0);
+            self.text_in(Rect::new(r.x + 6.0, r.y, 12.0, r.h), bold(px), "<", arrow, Align::Left);
+            self.text_in(Rect::new(r.right() - 18.0, r.y, 12.0, r.h), bold(px), ">", arrow, Align::Right);
+            let v = self.fonts.fit(body(px), value, r.w - 36.0);
+            let col = if st.disabled { theme::DIM } else { theme::TEXT };
+            self.text_in(r, body(px), &v, col, Align::Center);
+            return;
+        }
         self.rect(r, if st.hover && !st.disabled { theme::BTN_HOVER } else { theme::FIELD });
         self.outline(r, 1.0, if st.hover && !st.disabled { theme::ACCENT } else { theme::BORDER });
         let arrow = if st.disabled { theme::FAINT } else { theme::ACCENT };
@@ -562,10 +712,14 @@ impl<'a> Canvas<'a> {
 
     pub fn checkbox(&mut self, r: Rect, on: bool, st: WState) {
         let b = Rect::new(r.x, r.y + (r.h - 18.0) * 0.5, 18.0, 18.0);
+        let (acc, brd) = match self.classic {
+            Some(pal) => (pal.accent, if st.hover { pal.bracket } else { pal.border_outer }),
+            None => (theme::ACCENT, if st.hover { theme::ACCENT } else { theme::BORDER }),
+        };
         self.rect(b, theme::FIELD);
-        self.outline(b, 1.0, if st.hover { theme::ACCENT } else { theme::BORDER });
+        self.outline(b, 1.0, brd);
         if on {
-            self.rect(b.inset(4.0), theme::ACCENT);
+            self.rect(b.inset(4.0), acc);
         }
         let label = if on { "ON" } else { "OFF" };
         self.text_in(Rect::new(b.right() + 10.0, r.y, 60.0, r.h), body(15.0), label, if on { theme::TEXT } else { theme::DIM }, Align::Left);
@@ -575,12 +729,16 @@ impl<'a> Canvas<'a> {
     pub fn slider(&mut self, r: Rect, frac: f32, value: &str, st: WState) {
         let track = Rect::new(r.x, r.y + r.h * 0.5 - 3.0, r.w - 56.0, 6.0);
         self.rect(track, theme::FIELD);
-        self.outline(track, 1.0, theme::BORDER);
+        let (acc, brd, fill_lo) = match self.classic {
+            Some(pal) => (pal.accent, pal.border_outer, pal.header_bg),
+            None => (theme::ACCENT, theme::BORDER, [0.15, 0.45, 0.55, 1.0]),
+        };
+        self.outline(track, 1.0, brd);
         let f = frac.clamp(0.0, 1.0);
         self.gradient_h(
             Rect::new(track.x + 1.0, track.y + 1.0, (track.w - 2.0) * f, track.h - 2.0),
-            [0.15, 0.45, 0.55, 1.0],
-            theme::ACCENT,
+            fill_lo,
+            acc,
         );
         let kx = track.x + track.w * f;
         let knob = Rect::new(kx - 5.0, r.y + r.h * 0.5 - 9.0, 10.0, 18.0);
@@ -592,7 +750,11 @@ impl<'a> Canvas<'a> {
     /// Single-line text field with caret when focused.
     pub fn text_field(&mut self, r: Rect, text: &str, focused: bool, placeholder: &str, st: WState) {
         self.rect(r, theme::FIELD);
-        let border = if focused { theme::ACCENT } else if st.hover { [0.40, 0.50, 0.58, 1.0] } else { theme::BORDER };
+        let (acc, base_brd, hov_brd) = match self.classic {
+            Some(pal) => (pal.accent, pal.border_outer, pal.bracket),
+            None => (theme::ACCENT, theme::BORDER, [0.40, 0.50, 0.58, 1.0]),
+        };
+        let border = if focused { acc } else if st.hover { hov_brd } else { base_brd };
         self.outline(r, 1.0, border);
         let px = (r.h * 0.55).clamp(11.0, 17.0);
         let inner = Rect::new(r.x + 8.0, r.y, r.w - 16.0, r.h);
@@ -609,12 +771,21 @@ impl<'a> Canvas<'a> {
         if focused {
             let cx = inner.x + self.measure(body(px), &shown) + 1.0;
             let lh = self.fonts.line_height(body(px));
-            self.rect(Rect::new(cx, r.y + (r.h - lh) * 0.5, 2.0, lh), theme::ACCENT);
+            self.rect(Rect::new(cx, r.y + (r.h - lh) * 0.5, 2.0, lh), acc);
         }
     }
 
     /// Selection / hover highlight behind a list row.
     pub fn list_row(&mut self, r: Rect, selected: bool, hovered: bool) {
+        if let Some(pal) = self.classic {
+            if selected {
+                self.gradient_h(r, pal.btn_active, pal.panel_bot);
+                self.rect(Rect::new(r.x, r.y, 3.0, r.h), pal.bracket);
+            } else if hovered {
+                self.rect(r, pal.btn_hover);
+            }
+            return;
+        }
         if selected {
             self.gradient_h(r, theme::ROW_SEL, [0.06, 0.18, 0.22, 0.85]);
             self.rect(Rect::new(r.x, r.y, 2.0, r.h), theme::ACCENT);
@@ -672,6 +843,19 @@ impl Canvas<'_> {
     /// Full-window FA backdrop: the menu background art (darkened) plus vignette.
     pub fn backdrop(&mut self, dim: f32) {
         let full = Rect::new(0.0, 0.0, self.w, self.h);
+        if let Some(pal) = self.classic {
+            let shade = [dim * 0.96, dim * 1.0, dim * 1.08, 1.0];
+            if !self.image_cover("bg_classic", full, shade) && !self.image_cover("bg", full, shade) {
+                self.gradient_v(full, pal.panel_top, [0.01, 0.015, 0.025, 1.0]);
+            }
+            let edge = [0.0, 0.0, 0.0, 0.78];
+            let clear = [0.0, 0.0, 0.0, 0.0];
+            let vw = (self.w * 0.20).min(280.0);
+            self.gradient_h(Rect::new(0.0, 0.0, vw, self.h), edge, clear);
+            self.gradient_h(Rect::new(self.w - vw, 0.0, vw, self.h), clear, edge);
+            self.gradient_v(Rect::new(0.0, self.h - 160.0, self.w, 160.0), clear, [0.0, 0.0, 0.0, 0.65]);
+            return;
+        }
         let shade = [dim, dim * 1.04, dim * 1.1, 1.0];
         if !self.image_cover("bg", full, shade) {
             self.gradient_v(full, [0.04, 0.06, 0.09, 1.0], [0.01, 0.012, 0.02, 1.0]);
@@ -686,6 +870,29 @@ impl Canvas<'_> {
 
     /// Sub-screen chrome: header strip with title / subtitle and the footer bar.
     pub fn chrome(&mut self, f: &Frame, title_text: &str, subtitle: &str) {
+        if let Some(pal) = self.classic {
+            let full = Rect::new(0.0, 0.0, self.w, self.h);
+            let shade = [0.46, 0.48, 0.52, 1.0];
+            if !self.image_cover("bg_classic_sub", full, shade)
+                && !self.image_cover("bg_classic", full, shade)
+                && !self.image_cover("bg", full, shade)
+            {
+                self.gradient_v(full, pal.panel_top, pal.panel_bot);
+            }
+            self.gradient_v(f.header, pal.header_bg, pal.panel_bot);
+            self.rect(Rect::new(0.0, f.header.bottom() - 3.0, self.w, 2.0), pal.border_outer);
+            self.rect(Rect::new(0.0, f.header.bottom() - 1.0, self.w, 1.0), pal.border_inner);
+            let tx = f.content.x;
+            self.rect(Rect::new(tx, 16.0, 5.0, 34.0), pal.bracket);
+            self.text_in(Rect::new(tx + 16.0, 8.0, 900.0, 50.0), title(34.0), title_text, pal.title_gold, Align::Left);
+            if !subtitle.is_empty() {
+                let r = Rect::new(f.content.right() - 620.0, 8.0, 620.0, 50.0);
+                self.text_in(r, body(15.0), subtitle, pal.accent, Align::Right);
+            }
+            self.gradient_v(f.footer, pal.panel_top, pal.panel_bot);
+            self.rect(Rect::new(0.0, f.footer.y, self.w, 2.0), pal.border_outer);
+            return;
+        }
         self.backdrop(0.42);
         self.gradient_v(f.header, [0.02, 0.03, 0.04, 0.96], [0.04, 0.06, 0.08, 0.92]);
         self.rect(Rect::new(0.0, f.header.bottom() - 2.0, self.w, 1.0), [0.47, 0.86, 0.96, 0.55]);

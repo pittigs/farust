@@ -19,12 +19,12 @@ use crate::play::{PlayApp, PlayExit, PlaySession, UnitMeshCache};
 use crate::replay::Replay;
 use crate::savegame;
 use crate::settings::{
-    self, FACTION_KEYS, RESOLUTIONS, Settings, ShadowQuality, validate_host_addr, validate_name,
+    self, FACTION_KEYS, RESOLUTIONS, Settings, ShadowQuality, UiTheme, validate_host_addr, validate_name,
 };
 use crate::skirmish::{Catalog, GameOptions, MapContext, VictoryCondition};
 use crate::skirmish_ai::{Difficulty, ScriptedAi};
 use crate::ui_kit::{
-    Align, Canvas, Fonts, Frame, ImageStore, Rect, WState, WindowGpu, body, bold, render_png,
+    Align, Canvas, ClassicPalette, Fonts, Frame, ImageStore, Rect, WState, WindowGpu, body, bold, render_png,
     theme, title,
 };
 
@@ -74,6 +74,8 @@ pub struct MenuOptions {
     pub initial_map: Option<String>,
     pub seed: Option<u64>,
     pub autostart: bool,
+    /// Optional Steam-compatible `+connect_lobby <CODE|HOST:PORT>` auto-join target.
+    pub connect_lobby: Option<String>,
 }
 
 pub fn run(game_dir: &Path, opts: MenuOptions) -> Result<(), String> {
@@ -142,6 +144,7 @@ enum MpSession {
 enum FocusField {
     None,
     MpHostAddr,
+    MpRendezvous,
     MpJoinAddr,
     MpChat,
     OptPlayerName,
@@ -160,11 +163,13 @@ enum Action {
     CycleUnitCap,
     // Multiplayer Hub
     Focus(FocusField),
+    ToggleMpUseCode,
     HostLobby,
     JoinLobby,
     BackToMain,
     // Active MP lobby
     LeaveMpLobby,
+    MpCopyInviteCode,
     MpHostNextMap,
     MpHostPrevMap,
     MpHostSeedRandom,
@@ -187,6 +192,7 @@ enum Action {
     ToggleFullscreen,
     ToggleVsync,
     CycleShadow,
+    CycleUiTheme,
     SliderMaster(u8),
     SliderMusic(u8),
     SliderSfx(u8),
@@ -223,9 +229,12 @@ struct MenuState {
     shift_held: bool,
     mp_session: MpSession,
     mp_host_addr: String,
+    mp_rendezvous: String,
+    mp_use_code: bool,
     mp_join_addr: String,
     mp_chat_input: String,
     mp_map_idx: usize,
+    snapshot_mode: bool,
     focus: FocusField,
     status: String,
     status_err: bool,
@@ -234,10 +243,16 @@ struct MenuState {
 
 impl MenuState {
     fn new(game_dir: &Path, opts: &MenuOptions) -> Result<Self, String> {
-        let settings = settings::settings_path()
-            .map(|p| Settings::load_from(&p).0)
-            .unwrap_or_default();
-        settings::set_active(Some(settings.clone()));
+        #[cfg(not(test))]
+        let settings = {
+            let s = settings::settings_path()
+                .map(|p| Settings::load_from(&p).0)
+                .unwrap_or_default();
+            settings::set_active(Some(s.clone()));
+            s
+        };
+        #[cfg(test)]
+        let settings = Settings::default();
 
         let fonts = Fonts::load(game_dir);
         let mut images = ImageStore::default();
@@ -246,6 +261,8 @@ impl MenuState {
             &[
                 ("bg", "textures/ui/common/scx_menu/campaign-select/bg.dds"),
                 ("logo", "textures/ui/common/menus/main02/sc-logo-lg_bmp.dds"),
+                ("bg_classic", "textures/ui/common/menus/background-colossus_bmp.dds"),
+                ("bg_classic_sub", "textures/ui/common/menus/background-paint01_bmp.dds"),
             ],
         );
         if !images.contains("bg") {
@@ -266,6 +283,7 @@ impl MenuState {
         });
         let map_count = lobby.as_ref().map(|l| l.maps.len()).unwrap_or(0);
         let replays = scan_replays();
+        let rendezvous = settings::effective_rendezvous(Some(&settings));
 
         let mut st = Self {
             game_dir: game_dir.to_path_buf(),
@@ -285,16 +303,25 @@ impl MenuState {
             shift_held: false,
             mp_session: MpSession::None,
             mp_host_addr: "0.0.0.0:15000".to_string(),
+            mp_rendezvous: rendezvous,
+            mp_use_code: true,
             mp_join_addr: settings.last_host.clone(),
             mp_chat_input: String::new(),
             mp_map_idx: 0,
+            snapshot_mode: opts.snapshot.is_some(),
             focus: FocusField::None,
             status: "Ready".to_string(),
             status_err: false,
             map_count,
         };
         st.ensure_lobby_preview_image();
-        if st.screen == ScreenId::MpLobby {
+        if let Some(ref target) = opts.connect_lobby {
+            st.mp_join_addr = target.clone();
+            if let Err(e) = st.start_join_lobby() {
+                st.screen = ScreenId::Multiplayer;
+                st.set_status(e, true);
+            }
+        } else if st.screen == ScreenId::MpLobby {
             let bind_addr = if opts.snapshot.is_some() {
                 "127.0.0.1:0"
             } else {
@@ -366,18 +393,41 @@ impl MenuState {
             &self.settings.player_name,
             self.settings.default_faction as u8,
         );
-        let host = NetLobbyHost::bind(addr, st)?;
+        let mut host = NetLobbyHost::bind(addr, st)?;
         self.mp_host_addr = host.local_addr.to_string();
+        let mut status_msg = format!("Hosting lobby on {}", self.mp_host_addr);
+        if self.mp_use_code && (!self.snapshot_mode || std::env::var_os("FARUST_RENDEZVOUS").is_some()) {
+            match host.register_invite(&self.mp_rendezvous, Duration::from_millis(250)) {
+                Ok(code) => status_msg = format!("Hosting on {} - Invite Code: {code}", self.mp_host_addr),
+                Err(_) => status_msg = format!("Hosting on {} (direct IP; rendezvous offline)", self.mp_host_addr),
+            }
+        }
         self.mp_session = MpSession::Host(Box::new(host));
         self.screen = ScreenId::MpLobby;
         self.focus = FocusField::MpChat;
         self.ensure_lobby_preview_image();
-        self.set_status(format!("Hosting lobby on {}", self.mp_host_addr), false);
+        self.set_status(status_msg, false);
         Ok(())
     }
 
     fn start_join_lobby(&mut self) -> Result<(), String> {
-        let addr = validate_host_addr(&self.mp_join_addr)?;
+        let raw = self.mp_join_addr.trim().to_string();
+        if crate::rendezvous::looks_like_code(&raw) {
+            let code = crate::rendezvous::normalize_code(&raw)
+                .ok_or_else(|| format!("invalid invite code '{raw}'"))?;
+            let rv = if !self.mp_rendezvous.trim().is_empty() {
+                self.mp_rendezvous.trim().to_string()
+            } else {
+                settings::effective_rendezvous(Some(&self.settings))
+            };
+            let client = NetLobbyClient::connect_code(&rv, &code, false, &self.settings.player_name);
+            self.mp_session = MpSession::Client(Box::new(client));
+            self.screen = ScreenId::MpLobby;
+            self.focus = FocusField::MpChat;
+            self.set_status(format!("Resolving invite code {code} via {rv}..."), false);
+            return Ok(());
+        }
+        let addr = validate_host_addr(&raw)?;
         self.settings.last_host = addr.clone();
         self.draft.last_host = addr.clone();
         if let Some(path) = settings::settings_path() {
@@ -433,13 +483,29 @@ impl MenuState {
             }
             ScreenId::Multiplayer => {
                 self.mp_join_addr = self.settings.last_host.clone();
-                self.set_status("Host a TCP lockstep lobby or join an existing IP:port", false);
+                self.mp_rendezvous = settings::effective_rendezvous(Some(&self.settings));
+                self.set_status("Host with invite code / IP or enter friend's code / IP:port", false);
             }
             _ => {}
         }
     }
 
+    fn preview_classic_palette(&self) -> Option<ClassicPalette> {
+        let env_theme = std::env::var("FARUST_UI_THEME").ok().and_then(|v| UiTheme::parse(&v));
+        let (theme_mode, faction_idx) = if matches!(self.screen, ScreenId::Options | ScreenId::Keys) {
+            (env_theme.unwrap_or(self.draft.ui_theme), self.draft.default_faction)
+        } else {
+            (env_theme.unwrap_or(self.settings.ui_theme), self.settings.default_faction)
+        };
+        if theme_mode == UiTheme::Classic {
+            Some(ClassicPalette::for_faction_key(FACTION_KEYS[faction_idx % FACTION_KEYS.len()]))
+        } else {
+            None
+        }
+    }
+
     fn draw(&self, c: &mut Canvas) {
+        c.set_classic(self.preview_classic_palette());
         match self.screen {
             ScreenId::Main => self.draw_main(c),
             ScreenId::Skirmish => self.draw_skirmish(c),
@@ -607,35 +673,43 @@ impl MenuState {
         let col_w = ((c.w - 28.0) * 0.5).min(540.0);
         let left_x = c.x + (c.w - (col_w * 2.0 + 28.0)) * 0.5;
         let right_x = left_x + col_w + 28.0;
-        let py = c.y + 40.0;
-        let ph = (c.h - 80.0).min(360.0);
+        let py = c.y + 28.0;
+        let ph = (c.h - 56.0).clamp(360.0, 420.0);
+        let top = py + 42.0;
         vec![
-            (Rect::new(left_x + 24.0, py + 128.0, col_w - 48.0, 34.0), Action::Focus(FocusField::MpHostAddr)),
-            (Rect::new(left_x + 24.0, py + ph - 66.0, col_w - 48.0, 42.0), Action::HostLobby),
-            (Rect::new(right_x + 24.0, py + 128.0, col_w - 48.0, 34.0), Action::Focus(FocusField::MpJoinAddr)),
-            (Rect::new(right_x + 24.0, py + ph - 66.0, col_w - 48.0, 42.0), Action::JoinLobby),
+            (Rect::new(left_x + 24.0, top + 56.0, col_w - 48.0, 32.0), Action::Focus(FocusField::MpHostAddr)),
+            (Rect::new(left_x + 204.0, top + 98.0, (col_w - 228.0).max(96.0), 26.0), Action::ToggleMpUseCode),
+            (Rect::new(left_x + 24.0, top + 154.0, col_w - 48.0, 32.0), Action::Focus(FocusField::MpRendezvous)),
+            (Rect::new(left_x + 24.0, py + ph - 58.0, col_w - 48.0, 40.0), Action::HostLobby),
+            (Rect::new(right_x + 24.0, top + 56.0, col_w - 48.0, 34.0), Action::Focus(FocusField::MpJoinAddr)),
+            (Rect::new(right_x + 24.0, py + ph - 58.0, col_w - 48.0, 40.0), Action::JoinLobby),
             (f.footer_button(0, false, 160.0), Action::BackToMain),
         ]
     }
 
     fn draw_mp_hub(&self, c: &mut Canvas) {
         let f = Frame::new(c.w, c.h);
-        c.chrome(&f, "MULTIPLAYER", "TCP Deterministic Lockstep (v3)");
+        c.chrome(&f, "MULTIPLAYER", "TCP Deterministic Lockstep (v4) - Direct + Invite Code Relay");
         let cnt = f.content;
         let col_w = ((cnt.w - 28.0) * 0.5).min(540.0);
         let left_x = cnt.x + (cnt.w - (col_w * 2.0 + 28.0)) * 0.5;
         let right_x = left_x + col_w + 28.0;
-        let py = cnt.y + 40.0;
-        let ph = (cnt.h - 80.0).min(360.0);
+        let py = cnt.y + 28.0;
+        let ph = (cnt.h - 56.0).clamp(360.0, 420.0);
 
         let left_r = Rect::new(left_x, py, col_w, ph);
         let lin = c.titled_panel(left_r, "HOST LOBBY");
-        c.text(lin.x + 12.0, lin.y + 8.0, body(15.0), &format!("Host player: {}", self.settings.player_name), theme::TEXT);
-        c.text(lin.x + 12.0, lin.y + 36.0, bold(13.0), "BIND ADDRESS (IP:PORT)", theme::DIM);
+        c.text(lin.x + 12.0, lin.y + 4.0, body(15.0), &format!("Host player: {}", self.settings.player_name), theme::TEXT);
+        c.text(lin.x + 12.0, lin.y + 34.0, bold(13.0), "BIND ADDRESS (IP:PORT)", theme::DIM);
+        c.text(lin.x + 12.0, lin.y + 102.0, bold(13.0), "INVITE CODE RELAY", theme::DIM);
+        c.text(lin.x + 12.0, lin.y + 132.0, bold(13.0), "RENDEZVOUS SERVER (HOST:PORT)", theme::DIM);
+
         let right_r = Rect::new(right_x, py, col_w, ph);
         let rin = c.titled_panel(right_r, "JOIN GAME");
-        c.text(rin.x + 12.0, rin.y + 8.0, body(15.0), "Connect directly to a host lobby or `farust host`.", theme::TEXT);
-        c.text(rin.x + 12.0, rin.y + 36.0, bold(13.0), "HOST ADDRESS (IP:PORT)", theme::DIM);
+        c.text(rin.x + 12.0, rin.y + 4.0, body(15.0), "Join by invite code (XXXX-XXXX) or direct IP:port.", theme::TEXT);
+        c.text(rin.x + 12.0, rin.y + 34.0, bold(13.0), "HOST ADDRESS OR INVITE CODE", theme::DIM);
+        c.text(rin.x + 12.0, rin.y + 106.0, body(13.0), "Direct TCP tried first; relays through rendezvous if NAT blocks.", theme::DIM);
+        c.text(rin.x + 12.0, rin.y + 128.0, body(13.0), "Self-host relay: `farust rendezvous 0.0.0.0:15050`", theme::ACCENT);
 
         for (r, act) in self.mp_hub_widgets(c.w, c.h) {
             let st = WState { hover: c.is_hover(r), ..Default::default() };
@@ -643,9 +717,13 @@ impl MenuState {
                 Action::Focus(FocusField::MpHostAddr) => {
                     c.text_field(r, &self.mp_host_addr, self.focus == FocusField::MpHostAddr, "0.0.0.0:15000", st);
                 }
+                Action::ToggleMpUseCode => c.checkbox(r, self.mp_use_code, st),
+                Action::Focus(FocusField::MpRendezvous) => {
+                    c.text_field(r, &self.mp_rendezvous, self.focus == FocusField::MpRendezvous, crate::rendezvous::DEFAULT_ADDR, st);
+                }
                 Action::HostLobby => c.button(r, "OPEN MULTIPLAYER LOBBY", WState { primary: true, ..st }),
                 Action::Focus(FocusField::MpJoinAddr) => {
-                    c.text_field(r, &self.mp_join_addr, self.focus == FocusField::MpJoinAddr, "127.0.0.1:15000", st);
+                    c.text_field(r, &self.mp_join_addr, self.focus == FocusField::MpJoinAddr, "XXXX-XXXX or 127.0.0.1:15000", st);
                 }
                 Action::JoinLobby => c.button(r, "CONNECT TO HOST", WState { primary: true, ..st }),
                 Action::BackToMain => c.button(r, "BACK", st),
@@ -669,6 +747,9 @@ impl MenuState {
             MpSession::Host(host) => {
                 let st = &host.state;
                 let mw = left_w - 24.0;
+                if host.invite_code.is_some() {
+                    out.push((Rect::new(c.x + left_w - 134.0, c.y + 8.0, 122.0, 24.0), Action::MpCopyInviteCode));
+                }
                 out.push((Rect::new(c.x + 12.0, c.y + 44.0, mw - 120.0, 28.0), Action::MpHostNextMap));
                 out.push((Rect::new(c.x + 12.0 + mw - 112.0, c.y + 44.0, 112.0, 28.0), Action::MpHostSeedRandom));
                 let _ = Action::MpHostPrevMap;
@@ -713,8 +794,15 @@ impl MenuState {
     fn draw_mp_lobby(&self, c: &mut Canvas) {
         let f = Frame::new(c.w, c.h);
         let subtitle = match &self.mp_session {
-            MpSession::Host(h) => format!("Hosting on {}", h.local_addr),
-            MpSession::Client(cl) => format!("Connected to {}", cl.addr),
+            MpSession::Host(h) => match &h.invite_code {
+                Some(code) => format!("CODE: {code}  |  Hosting on {}", h.local_addr),
+                None => format!("Hosting on {}", h.local_addr),
+            },
+            MpSession::Client(cl) => match cl.via_relay {
+                Some(true) => format!("Relayed ({})", cl.addr),
+                Some(false) => format!("Direct ({})", cl.addr),
+                None => format!("Connecting to {}", cl.addr),
+            },
             MpSession::None => "Disconnected".to_string(),
         };
         c.chrome(&f, "MULTIPLAYER LOBBY", &subtitle);
@@ -732,7 +820,13 @@ impl MenuState {
         };
 
         if let Some(st) = lobby_state {
-            c.text(cnt.x + 14.0, cnt.y + 12.0, bold(16.0), &format!("MAP: {} ({})   SEED: {}", st.map_name, st.map_id, st.seed), theme::GOLD);
+            let max_map_w = if is_host { left_w - 156.0 } else { left_w - 28.0 };
+            let hdr_txt = c.fonts.fit(
+                bold(16.0),
+                &format!("MAP: {} ({})   SEED: {}", st.map_name, st.map_id, st.seed),
+                max_map_w,
+            );
+            c.text(cnt.x + 14.0, cnt.y + 12.0, bold(16.0), &hdr_txt, theme::GOLD);
             c.text(cnt.x + 14.0, cnt.y + 88.0, bold(13.0), "SLOTS & PLAYERS", theme::DIM);
 
             let mw = left_w - 24.0;
@@ -773,7 +867,14 @@ impl MenuState {
             for p in &st.peers {
                 let tag = if p.ready { "READY" } else { "WAIT" };
                 let col = if p.ready { theme::GOOD } else { theme::GOLD };
-                c.text(right_x + 168.0, py, body(14.0), &c.fonts.fit(body(14.0), &p.name, right_w - 235.0), theme::TEXT);
+                let relay_tag = match &self.mp_session {
+                    MpSession::Host(h) if p.id != HOST_ID => {
+                        if h.peer_is_relayed(p.id) == Some(true) { " [R]" } else { " [D]" }
+                    }
+                    _ => "",
+                };
+                let shown = format!("{}{}", p.name, relay_tag);
+                c.text(right_x + 168.0, py, body(14.0), &c.fonts.fit(body(14.0), &shown, right_w - 235.0), theme::TEXT);
                 c.text_in(Rect::new(right_x + right_w - 64.0, py - 2.0, 52.0, 20.0), bold(12.0), tag, col, Align::Right);
                 py += 22.0;
             }
@@ -803,6 +904,7 @@ impl MenuState {
             let st = WState { hover: c.is_hover(r), ..Default::default() };
             match act {
                 Action::LeaveMpLobby => c.button(r, "LEAVE", st),
+                Action::MpCopyInviteCode => c.button(r, "COPY CODE", WState { primary: true, ..st }),
                 Action::MpHostNextMap => {
                     let lbl = lobby_state.map(|s| format!("Map: {}", s.map_name)).unwrap_or_default();
                     c.cycler(r, &lbl, st);
@@ -1001,6 +1103,7 @@ impl MenuState {
             (Rect::new(lx + 14.0 + lw, y + step * 4.0, ctrl_w, 30.0), Action::SliderMaster(self.draft.master_volume)),
             (Rect::new(lx + 14.0 + lw, y + step * 5.0, ctrl_w, 30.0), Action::SliderMusic(self.draft.music_volume)),
             (Rect::new(lx + 14.0 + lw, y + step * 6.0, ctrl_w, 30.0), Action::SliderSfx(self.draft.sfx_volume)),
+            (Rect::new(lx + 14.0 + lw, y + step * 7.0, ctrl_w, 30.0), Action::CycleUiTheme),
         ];
         let _ = &mut y;
         let rctrl_w = (col_w - lw - 28.0).max(160.0);
@@ -1053,6 +1156,10 @@ impl MenuState {
                 Action::CycleShadow => {
                     label("Shadows");
                     c.cycler(r, self.draft.shadow_quality.key(), st);
+                }
+                Action::CycleUiTheme => {
+                    label("UI Theme");
+                    c.cycler(r, self.draft.ui_theme.label(), st);
                 }
                 Action::SliderMaster(_) => {
                     label("Master Volume");
@@ -1169,6 +1276,7 @@ impl MenuState {
                 self.game_options.unit_cap = UNIT_CAPS[(i + 1) % UNIT_CAPS.len()];
             }
             Action::Focus(ff) => self.focus = ff,
+            Action::ToggleMpUseCode => self.mp_use_code = !self.mp_use_code,
             Action::HostLobby => {
                 let addr = self.mp_host_addr.clone();
                 if let Err(e) = self.start_host_lobby(&addr) {
@@ -1183,6 +1291,15 @@ impl MenuState {
             Action::LeaveMpLobby => {
                 self.close_mp_session();
                 self.navigate(ScreenId::Multiplayer);
+            }
+            Action::MpCopyInviteCode => {
+                if let MpSession::Host(ref h) = self.mp_session
+                    && let Some(ref code) = h.invite_code
+                {
+                    let copied = copy_to_clipboard(code);
+                    let suffix = if copied { " (copied to clipboard)" } else { "" };
+                    self.set_status(format!("Share invite code: {code}{suffix}"), false);
+                }
             }
             Action::MpHostNextMap | Action::MpHostPrevMap => {
                 let maps = self.available_maps();
@@ -1313,6 +1430,14 @@ impl MenuState {
             Action::CycleShadow => {
                 let i = ShadowQuality::ALL.iter().position(|q| *q == self.draft.shadow_quality).unwrap_or(0);
                 self.draft.shadow_quality = ShadowQuality::ALL[(i + 1) % ShadowQuality::ALL.len()];
+            }
+            Action::CycleUiTheme => {
+                let i = UiTheme::ALL.iter().position(|t| *t == self.draft.ui_theme).unwrap_or(0);
+                self.draft.ui_theme = UiTheme::ALL[(i + 1) % UiTheme::ALL.len()];
+                self.set_status(
+                    format!("Theme: {} (click SAVE & APPLY to keep)", self.draft.ui_theme.label()),
+                    false,
+                );
             }
             Action::SliderMaster(_) | Action::SliderMusic(_) | Action::SliderSfx(_) => {
                 let track_w = (rect.w - 56.0).max(20.0);
@@ -1567,6 +1692,7 @@ impl MenuState {
     fn active_field_mut(&mut self) -> Option<&mut String> {
         match self.focus {
             FocusField::MpHostAddr => Some(&mut self.mp_host_addr),
+            FocusField::MpRendezvous => Some(&mut self.mp_rendezvous),
             FocusField::MpJoinAddr => Some(&mut self.mp_join_addr),
             FocusField::MpChat => Some(&mut self.mp_chat_input),
             FocusField::OptPlayerName => Some(&mut self.draft.player_name),
@@ -1574,6 +1700,32 @@ impl MenuState {
             FocusField::None => None,
         }
     }
+}
+
+fn copy_to_clipboard(text: &str) -> bool {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    for (bin, args) in [
+        ("wl-copy", &[][..]),
+        ("xclip", &["-selection", "clipboard"][..]),
+        ("xsel", &["-b"][..]),
+    ] {
+        if let Ok(mut child) = Command::new(bin)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(text.as_bytes());
+            }
+            if child.wait().is_ok_and(|s| s.success()) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 enum MenuEvent {
@@ -2247,5 +2399,48 @@ mod tests {
         st.scroll_keys(10_000, 800.0);
         let last = crate::keymap::actions().len() - 1;
         assert!(st.keys_widgets(1280.0, 800.0).iter().any(|(_, a)| *a == Action::KeyRow(last)));
+    }
+
+    #[test]
+    fn classic_theme_draws_and_hit_tests_all_screens() {
+        let mut st = MenuState::new(Path::new("/nonexistent"), &MenuOptions::default()).unwrap();
+        st.settings.ui_theme = UiTheme::Classic;
+        st.draft.ui_theme = UiTheme::Classic;
+        st.lobby = Some(LobbyState::with_maps(
+            Path::new("/nonexistent"),
+            vec![LobbyMap { id: "SCMP_001".into(), name: "Burial Mounds".into(), size: (256, 256), armies: 2 }],
+            "SCMP_001",
+            42,
+            "Tester",
+            0,
+        ));
+        st.start_host_lobby("127.0.0.1:0").unwrap();
+        for fidx in 0..FACTION_KEYS.len() {
+            st.settings.default_faction = fidx;
+            st.draft.default_faction = fidx;
+            for screen in [
+                ScreenId::Main,
+                ScreenId::Skirmish,
+                ScreenId::Multiplayer,
+                ScreenId::MpLobby,
+                ScreenId::Replays,
+                ScreenId::Options,
+                ScreenId::Keys,
+            ] {
+                st.screen = screen;
+                let mut c = Canvas::new(1280.0, 800.0, &st.fonts, &st.images, Some((200.0, 200.0)));
+                st.draw(&mut c);
+                assert!(c.classic.is_some());
+                let idx_count: usize = c.batches.iter().map(|b| b.idx.len()).sum();
+                assert!(idx_count > 100, "{screen:?} faction {fidx} drew too few indices");
+                let ws = st.widgets(1280.0, 800.0);
+                for (r, _) in &ws {
+                    assert!(r.right() <= 1280.5 && r.bottom() <= 800.5, "{screen:?} offscreen {r:?}");
+                    let (cx, cy) = r.center();
+                    assert!(hit_test(&ws, cx, cy).is_some(), "{screen:?} missed hit at {r:?}");
+                }
+            }
+        }
+        st.close_mp_session();
     }
 }

@@ -477,6 +477,102 @@ impl LockstepHost {
         Self::accept_players(listener, hs, &mut on_join).map(|h| (h, local_addr))
     }
 
+    /// Binds `addr` AND registers an invite code on `rendezvous_addr`, accepting `hs.player_count - 1`
+    /// players from either direct TCP or relayed tunnels. `on_join(army, peer_addr, relayed)`.
+    pub fn bind_players_with_code(
+        addr: &str,
+        rendezvous_addr: &str,
+        hs: &Handshake,
+        mut on_join: impl FnMut(ArmyId, SocketAddr, bool),
+    ) -> Result<(Self, SocketAddr, String), String> {
+        let n = hs.player_count;
+        if !(2..=8).contains(&n) {
+            return Err(format!("player count {n} out of range 2..=8"));
+        }
+        if hs.setups.len() < n {
+            return Err(format!("{n} players need at least {n} armies, got {}", hs.setups.len()));
+        }
+        let listener =
+            TcpListener::bind(addr).map_err(|e| format!("failed to bind {addr}: {e}"))?;
+        let local_addr = listener
+            .local_addr()
+            .map_err(|e| format!("local_addr failed: {e}"))?;
+        listener
+            .set_nonblocking(true)
+            .map_err(|e| format!("set_nonblocking failed: {e}"))?;
+
+        let (tx, rx) = mpsc::channel::<(TcpStream, SocketAddr, bool)>();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (atx, astop) = (tx.clone(), stop.clone());
+        let accept_thread = std::thread::spawn(move || {
+            while !astop.load(std::sync::atomic::Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((s, p)) => {
+                        let _ = s.set_nonblocking(false);
+                        if atx.send((s, p, false)).is_err() {
+                            return;
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+
+        let rtx = tx.clone();
+        let reg = crate::rendezvous::HostRegistration::register(
+            rendezvous_addr,
+            local_addr,
+            "Host",
+            &hs.map_id,
+            Duration::from_secs(4),
+            Box::new(move |s, p| {
+                let _ = rtx.send((s, p, true));
+            }),
+        );
+        let mut reg = match reg {
+            Ok(r) => r,
+            Err(e) => {
+                stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                let _ = accept_thread.join();
+                return Err(e);
+            }
+        };
+        let code = reg.code.clone();
+        println!("Invite code: {code} (rendezvous {rendezvous_addr})");
+
+        let mut clients = Vec::with_capacity(n - 1);
+        for slot in 1..n {
+            let (mut stream, peer, relayed) = rx
+                .recv()
+                .map_err(|_| format!("accept slot {slot} failed: listener closed"))?;
+            let _ = stream.set_nodelay(true);
+            let _ = stream.set_read_timeout(Some(NET_TIMEOUT));
+            let army = slot as ArmyId;
+            let mut client_hs = hs.clone();
+            client_hs.assigned_army = army;
+            write_frame(&mut stream, &encode_handshake(&client_hs))?;
+            on_join(army, peer, relayed);
+            clients.push((army, stream));
+        }
+
+        reg.close();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = accept_thread.join();
+
+        Ok((
+            Self {
+                clients,
+                local_army: 0,
+                next_turn: 0,
+            },
+            local_addr,
+            code,
+        ))
+    }
+
     pub fn accept_players(
         listener: TcpListener,
         hs: &Handshake,
@@ -579,9 +675,7 @@ pub struct LockstepClient {
 }
 
 impl LockstepClient {
-    pub fn connect(addr: &str) -> Result<(Self, Handshake), String> {
-        let mut stream =
-            TcpStream::connect(addr).map_err(|e| format!("failed to connect {addr}: {e}"))?;
+    pub fn from_stream(mut stream: TcpStream) -> Result<(Self, Handshake), String> {
         let _ = stream.set_nodelay(true);
         let _ = stream.set_read_timeout(Some(NET_TIMEOUT));
         let raw = read_frame(&mut stream)?;
@@ -599,6 +693,40 @@ impl LockstepClient {
             next_turn: 0,
         };
         Ok((client, hs))
+    }
+
+    pub fn connect(addr: &str) -> Result<(Self, Handshake), String> {
+        let stream =
+            TcpStream::connect(addr).map_err(|e| format!("failed to connect {addr}: {e}"))?;
+        Self::from_stream(stream)
+    }
+
+    /// Connects to a host via `XXXX-XXXX` invite code (direct TCP first, automatic TCP relay fallback).
+    pub fn connect_code_retry(
+        rendezvous_addr: &str,
+        code: &str,
+        force_relay: bool,
+        timeout: Duration,
+    ) -> Result<(Self, Handshake, crate::rendezvous::ConnectVia), String> {
+        let t0 = Instant::now();
+        loop {
+            match crate::rendezvous::connect_via_code(
+                rendezvous_addr,
+                code,
+                force_relay,
+                Duration::from_millis(800),
+            ) {
+                Ok((stream, via)) => match Self::from_stream(stream) {
+                    Ok((c, hs)) => return Ok((c, hs, via)),
+                    Err(e) if t0.elapsed() >= timeout => return Err(e),
+                    Err(_) => std::thread::sleep(Duration::from_millis(80)),
+                },
+                Err(e) if e.contains("invalid invite code") || t0.elapsed() >= timeout => {
+                    return Err(e);
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(100)),
+            }
+        }
     }
 
     /// Retries `connect` until it succeeds or `timeout` elapses (host may start later).

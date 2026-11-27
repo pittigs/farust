@@ -177,3 +177,22 @@ cargo run --release -- roster --verify SCMP_009
 cargo run --release -- mods
 cargo run --release -- --mod MyMod skirmish SCMP_001
 ```
+
+## Steps 26–27 — done: online invite codes + relay & classic FA UI theme
+
+- **Invite Codes & TCP Relay** (`src/rendezvous.rs`, `src/net_lobby.rs`, `src/net.rs`):
+  Host and join using `XXXX-XXXX` invite codes via a lightweight self-hosted
+  `farust rendezvous` server (tries direct TCP first, falls back to bi-directional
+  TCP relay through the rendezvous server without port-forwarding). Supports
+  Steam-compatible `+connect_lobby <CODE>` CLI launch args.
+- **Classic FA Layout & Faction Skins** (`src/settings.rs`, `src/ui_kit.rs`, `src/hud.rs`):
+  Toggle `UI Theme` in Options (`modern` / `classic`, or `FARUST_UI_THEME=classic`)
+  for the old-school top-left split Mass/Energy console, open sky, bottom-left minimap +
+  orders + build card + bottom-right unit portrait dock, and faction-colored beveled chrome.
+
+```sh
+cargo run --release -- rendezvous 0.0.0.0:15050
+cargo run --release -- host --code SCMP_001 --rendezvous 127.0.0.1:15050 --play
+cargo run --release -- join --code XXXX-XXXX --rendezvous 127.0.0.1:15050 --play
+FARUST_UI_THEME=classic cargo run --release -- play SCMP_001
+```
