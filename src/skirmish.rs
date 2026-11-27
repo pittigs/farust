@@ -2104,6 +2104,9 @@ pub struct Unit {
     pub fire_state: FireState,
     /// Phase 35: construction / production paused.
     pub build_paused: bool,
+    /// Phase 54: cached type economy `[mass/tick, energy/tick, mass storage, energy
+    /// storage]` (refreshed on upgrade) so per-tick passes avoid catalog lookups.
+    eco: [i64; 4],
 }
 
 impl Unit {
@@ -4169,6 +4172,7 @@ impl Skirmish {
                 untargetable: t.ext.untargetable,
                 fire_state: FireState::FireAtWill,
                 build_paused: false,
+                eco: [t.mass_per_tick, t.energy_per_tick, t.storage_mass, t.storage_energy],
             },
         );
         // Phase 31: a finished engineering station comes with its pod drones.
@@ -4325,10 +4329,8 @@ impl Skirmish {
     fn recompute_caps(&mut self) {
         let mut caps = vec![(0i64, 0i64); self.armies.len()];
         for u in self.units.values().filter(|u| u.alive) {
-            if let Some(t) = self.catalog.get(&u.type_id) {
-                caps[u.army as usize].0 += t.storage_mass;
-                caps[u.army as usize].1 += t.storage_energy;
-            }
+            caps[u.army as usize].0 += u.eco[2];
+            caps[u.army as usize].1 += u.eco[3];
         }
         for (a, (m, e)) in self.armies.iter_mut().zip(caps) {
             a.mass_cap = m;
@@ -4425,17 +4427,25 @@ impl Skirmish {
     }
 
     fn step_income(&mut self) {
-        self.recompute_caps();
+        // Storage caps and income in one pass over the cached per-unit economy.
+        let mut caps = vec![(0i64, 0i64); self.armies.len()];
         let mut income = vec![(0i64, 0i64); self.armies.len()];
         for u in self.units.values().filter(|u| u.alive) {
-            if let Some(t) = self.catalog.get(&u.type_id) {
+            let a = u.army as usize;
+            caps[a].0 += u.eco[2];
+            caps[a].1 += u.eco[3];
+            if u.eco[0] != 0 || u.eco[1] != 0 {
                 let mult = 100 + u.adjacency_bonus_pct;
-                income[u.army as usize].0 += t.mass_per_tick * mult / 100;
-                income[u.army as usize].1 += t.energy_per_tick * mult / 100;
+                income[a].0 += u.eco[0] * mult / 100;
+                income[a].1 += u.eco[1] * mult / 100;
             }
             // Phase 18: Resource Allocation enhancements.
-            income[u.army as usize].0 += u.enh.mass_per_tick;
-            income[u.army as usize].1 += u.enh.energy_per_tick;
+            income[a].0 += u.enh.mass_per_tick;
+            income[a].1 += u.enh.energy_per_tick;
+        }
+        for (a, (m, e)) in self.armies.iter_mut().zip(caps) {
+            a.mass_cap = m;
+            a.energy_cap = e;
         }
         let mut overflow = vec![(0i64, 0i64); self.armies.len()];
         for (i, (a, (m, e))) in self.armies.iter_mut().zip(income).enumerate() {
@@ -4491,7 +4501,7 @@ impl Skirmish {
     }
 
     fn step_shields(&mut self) {
-        let ids: Vec<UnitId> = self.units.keys().copied().collect();
+        let ids: Vec<UnitId> = self.units.values().filter(|u| u.shield_max_hp > 0).map(|u| u.id).collect();
         for id in ids {
             let (army, max_sh, upkeep, regen, on, cur_sh, cd) = match self.units.get(&id) {
                 Some(u) if u.alive && u.shield_max_hp > 0 => (
@@ -4662,6 +4672,7 @@ impl Skirmish {
         }
         u.max_range = new_t.max_range();
         u.height = new_t.size[1].max(SCALE / 4);
+        u.eco = [new_t.mass_per_tick, new_t.energy_per_tick, new_t.storage_mass, new_t.storage_energy];
         if new_t.role.is_structure() {
             self.walls_dirty = true;
         }
@@ -4894,6 +4905,18 @@ impl Skirmish {
         }
 
         for id in ids {
+            // Phase 54: plain mobile units with nothing to build skip the whole pass.
+            if self.units.get(&id).is_some_and(|u| {
+                u.role == Role::Mobile
+                    && u.build.is_none()
+                    && u.production.is_empty()
+                    && !matches!(
+                        u.orders.front(),
+                        Some(UnitOrder::Build { .. } | UnitOrder::Repair(_) | UnitOrder::Assist(_) | UnitOrder::Reclaim { .. } | UnitOrder::Upgrade(_) | UnitOrder::Enhance(_))
+                    )
+            }) {
+                continue;
+            }
             let (alive, role, army, pos, radius, rate, head, adj, silocnt, type_id) =
                 match self.units.get(&id) {
                     Some(u) => (

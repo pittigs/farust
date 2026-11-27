@@ -693,10 +693,17 @@ bumps `SIM_VERSION`, re-baselines golden hashes deliberately, and keeps
 
 ### Arc G — Scale, platforms & release (54–57)
 
-### Phase 54 — Parallel sim II, 10k units (planned)
-- Deterministic parallel phases for projectiles, damage application and
-  economy via per-thread buffers merged in canonical order.
-- Exit: `bench-scale --units 10000` ≥ 60 ticks/s with exact `1t == Nt` hash.
+### Phase 54 — Sim throughput at 10k units (done)
+- Per-unit economy cached on the unit (`eco` = mass/energy per tick, storage; refreshed on
+  upgrade) so income and storage caps are one catalog-free pass; shields only visit
+  shielded units; construction skips plain mobile units with nothing to build. All pure
+  optimisations: every hash is unchanged.
+- Exit: `bench-scale SCMP_001 --units 10000 --ticks 100 --threads 16`: 67 ticks/s
+  (60 before) with exact `1t == 16t` (`15575a588a785eda`); construction 1.68 → 0.75 ms,
+  economy 1.26 → 0.47 ms per tick. 2,048 units: 179 / 338 ticks/s (was 170 / 305). Done.
+- Next candidates (not done): parallel weapon fire decisions (they do not depend on
+  same-tick damage, so a parallel decide + ordered apply is exact; 2.9 ms at 10k units),
+  flow-field reuse across goals (4.3 ms).
 
 ### Phase 55 — GPU-driven rendering (planned)
 - Compute-shader culling + LOD selection, indirect draws, GPU instance
