@@ -444,10 +444,19 @@ bumps `SIM_VERSION`, re-baselines golden hashes deliberately, and keeps
   value graph, APM), follow-unit camera, picture-in-picture minimap.
 - Exit: a 2-player match with 1 live observer completes without desync.
 
-### Phase 39 — Onboarding & accessibility (planned)
-- Interactive tutorial scenario, colour-blind team palettes, UI scale,
-  rebindable mouse buttons, subtitle captions for voice cues.
-- Exit: the tutorial completes start to finish from `farust menu`.
+### Phase 39 — Onboarding & accessibility (done)
+- Tutorial: `missions/tutorial.farust-mission` (built into the binary, main menu → TUTORIAL)
+  walks a UEF opening one objective at a time — move the Commander, mass extractor, power
+  generator, land factory, three Strikers, destroy scripted Cybran scouts. Mission
+  conditions gained `COND and COND …` (`Cond::All`) to chain steps.
+- Accessibility (`settings.ini` + Options checkboxes): `colorblind` (Okabe–Ito palette per
+  army slot instead of faction colours, also `FARUST_COLORBLIND=1`), `mouse_swap` (left /
+  right buttons swapped in matches), `subtitles` (default on: every announcer voice line
+  is captioned in the status banner, EN/DE caption texts).
+- Exit: `farust mission missions/tutorial.farust-mission --human-ai normal` completes all
+  six objectives → `Victory(0)` at 3:21 and its replay verifies; main menu shows TUTORIAL,
+  Options shows the three toggles; 325/325 tests. Done.
+- Not done: UI scale factor, controller input, captions while audio is disabled.
 
 ### Arc C — Visual & audio fidelity III (40–43)
 

@@ -72,7 +72,12 @@ pub enum Cond {
     NoUnits(ArmyId),
     Count { army: ArmyId, unit_type: Option<String>, at: (i64, i64), radius: i64, cmp: Cmp, n: i64 },
     Objective { id: String, failed: bool },
+    /// Phase 39: every part holds (`COND and COND ...`).
+    All(Vec<Cond>),
 }
+
+/// Phase 39: the built-in tutorial mission.
+pub const TUTORIAL: &str = include_str!("../missions/tutorial.farust-mission");
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UnitGoal {
@@ -174,6 +179,13 @@ fn tokens(s: &str) -> Result<Vec<String>, String> {
 }
 
 fn parse_cond(t: &[String]) -> Result<Cond, String> {
+    let parts: Vec<&[String]> = t.split(|x| x == "and").collect();
+    if parts.len() > 1 {
+        if parts.iter().any(|p| p.is_empty()) {
+            return Err("empty side of 'and'".into());
+        }
+        return parts.into_iter().map(parse_cond).collect::<Result<Vec<_>, _>>().map(Cond::All);
+    }
     let w = |i: usize| t.get(i).map(String::as_str).ok_or_else(|| "incomplete condition".to_string());
     match w(0)? {
         "at" => Ok(Cond::At(parse_time(w(1)?)?)),
@@ -375,10 +387,16 @@ impl Mission {
                 Action::Objective { id, .. } => Some(id),
                 _ => None,
             });
-            for id in refs.chain(match &t.cond {
-                Cond::Objective { id, .. } => Some(id),
-                _ => None,
-            }) {
+            fn cond_refs<'a>(c: &'a Cond, out: &mut Vec<&'a String>) {
+                match c {
+                    Cond::Objective { id, .. } => out.push(id),
+                    Cond::All(parts) => parts.iter().for_each(|p| cond_refs(p, out)),
+                    _ => {}
+                }
+            }
+            let mut cr = Vec::new();
+            cond_refs(&t.cond, &mut cr);
+            for id in refs.chain(cr) {
                 if !ids.contains(&id) {
                     return Err(format!("trigger references unknown objective '{id}'"));
                 }
@@ -557,6 +575,7 @@ impl MissionRuntime {
             Cond::Objective { id, failed } => {
                 self.objectives.get(id).is_some_and(|s| *s == if *failed { ObjectiveState::Failed } else { ObjectiveState::Complete })
             }
+            Cond::All(parts) => parts.iter().all(|p| self.cond_true(p, w, tick)),
         }
     }
 
@@ -659,6 +678,14 @@ when dead commander 0 do objective hold fail; lose 0
         assert!(matches!(a.1, ObjectiveState::Complete | ObjectiveState::Failed), "objective resolved: {a:?}");
         assert!(a.0.is_some(), "the script ended the game");
         assert_eq!(run(), a, "mission runs are deterministic");
+    }
+
+    #[test]
+    fn and_conditions_and_the_builtin_tutorial_parse() {
+        let m = Mission::parse(TUTORIAL).unwrap();
+        assert_eq!(m.objectives.len(), 6);
+        assert!(matches!(&m.triggers[2].cond, Cond::All(p) if p.len() == 2));
+        assert!(Mission::parse("map X\narmy 0\narmy 1\nwhen at 0:01 and do win 0").is_err());
     }
 
     #[test]

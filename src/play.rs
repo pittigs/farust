@@ -1231,7 +1231,22 @@ impl PlaySession {
 // Colors, Instanced Unit Batches & Dynamic Overlays (Tracers, Projectiles, Icons)
 // ---------------------------------------------------------------------------
 
+/// Phase 39: Okabe–Ito colour-blind safe palette, one colour per army slot.
+pub(crate) const COLORBLIND_ARMY_RGB: [[f32; 3]; 8] = [
+    [0.00, 0.45, 0.70],
+    [0.90, 0.62, 0.00],
+    [0.00, 0.62, 0.45],
+    [0.80, 0.47, 0.65],
+    [0.34, 0.71, 0.91],
+    [0.95, 0.90, 0.25],
+    [0.84, 0.37, 0.00],
+    [0.60, 0.60, 0.60],
+];
+
 pub(crate) fn army_rgb(world: &Skirmish, army: ArmyId) -> [f32; 3] {
+    if crate::settings::colorblind() {
+        return COLORBLIND_ARMY_RGB[(army & 7) as usize];
+    }
     let faction_key = world
         .army(army)
         .and_then(|a| world.catalog().factions.get(a.faction))
@@ -3144,6 +3159,12 @@ impl ApplicationHandler for PlayApp {
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
+                // Phase 39: optional left/right swap.
+                let button = match button {
+                    MouseButton::Left if crate::settings::mouse_swap() => MouseButton::Right,
+                    MouseButton::Right if crate::settings::mouse_swap() => MouseButton::Left,
+                    b => b,
+                };
                 let pressed = state == ElementState::Pressed;
                 let cur = st.cursor_px.unwrap_or((
                     st.config.width as f64 * 0.5,

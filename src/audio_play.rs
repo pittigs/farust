@@ -338,6 +338,29 @@ impl AnnouncerEvent {
         AnnouncerEvent::EnergyStorageFull,
     ];
 
+    /// Phase 39: localized on-screen caption of the voice line.
+    pub fn caption(self) -> String {
+        let fallback = match self {
+            AnnouncerEvent::StrategicLaunchDetected => "Strategic launch detected",
+            AnnouncerEvent::EnemyNukeInbound => "Nuclear missile inbound",
+            AnnouncerEvent::CommanderUnderAttack => "Commander under attack",
+            AnnouncerEvent::ExperimentalDetected => "Enemy experimental detected",
+            AnnouncerEvent::StrategicMissileDestroyed => "Strategic missile destroyed",
+            AnnouncerEvent::BaseUnderAttack => "Base under attack",
+            AnnouncerEvent::StructureLost => "Structure lost",
+            AnnouncerEvent::ShieldDown => "Shield down",
+            AnnouncerEvent::EnergyStorageEmpty => "Energy depleted",
+            AnnouncerEvent::MassStorageEmpty => "Mass depleted",
+            AnnouncerEvent::EnergyStorageLow => "Low energy",
+            AnnouncerEvent::MassStorageLow => "Low mass",
+            AnnouncerEvent::UnitCapReached => "Unit cap reached",
+            AnnouncerEvent::TransportFull => "Transport full",
+            AnnouncerEvent::MassStorageFull => "Mass storage full",
+            AnnouncerEvent::EnergyStorageFull => "Energy storage full",
+        };
+        format!("[{}]", crate::loc::tr(&format!("caption.{}", self.slug()), fallback))
+    }
+
     pub const fn slug(self) -> &'static str {
         match self {
             AnnouncerEvent::StrategicLaunchDetected => "strategic_launch_detected",
@@ -1305,6 +1328,8 @@ pub struct GameAudio {
     pub played: BTreeMap<String, u32>,
     /// Announcer events actually voiced during this session.
     pub announced: BTreeMap<AnnouncerEvent, u32>,
+    /// Phase 39: captions of announcer lines played since the last frame.
+    pub captions: Vec<String>,
 }
 
 impl GameAudio {
@@ -1361,6 +1386,7 @@ impl GameAudio {
             loops: LoopBook::default(),
             played: BTreeMap::new(),
             announced: BTreeMap::new(),
+            captions: Vec::new(),
         })
     }
 
@@ -1961,6 +1987,7 @@ impl GameAudio {
         if let Some((ev, vid)) = outcome {
             self.announcer_voice = Some(vid);
             *self.announced.entry(ev).or_insert(0) += 1;
+            self.captions.push(ev.caption());
         }
     }
 
@@ -2267,6 +2294,12 @@ pub fn frame(s: &mut PlaySession, scmap: Option<&ScMap>, game_dir: Option<&Path>
         }
         ga.after_step(s, cam);
         ga.before_step(s);
+        let caps = std::mem::take(&mut ga.captions);
+        if crate::settings::subtitles()
+            && let Some(c) = caps.last()
+        {
+            s.status_banner = c.clone();
+        }
     }
     s.audio = slot;
 }

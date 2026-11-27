@@ -121,6 +121,11 @@ pub struct Settings {
     pub language: String,
     /// Phase 26: lightweight TCP rendezvous + relay server (`HOST:PORT`).
     pub rendezvous_server: String,
+    /// Phase 39 accessibility: colour-blind safe army palette, swapped mouse buttons and
+    /// on-screen captions for announcer voice lines.
+    pub colorblind: bool,
+    pub mouse_swap: bool,
+    pub subtitles: bool,
     /// Phase 23: remappable key bindings (`key.<action>=Ctrl+Shift+K`).
     pub keys: crate::keymap::KeyMap,
 }
@@ -143,6 +148,9 @@ impl Default for Settings {
             ui_theme: UiTheme::Modern,
             language: "us".to_string(),
             rendezvous_server: crate::rendezvous::DEFAULT_ADDR.to_string(),
+            colorblind: false,
+            mouse_swap: false,
+            subtitles: true,
             keys: crate::keymap::KeyMap::default(),
         }
     }
@@ -150,7 +158,7 @@ impl Default for Settings {
 
 /// Every key written to / understood in `settings.ini`, in file order (followed by one
 /// `key.<action>` line per bindable action, see [`crate::keymap`]).
-pub const KEYS: [&str; 15] = [
+pub const KEYS: [&str; 18] = [
     "resolution",
     "fullscreen",
     "vsync",
@@ -166,6 +174,9 @@ pub const KEYS: [&str; 15] = [
     "ui_theme",
     "language",
     "rendezvous_server",
+    "colorblind",
+    "mouse_swap",
+    "subtitles",
 ];
 
 fn parse_bool(v: &str) -> Result<bool, String> {
@@ -276,6 +287,9 @@ impl Settings {
             }
             "language" => self.language = validate_language(v)?,
             "rendezvous_server" => self.rendezvous_server = validate_host_addr(v)?,
+            "colorblind" => self.colorblind = parse_bool(v)?,
+            "mouse_swap" => self.mouse_swap = parse_bool(v)?,
+            "subtitles" => self.subtitles = parse_bool(v)?,
             other => match other.strip_prefix("key.") {
                 Some(id) => self.keys.set_from_setting(id, v)?,
                 None => return Err(format!("unknown key '{other}'")),
@@ -303,6 +317,9 @@ impl Settings {
             "ui_theme" => self.ui_theme.key().to_string(),
             "language" => self.language.clone(),
             "rendezvous_server" => self.rendezvous_server.clone(),
+            "colorblind" => b(self.colorblind),
+            "mouse_swap" => b(self.mouse_swap),
+            "subtitles" => b(self.subtitles),
             other => {
                 let id = other.strip_prefix("key.")?;
                 let action = crate::keymap::action_by_id(id)?;
@@ -477,6 +494,21 @@ pub fn card_hotkeys_enabled() -> bool {
     input_settings().card_hotkeys || std::env::var("FARUST_CARD_HOTKEYS").is_ok_and(|v| v == "1")
 }
 
+/// Phase 39: colour-blind safe army colours (`FARUST_COLORBLIND=1` overrides).
+pub fn colorblind() -> bool {
+    std::env::var("FARUST_COLORBLIND").is_ok_and(|v| v == "1") || input_settings().colorblind
+}
+
+/// Phase 39: left / right mouse buttons swapped in matches.
+pub fn mouse_swap() -> bool {
+    input_settings().mouse_swap
+}
+
+/// Phase 39: captions for announcer voice lines.
+pub fn subtitles() -> bool {
+    input_settings().subtitles
+}
+
 /// Active UI visual theme (`FARUST_UI_THEME` env var overrides `settings.ini`, default `Modern`).
 pub fn ui_theme() -> UiTheme {
     if let Ok(v) = std::env::var("FARUST_UI_THEME")
@@ -532,6 +564,9 @@ mod tests {
             ui_theme: UiTheme::Classic,
             language: "de".into(),
             rendezvous_server: "relay.example.org:15050".into(),
+            colorblind: true,
+            mouse_swap: true,
+            subtitles: false,
             keys: {
                 let mut k = crate::keymap::KeyMap::default();
                 k.set_from_setting("build_factory", "Ctrl+Shift+K").unwrap();

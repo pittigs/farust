@@ -156,6 +156,12 @@ enum Action {
     // Main menu
     Go(ScreenId),
     Quit,
+    /// Phase 39: launch the built-in tutorial mission.
+    StartTutorial,
+    /// Phase 39 accessibility toggles.
+    ToggleColorblind,
+    ToggleMouseSwap,
+    ToggleSubtitles,
     // Skirmish extras
     Skirmish(LobbyAction),
     CycleAiDiff,
@@ -556,6 +562,7 @@ impl MenuState {
         let by0 = (h * 0.34).max(190.0);
         let items = [
             ("SKIRMISH", Action::Go(ScreenId::Skirmish)),
+            ("TUTORIAL", Action::StartTutorial),
             ("MULTIPLAYER", Action::Go(ScreenId::Multiplayer)),
             ("REPLAYS", Action::Go(ScreenId::Replays)),
             ("OPTIONS", Action::Go(ScreenId::Options)),
@@ -581,10 +588,11 @@ impl MenuState {
 
         let lang = self.preview_lang();
         let tr = |k: &str, fb: &str| crate::loc::tr_lang(&lang, k, fb);
-        let nav_box = Rect::new(bx - 16.0, (h * 0.34).max(190.0) - 18.0, 312.0, 316.0);
+        let nav_box = Rect::new(bx - 16.0, (h * 0.34).max(190.0) - 18.0, 312.0, 374.0);
         c.panel(nav_box);
         let labels = [
             tr("ui.skirmish", "SKIRMISH"),
+            tr("ui.tutorial", "TUTORIAL"),
             tr("ui.multiplayer", "MULTIPLAYER"),
             tr("ui.replays", "REPLAYS"),
             tr("ui.options", "OPTIONS"),
@@ -1140,6 +1148,9 @@ impl MenuState {
             (Rect::new(rx + 14.0 + lw, y + step * 3.0, rctrl_w, 30.0), Action::Focus(FocusField::OptLastHost)),
             (Rect::new(rx + 14.0 + lw, y + step * 4.0, rctrl_w, 30.0), Action::ToggleCardHotkeys),
             (Rect::new(rx + 14.0 + lw, y + step * 5.0, rctrl_w, 30.0), Action::Go(ScreenId::Keys)),
+            (Rect::new(rx + 14.0 + lw, y + step * 6.0, rctrl_w, 30.0), Action::ToggleColorblind),
+            (Rect::new(rx + 14.0 + lw, y + step * 7.0, rctrl_w, 30.0), Action::ToggleMouseSwap),
+            (Rect::new(rx + 14.0 + lw, y + step * 8.0, rctrl_w, 30.0), Action::ToggleSubtitles),
             (f.footer_button(0, false, 160.0), Action::BackToMain),
             (f.footer_button(1, false, 160.0), Action::ResetOptions),
             (f.footer_button(0, true, 220.0), Action::SaveOptions),
@@ -1226,6 +1237,18 @@ impl MenuState {
                     label(&tr("ui.card_hotkeys", "Card Grid Keys"));
                     c.checkbox(r, self.draft.card_hotkeys, st);
                 }
+                Action::ToggleColorblind => {
+                    label(&tr("ui.colorblind", "Colour-blind Mode"));
+                    c.checkbox(r, self.draft.colorblind, st);
+                }
+                Action::ToggleMouseSwap => {
+                    label(&tr("ui.mouse_swap", "Swap Mouse Buttons"));
+                    c.checkbox(r, self.draft.mouse_swap, st);
+                }
+                Action::ToggleSubtitles => {
+                    label(&tr("ui.subtitles", "Subtitles"));
+                    c.checkbox(r, self.draft.subtitles, st);
+                }
                 Action::Go(ScreenId::Keys) => {
                     label(&tr("ui.key_bindings", "Key Bindings"));
                     let n = self.draft.keys.conflicts().len();
@@ -1246,7 +1269,7 @@ impl MenuState {
         }
 
         // Mouse legend in lower half of right panel (keys: see EDIT KEYS)
-        let ky0 = cnt.y + 54.0 + 42.0 * 6.3;
+        let ky0 = cnt.y + 54.0 + 42.0 * 9.3;
         c.text(rx + 14.0, ky0, bold(14.0), "MOUSE", theme::GOLD);
         let binds = [
             "LMB / Box : Select units   Dbl-click : Select same type",
@@ -1278,6 +1301,10 @@ impl MenuState {
         }
         match act {
             Action::Go(s) => self.navigate(s),
+            Action::StartTutorial => return MenuEvent::StartTutorial,
+            Action::ToggleColorblind => self.draft.colorblind = !self.draft.colorblind,
+            Action::ToggleMouseSwap => self.draft.mouse_swap = !self.draft.mouse_swap,
+            Action::ToggleSubtitles => self.draft.subtitles = !self.draft.subtitles,
             Action::Quit => return MenuEvent::Quit,
             Action::BackToMain => self.navigate(ScreenId::Main),
             Action::Skirmish(la) => {
@@ -1778,6 +1805,7 @@ enum MenuEvent {
     SettingsChanged,
     StartSkirmish(crate::lobby::LobbyLaunch),
     StartReplay(Replay),
+    StartTutorial,
 }
 
 // ---------------------------------------------------------------------------
@@ -1856,6 +1884,13 @@ impl ShellApp {
                     Err(e) => self.state.set_status(format!("Start failed: {e}"), true),
                 }
             }
+            MenuEvent::StartTutorial => match build_tutorial_from_menu(&self.state.game_dir) {
+                Ok((mut sess, map, meshes)) => {
+                    sess.muted = self.state.settings.master_volume == 0;
+                    self.enter_match(event_loop, sess, map, meshes);
+                }
+                Err(e) => self.state.set_status(format!("Tutorial failed: {e}"), true),
+            },
             MenuEvent::StartReplay(rep) => {
                 match build_replay_from_menu(&self.state.game_dir, rep) {
                     Ok((mut sess, map, meshes)) => {
@@ -2196,6 +2231,22 @@ fn build_skirmish_from_menu(
             rec.ai_event(0, ai.army, true);
         }
     }
+    Ok((session, map, meshes))
+}
+
+/// Phase 39: the built-in tutorial mission as a ready-to-play session.
+fn build_tutorial_from_menu(game_dir: &Path) -> Result<(PlaySession, MapContext, UnitMeshCache), String> {
+    let m = crate::mission::Mission::parse(crate::mission::TUTORIAL)?;
+    let catalog = Catalog::load(game_dir)?;
+    let map = MapContext::load(game_dir, &m.map)?;
+    let meshes = UnitMeshCache::load(Some(game_dir), &catalog);
+    let world = crate::mission::build_world(&m, catalog, &map, crate::sim::DEFAULT_SEED)?;
+    let human = m.human_army().unwrap_or(0) as crate::skirmish::ArmyId;
+    let mut session = PlaySession::new(world, human, false, 1);
+    session.ais = crate::mission::ai_armies(&m, None)?
+        .into_iter()
+        .map(|(a, d)| crate::skirmish_ai::ScriptedAi::with_difficulty(a, d))
+        .collect();
     Ok((session, map, meshes))
 }
 
