@@ -261,6 +261,9 @@ pub struct UnitTypeExt {
     pub fuel_recharge_milli: i64,
     /// Phase 30: present on air staging platforms.
     pub staging: Option<StagingSpec>,
+    /// Phase 31: pod drones an engineering station keeps alive (`Economy.EngineeringPods`
+    /// `PodUnitID`, upper-case); empty = the station works itself (Cybran Hive).
+    pub pods: Vec<String>,
 }
 
 /// Phase 30: air staging platform data (`Transport.DockingSlots`, `AI.Refueling*`,
@@ -345,6 +348,9 @@ pub enum Role {
     Wall,
     /// Phase 30: air staging platform — docks, refuels and repairs aircraft.
     AirStaging,
+    /// Phase 31: engineering station (UEF Kennel, Cybran Hive) — automatically assists and
+    /// repairs allied work in its radius, itself or through its pod drones.
+    EngStation,
 }
 
 impl Role {
@@ -367,6 +373,7 @@ impl Role {
                 | Role::MissileDefense
                 | Role::Wall
                 | Role::AirStaging
+                | Role::EngStation
         )
     }
     pub fn is_factory(self) -> bool {
@@ -397,6 +404,7 @@ impl Role {
             Role::Experimental => 17,
             Role::Wall => 18,
             Role::AirStaging => 19,
+            Role::EngStation => 20,
         }
     }
 }
@@ -440,8 +448,8 @@ pub const LOF_CLEARANCE: i64 = SCALE / 4;
 /// Phase 29: sim rules generation. Replays / saves record it and refuse to re-simulate
 /// under different rules (1 = Phases ≤ 28; 2 = Phase 29 ballistics, turrets and structure
 /// footprints blocking pathing).
-/// 3 = Phase 30 air fuel & staging.
-pub const RULES_VERSION: u32 = 3;
+/// 3 = Phase 30 air fuel & staging; 4 = Phase 31 engineering stations & pod drones.
+pub const RULES_VERSION: u32 = 4;
 
 /// Phase 29: milliradians per degree, scaled by 1000 (17.453 mrad / deg).
 const MRAD_PER_DEG_MILLI: i64 = 17_453;
@@ -532,6 +540,7 @@ fn default_strategic_icon(role: Role, tier: u8) -> &'static str {
         Role::Mobile => "icon_land1_directfire",
         Role::Wall => "icon_structure_wall",
         Role::AirStaging => "icon_structure2_air",
+        Role::EngStation => "icon_structure2_engineer",
     }
 }
 
@@ -778,6 +787,8 @@ impl UnitType {
         let default_build_range = match role {
             Role::Commander => 10.0,
             Role::Engineer => 6.0,
+            // Phase 31: stations work within their guard radius.
+            Role::EngStation => root.get("AI").and_then(|a| a.get_f64("GuardScanRadius")).unwrap_or(15.0),
             _ => 0.0,
         };
         let vision_default = match role {
@@ -927,6 +938,17 @@ impl UnitTypeExt {
                     * 1000.0)
                     .round() as i64;
             }
+        }
+        if role == Role::EngStation {
+            out.pods = root
+                .get("Economy")
+                .and_then(|e| e.get("EngineeringPods"))
+                .map(|p| p.table_list())
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|p| p.get_str("PodUnitID"))
+                .map(|id| id.to_ascii_uppercase())
+                .collect();
         }
         if role == Role::AirStaging {
             let ai = root.get("AI");
@@ -1481,6 +1503,15 @@ impl Catalog {
             }
             self.types.insert(id.clone(), t);
         }
+        // Phase 31: pod drones are spawned by their stations, never built: load them too.
+        let pods: Vec<String> = self.types.values().flat_map(|t| t.ext.pods.iter().cloned()).collect();
+        for id in pods {
+            if !self.types.contains_key(&id)
+                && let Some(root) = roots.get(&id)
+            {
+                self.types.insert(id.clone(), UnitType::from_blueprint(&id, Role::Engineer, root));
+            }
+        }
         self.roster = Arc::new(r);
     }
 
@@ -1867,6 +1898,10 @@ pub struct Unit {
     pub fuel: u32,
     /// Phase 30: return to the nearest free air staging platform when fuel runs low.
     pub auto_refuel: bool,
+    /// Phase 31: the engineering station this pod drone belongs to.
+    pub drone_of: Option<UnitId>,
+    /// Phase 31: (station) ticks spent rebuilding a missing pod drone.
+    pub pod_timer: u32,
 }
 
 impl Unit {
@@ -3591,6 +3626,7 @@ impl Skirmish {
         if t.role.is_structure() {
             self.walls_dirty = true;
         }
+        let spawn_pods = t.ext.pods.clone();
         self.units.insert(
             id,
             Unit {
@@ -3653,9 +3689,121 @@ impl Skirmish {
                 vel: (0, 0),
                 fuel: t.ext.fuel_ticks,
                 auto_refuel: t.ext.fuel_ticks > 0,
+                drone_of: None,
+                pod_timer: 0,
             },
         );
+        // Phase 31: a finished engineering station comes with its pod drones.
+        for pod in spawn_pods {
+            self.spawn_pod(id, &pod);
+        }
         Some(id)
+    }
+
+    /// Phase 31: spawns pod drone `pod_type` docked at station `station`.
+    fn spawn_pod(&mut self, station: UnitId, pod_type: &str) -> Option<UnitId> {
+        let (army, pos) = self.units.get(&station).map(|s| (s.army, (s.pos.x, s.pos.y)))?;
+        let pid = self.spawn_unit(army, pod_type, pos)?;
+        let p = self.units.get_mut(&pid).unwrap();
+        p.drone_of = Some(station);
+        p.auto_refuel = false;
+        Some(pid)
+    }
+
+    /// Phase 31: live pod drones of station `sid`.
+    pub fn pods_of(&self, sid: UnitId) -> Vec<UnitId> {
+        self.units.values().filter(|u| u.alive && u.drone_of == Some(sid)).map(|u| u.id).collect()
+    }
+
+    /// Phase 31: work an engineering station at `p` with radius `r` should pick up for
+    /// `army`: the nearest allied construction (builder site, factory, in-place upgrade) in
+    /// range, else the nearest damaged allied surface unit — ties by id.
+    fn station_target(&self, sid: UnitId, army: ArmyId, p: (i64, i64), r: i64) -> Option<UnitOrder> {
+        let lim = (r as i128) * (r as i128);
+        let mut assist: Option<(i128, UnitId)> = None;
+        let mut repair: Option<(i128, UnitId)> = None;
+        for u in self.units.values() {
+            if !u.alive || u.id == sid || u.carried_by.is_some() || u.drone_of.is_some() || !self.are_allies(army, u.army) {
+                continue;
+            }
+            if let Some(j) = &u.build {
+                let site = if u.role.is_builder() { (j.x, j.y) } else { (u.pos.x, u.pos.y) };
+                let d = dist_sq(p, site);
+                if d <= lim && assist.is_none_or(|(bd, bid)| (d, u.id) < (bd, bid)) {
+                    assist = Some((d, u.id));
+                }
+            } else if u.hp < u.max_hp && u.domain != NavDomain::Air {
+                let d = dist_sq(p, (u.pos.x, u.pos.y));
+                if d <= lim && repair.is_none_or(|(bd, bid)| (d, u.id) < (bd, bid)) {
+                    repair = Some((d, u.id));
+                }
+            }
+        }
+        assist.map(|(_, id)| UnitOrder::Assist(id)).or(repair.map(|(_, id)| UnitOrder::Repair(id)))
+    }
+
+    /// Phase 31 engineering stations (ascending id): pods die with their station; stations
+    /// rebuild missing pods (pod build time at the station's rate, paid on completion);
+    /// every second an idle-or-finished station (or each of its pods) re-targets the nearest
+    /// allied construction / damaged unit in its radius. Pods fly out to work and return to
+    /// the station when idle; work outside the radius is dropped.
+    fn step_eng_stations(&mut self) {
+        if !self.units.values().any(|u| u.role == Role::EngStation || u.drone_of.is_some()) {
+            return;
+        }
+        let ids: Vec<UnitId> = self.units.keys().copied().collect();
+        for &id in &ids {
+            let Some(parent) = self.units[&id].drone_of else { continue };
+            if !self.units.get(&parent).is_some_and(|s| s.alive && s.role == Role::EngStation) {
+                self.units.get_mut(&id).unwrap().hp = 0;
+            }
+        }
+        let retarget = self.tick.is_multiple_of(TICK_HZ);
+        for &sid in &ids {
+            let Some(s) = self.units.get(&sid).filter(|s| s.alive && s.role == Role::EngStation && s.carried_by.is_none()) else {
+                continue;
+            };
+            let (army, sp, upgrading) = (s.army, (s.pos.x, s.pos.y), matches!(s.orders.front(), Some(UnitOrder::Upgrade(_))));
+            let Some(t) = self.catalog.get(&s.type_id) else { continue };
+            let (pods_spec, radius, rate) = (t.ext.pods.clone(), t.build_range, t.build_rate.max(1));
+            // Rebuild missing pods.
+            let live = self.pods_of(sid);
+            if !upgrading && live.len() < pods_spec.len() {
+                let pod_type = pods_spec[live.len()].clone();
+                let (work, cm, ce) = self.catalog.get(&pod_type).map_or((1, 0, 0), |p| (p.build_work, p.cost_mass, p.cost_energy));
+                let st = self.units.get_mut(&sid).unwrap();
+                st.pod_timer = st.pod_timer.saturating_add(1);
+                let a = &self.armies[army as usize];
+                if st.pod_timer as i64 * rate >= work && a.mass >= cm && a.energy >= ce {
+                    st.pod_timer = 0;
+                    self.armies[army as usize].mass -= cm;
+                    self.armies[army as usize].energy -= ce;
+                    self.spawn_pod(sid, &pod_type);
+                }
+            }
+            if !retarget || upgrading {
+                continue;
+            }
+            let target = self.station_target(sid, army, sp, radius);
+            let workers: Vec<UnitId> = if pods_spec.is_empty() { vec![sid] } else { self.pods_of(sid) };
+            for wid in workers {
+                let w = self.units.get_mut(&wid).unwrap();
+                let busy = matches!(w.orders.front(), Some(UnitOrder::Assist(t) | UnitOrder::Repair(t)) if Some(*t) == target.as_ref().and_then(|o| match o { UnitOrder::Assist(x) | UnitOrder::Repair(x) => Some(*x), _ => None }));
+                if busy {
+                    continue;
+                }
+                w.orders.clear();
+                w.path.clear();
+                w.path_goal = None;
+                match &target {
+                    Some(o) => w.orders.push_back(o.clone()),
+                    None if wid != sid && dist_sq((w.pos.x, w.pos.y), sp) > (2 * SCALE as i128).pow(2) => {
+                        w.orders.push_back(UnitOrder::Move { x: sp.0, y: sp.1 });
+                    }
+                    None => {}
+                }
+            }
+        }
     }
 
     pub fn rebuild_spatial(&mut self) {
@@ -3753,7 +3901,7 @@ impl Skirmish {
             self.recompute_adjacency();
         }
         { let _p = scope("sim.economy"); self.step_income(); self.step_shields(); self.step_enhancements(); self.step_silos(); }
-        { let _p = scope("sim.construction"); self.step_construction(); self.sync_walls(); }
+        { let _p = scope("sim.construction"); self.step_eng_stations(); self.step_construction(); self.sync_walls(); }
         { let _p = scope("sim.spatial"); self.rebuild_spatial(); }
         // Phase 29: per-tick ground velocity (for target leading) = position delta over the
         // movement, separation and transport passes.
@@ -4238,7 +4386,7 @@ impl Skirmish {
         let mut assist_bonus: BTreeMap<UnitId, i64> = BTreeMap::new();
         for &id in &ids {
             let Some(u) = self.units.get(&id) else { continue };
-            if !u.alive || !u.role.is_builder() || u.carried_by.is_some() {
+            if !u.alive || !(u.role.is_builder() || u.role == Role::EngStation) || u.carried_by.is_some() {
                 continue;
             }
             if let Some(UnitOrder::Assist(target_id)) = u.orders.front()
@@ -4380,7 +4528,7 @@ impl Skirmish {
                     }
                     self.units.get_mut(&id).unwrap().build = Some(job);
                 }
-            } else if role.is_builder() {
+            } else if role.is_builder() || role == Role::EngStation {
                 match head {
                     Some(UnitOrder::Build { unit_type, x, y }) => {
                         let target_r = self.catalog.get(&unit_type).map(|t| t.radius).unwrap_or(0);
@@ -4944,7 +5092,7 @@ impl Skirmish {
                 None => continue,
             };
             let u = self.units.get_mut(&id).unwrap();
-            if fuel_ticks == 0 || !u.alive || u.carried_by.is_some() || u.domain != NavDomain::Air {
+            if fuel_ticks == 0 || !u.alive || u.carried_by.is_some() || u.domain != NavDomain::Air || u.drone_of.is_some() {
                 continue;
             }
             u.fuel = u.fuel.saturating_sub(1);
@@ -6381,6 +6529,8 @@ impl Skirmish {
             m(&mut h, &u.silo_missiles.to_le_bytes());
             m(&mut h, &u.fuel.to_le_bytes());
             m(&mut h, &[u8::from(u.auto_refuel)]);
+            m(&mut h, &u.drone_of.unwrap_or(0).to_le_bytes());
+            m(&mut h, &u.pod_timer.to_le_bytes());
             m(&mut h, &(u.orders.len() as u32).to_le_bytes());
             m(&mut h, &(u.production.len() as u32).to_le_bytes());
             m(&mut h, &(u.path.len() as u32).to_le_bytes());
@@ -6999,6 +7149,118 @@ pub(crate) mod tests {
             assert!(u.alive && u.carried_by.is_none(), "aircraft released when the platform dies");
             assert!(!matches!(u.orders.front(), Some(UnitOrder::Dock(_))));
         }
+    }
+
+    /// Phase 31 fixture: a Hive-like station `RHIVE` (works itself, 15 m radius) and a
+    /// Kennel-like `RKEN` with one pod drone `RPOD` (upgrades to `RKEN2` with two pods).
+    fn station_world() -> Skirmish {
+        let mut w = wall_world();
+        let mut hive = ty("RHIVE", Role::EngStation, 500, 0, 0, 0);
+        hive.build_rate = 20;
+        hive.build_range = 15 * SCALE;
+        hive.radius = SCALE / 2;
+        let mut pod = ty("RPOD", Role::Engineer, 6, 10, 0, 0);
+        pod.domain = NavDomain::Air;
+        pod.elevation = SCALE;
+        pod.build_rate = 20;
+        pod.build_range = 4 * SCALE;
+        pod.cost_mass = 25 * SCALE;
+        pod.build_work = 800;
+        let mut ken = hive.clone();
+        ken.id = "RKEN".into();
+        ken.ext.pods = vec!["RPOD".into()];
+        ken.upgrades_to = Some("RKEN2".into());
+        let mut ken2 = ken.clone();
+        ken2.id = "RKEN2".into();
+        ken2.tier = 3;
+        ken2.upgrades_to = None;
+        ken2.ext.pods = vec!["RPOD".into(), "RPOD".into()];
+        for t in [hive, pod, ken, ken2] {
+            w.catalog.types.insert(t.id.clone(), t);
+        }
+        w.catalog.types.get_mut("RT").unwrap().build_work = 2_000;
+        w.armies[0].mass = 5_000 * SCALE;
+        w.armies[0].energy = 50_000 * SCALE;
+        w
+    }
+
+    /// Ticks until factory `fac` (with `RT` queued) rolls out a new unit.
+    fn ticks_to_produce(w: &mut Skirmish, fac: UnitId) -> u64 {
+        let before: Vec<UnitId> = w.units().map(|u| u.id).collect();
+        w.issue(0, Command::Produce { factory: fac, unit_type: "RT".into(), count: 1 });
+        for t in 1..=600 {
+            w.step();
+            if w.units().any(|u| !before.contains(&u.id) && u.role == Role::Mobile) {
+                return t;
+            }
+        }
+        panic!("factory never finished");
+    }
+
+    #[test]
+    fn hive_assists_construction_and_repairs_in_its_radius() {
+        let mut alone = station_world();
+        let f1 = alone.spawn_unit(0, "RF", (100 * SCALE, 100 * SCALE)).unwrap();
+        let solo = ticks_to_produce(&mut alone, f1);
+
+        let mut w = station_world();
+        let fac = w.spawn_unit(0, "RF", (100 * SCALE, 100 * SCALE)).unwrap();
+        let hive = w.spawn_unit(0, "RHIVE", (108 * SCALE, 100 * SCALE)).unwrap();
+        let helped = ticks_to_produce(&mut w, fac);
+        assert!(helped * 10 < solo * 8, "hive speeds up production ({helped} vs {solo} ticks)");
+
+        // Repairs the nearest damaged ally in range, ignores one outside it.
+        let near = w.spawn_unit(0, "RPD", (112 * SCALE, 110 * SCALE)).unwrap();
+        let far = w.spawn_unit(0, "RPD", (160 * SCALE, 100 * SCALE)).unwrap();
+        for id in [near, far] {
+            let u = w.units.get_mut(&id).unwrap();
+            u.hp = u.max_hp / 2;
+        }
+        w.run(200);
+        assert_eq!(w.unit(near).unwrap().hp, w.unit(near).unwrap().max_hp, "near PD repaired");
+        assert_eq!(w.unit(far).unwrap().hp, w.unit(far).unwrap().max_hp / 2, "far PD untouched");
+        assert!(w.unit(hive).unwrap().pos == Vec2 { x: 108 * SCALE, y: 100 * SCALE }, "hive never moves");
+    }
+
+    #[test]
+    fn kennel_pods_fly_out_to_work_return_rebuild_and_die_with_the_station() {
+        let mut w = station_world();
+        let ken = w.spawn_unit(0, "RKEN", (100 * SCALE, 100 * SCALE)).unwrap();
+        let pods = w.pods_of(ken);
+        assert_eq!(pods.len(), 1, "station spawns with its pod");
+        let pod = pods[0];
+        assert_eq!(w.unit(pod).unwrap().drone_of, Some(ken));
+
+        let hurt = w.spawn_unit(0, "RPD", (110 * SCALE, 108 * SCALE)).unwrap();
+        w.units.get_mut(&hurt).unwrap().hp = 100 * SCALE;
+        let mut flew = false;
+        for _ in 0..300 {
+            w.step();
+            let p = w.unit(pod).unwrap();
+            flew |= dist_sq((p.pos.x, p.pos.y), (100 * SCALE, 100 * SCALE)) > (4 * SCALE as i128).pow(2);
+        }
+        assert!(flew, "pod flew out to the damaged PD");
+        assert_eq!(w.unit(hurt).unwrap().hp, w.unit(hurt).unwrap().max_hp, "pod repaired it");
+        let p = w.unit(pod).unwrap();
+        assert!(dist_sq((p.pos.x, p.pos.y), (100 * SCALE, 100 * SCALE)) <= (2 * SCALE as i128).pow(2), "pod returned home");
+
+        // A destroyed pod is rebuilt (paid), the upgrade adds a second one.
+        w.units.get_mut(&pod).unwrap().hp = 0;
+        let mass0 = w.armies[0].mass;
+        w.run(30);
+        assert!(w.pods_of(ken).is_empty(), "rebuild takes time");
+        w.run(20);
+        assert_eq!(w.pods_of(ken).len(), 1, "pod rebuilt");
+        assert!(w.armies[0].mass <= mass0 - 25 * SCALE + 100 * SCALE, "rebuild paid");
+        w.issue(0, Command::Upgrade { unit: ken, target_type: "RKEN2".into() });
+        w.run(400);
+        assert_eq!(w.unit(ken).unwrap().type_id, "RKEN2");
+        assert_eq!(w.pods_of(ken).len(), 2, "upgraded station keeps two pods");
+
+        let all = w.pods_of(ken);
+        w.units.get_mut(&ken).unwrap().hp = 0;
+        w.run(3);
+        assert!(all.iter().all(|p| w.unit(*p).is_none()), "pods die with their station");
     }
 
     #[test]

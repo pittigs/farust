@@ -40,7 +40,7 @@ const GATHER_DIST: i64 = 28 * U;
 const ACU_LEASH: i64 = 60 * U;
 const ACU_MEX_RANGE: i64 = 60 * U;
 /// Number of [`Role`] codes (`Role::code` is 0..ROLES).
-const ROLES: usize = 20;
+const ROLES: usize = 21;
 /// Raids start after 4 minutes of game time.
 const RAID_START: u64 = 2_400;
 /// Air units at least this fast (milli per tick) are used for strikes, otherwise kept home.
@@ -951,7 +951,8 @@ impl Smart {
         };
         let cat = w.catalog();
         for u in w.units() {
-            if u.army == me {
+            // Phase 31: pod drones are driven by their engineering station, not the AI.
+            if u.army == me && u.drone_of.is_none() {
                 v.have[u.role.code() as usize] += 1;
                 match u.role {
                     Role::Commander => v.acu = Some(u),

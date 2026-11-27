@@ -550,7 +550,7 @@ impl PlaySession {
     pub fn idle_engineers(&self) -> Vec<UnitId> {
         self.world
             .units()
-            .filter(|u| u.army == self.human_army && u.role == Role::Engineer && u.orders.is_empty() && u.build.is_none())
+            .filter(|u| u.army == self.human_army && u.role == Role::Engineer && u.drone_of.is_none() && u.orders.is_empty() && u.build.is_none())
             .map(|u| u.id)
             .collect()
     }

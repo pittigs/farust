@@ -91,7 +91,7 @@ impl LegacyAi {
         // Factories: rally + Engineers / Land (T1-T3) / Air / Naval production & upgrades.
         let n_eng = w
             .units()
-            .filter(|u| u.army == self.army && u.role == Role::Engineer)
+            .filter(|u| u.army == self.army && u.role == Role::Engineer && u.drone_of.is_none())
             .count();
         let queued_eng: usize = w
             .units()
@@ -485,6 +485,7 @@ impl LegacyAi {
         for eng in w.units().filter(|u| {
             u.army == self.army
                 && u.role == Role::Engineer
+                && u.drone_of.is_none()
                 && u.orders.is_empty()
                 && u.build.is_none()
         }) {

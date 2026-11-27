@@ -196,6 +196,7 @@ fn select_category(role: Role, domain: NavDomain, tier: u8) -> &'static str {
         Role::PointDefense => "Gun",
         Role::Radar => "Radar",
         Role::Shield | Role::MissileSilo | Role::MissileDefense | Role::AntiAir | Role::Wall | Role::AirStaging => "Structure",
+        Role::EngStation => "Factory",
         Role::Engineer => "Vehicle",
         Role::Experimental => "Bot",
         Role::Mobile => match domain {

@@ -306,10 +306,22 @@ bumps `SIM_VERSION`, re-baselines golden hashes deliberately, and keeps
   staging in practice (tech pacing is Phase 52); staging HUD (fuel bar, auto-refuel
   toggle button) is not on the command card yet.
 
-### Phase 31 — Engineering stations & drones (planned)
-- Kennel / Hive builder stations, UEF pod drones and Cybran build drones as
-  sim units owned by a parent, upgrades T2→T3, auto-assist radius.
-- Exit: the 5 engineering-station blueprints leave the exclusion list.
+### Phase 31 — Engineering stations & drones (done)
+- `Role::EngStation` (UEF Kennels `XEB0104`/`XEB0204`, Cybran Hives `XRB0104`→`0204`→`0304`;
+  roster excluded 10 → 5, `roster --verify SCMP_009` 365/365): stationary, never-moving
+  workers that every second pick the nearest allied construction (builder site, factory,
+  in-place upgrade) in their radius (`MaxBuildDistance` / `AI.GuardScanRadius`), else the
+  nearest damaged surface ally, and assist / repair it with their `BuildRate`.
+- Pod drones: stations with `Economy.EngineeringPods` spawn their `PodUnitID` drones
+  (loaded into the catalog even though nothing builds them); pods fly out to the work,
+  return home when idle, die with their station, are rebuilt at the station's rate
+  (`BuildTime / BuildRate`, paid in full) and upgrades grow the pod count. Pods burn no
+  fuel and are invisible to the AIs and the idle-engineer cycle. Rules v4.
+- Exit: Hive speeds up a factory by > 20 % and repairs only inside its radius; Kennel pod
+  flies out, repairs, returns, is rebuilt (paid), upgrade → two pods, pods die with the
+  station (308/308). `bench-scale --units 2048` 176 / 318 ticks/s, exact `1t == 20t`. Done.
+- Not modelled: ACU/SCU shoulder-pod enhancements (no `PodUnitID` in their blueprint data),
+  station reclaim/capture, AI building stations.
 
 ### Phase 32 — Mobile factories, carriers & eggs (planned)
 - Production from mobile units: Fatboy, Atlantis, Czar, Tempest, Megalith

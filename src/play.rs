@@ -310,7 +310,7 @@ impl UnitMeshCache {
             let target = match role {
                 Role::AirFactory | Role::NavalFactory => Role::Factory,
                 Role::Hydro | Role::MassStorage | Role::EnergyStorage => Role::Generator,
-                Role::AirStaging => Role::Factory,
+                Role::AirStaging | Role::EngStation => Role::Factory,
                 Role::Shield | Role::AntiAir | Role::MissileSilo | Role::MissileDefense => Role::PointDefense,
                 Role::Experimental => Role::Mobile,
                 r => r,
@@ -405,7 +405,7 @@ fn procedural_role_mesh(role: Role, span: f32) -> NormalizedMesh {
             append_local_box(&mut positions, &mut normals, &mut uvs, &mut indices, [0.0, 0.0, 0.0], [half * 0.75, span * 0.35, half]);
             append_local_box(&mut positions, &mut normals, &mut uvs, &mut indices, [0.0, span * 0.35, half * 0.1], [half * 0.4, span * 0.25, half * 0.65]);
         }
-        Role::AirFactory | Role::NavalFactory | Role::Hydro | Role::MassStorage | Role::EnergyStorage | Role::Shield | Role::AntiAir | Role::MissileSilo | Role::MissileDefense | Role::AirStaging => {
+        Role::AirFactory | Role::NavalFactory | Role::Hydro | Role::MassStorage | Role::EnergyStorage | Role::Shield | Role::AntiAir | Role::MissileSilo | Role::MissileDefense | Role::AirStaging | Role::EngStation => {
             append_local_box(&mut positions, &mut normals, &mut uvs, &mut indices, [0.0, 0.0, 0.0], [half * 0.75, span * 0.55, half * 0.75]);
             append_local_box(&mut positions, &mut normals, &mut uvs, &mut indices, [0.0, span * 0.55, 0.0], [half * 0.45, span * 0.35, half * 0.45]);
         }

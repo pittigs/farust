@@ -62,7 +62,8 @@ pub const DEFAULT_INPUT_DELAY: u64 = 2;
 /// wall `Build` commands and desync), so mixed v4/v5 games are refused at the handshake.
 /// v6 (Phase 29): sim rules v2 (ballistics, turrets, structure footprints).
 /// v7 (Phase 30): sim rules v3 (air fuel & staging).
-pub const PROTOCOL_VERSION: u32 = 7;
+/// v8 (Phase 31): sim rules v4 (engineering stations & pod drones).
+pub const PROTOCOL_VERSION: u32 = 8;
 /// The host's army (star-topology relay); only it may change the game speed.
 pub const HOST_ARMY: ArmyId = 0;
 /// Sender id of host-generated control messages (`Dropped`).

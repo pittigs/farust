@@ -132,8 +132,8 @@ pub fn infer_role(b: &BpInfo) -> Result<Role, &'static str> {
     if h("SATELLITE") || h("ORBITALSYSTEM") {
         return Err("orbital satellite");
     }
-    if h("POD") || (h("ENGINEERSTATION") || (h("PODSTAGINGPLATFORM") && h("STRUCTURE"))) {
-        return Err("engineering drones / pod staging");
+    if h("ENGINEERSTATION") || (h("PODSTAGINGPLATFORM") && h("STRUCTURE")) {
+        return Ok(Role::EngStation);
     }
     if h("MOBILESONAR") {
         return Ok(Role::Radar);
@@ -250,6 +250,7 @@ impl BuildGroup {
         }
         match role {
             Role::Factory | Role::AirFactory | Role::NavalFactory | Role::AirStaging => BuildGroup::Factory,
+            Role::EngStation => BuildGroup::Engineer,
             Role::Extractor | Role::Generator | Role::Hydro | Role::MassStorage | Role::EnergyStorage => BuildGroup::Economy,
             Role::PointDefense | Role::AntiAir | Role::Shield | Role::MissileDefense | Role::Wall => BuildGroup::Defense,
             Role::Radar => BuildGroup::Intel,
