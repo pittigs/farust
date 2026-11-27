@@ -2751,7 +2751,12 @@ impl ApplicationHandler for PlayApp {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         if let Some(st) = self.state.as_ref() {
             let _p = crate::profiler::scope("audio.frame");
-            crate::audio_play::frame(&mut self.session, self.game_dir.as_deref(), &st.camera);
+            crate::audio_play::frame(
+                &mut self.session,
+                Some(&self.map.scmap),
+                self.game_dir.as_deref(),
+                &st.camera,
+            );
         }
         let Some(st) = self.state.as_mut() else {
             return;

@@ -196,3 +196,14 @@ cargo run --release -- host --code SCMP_001 --rendezvous 127.0.0.1:15050 --play
 cargo run --release -- join --code XXXX-XXXX --rendezvous 127.0.0.1:15050 --play
 FARUST_UI_THEME=classic cargo run --release -- play SCMP_001
 ```
+
+## Step 43 — done: announcer, map ambience & adaptive music
+
+- **Tactical & Economy Announcer** (`src/xact.rs`, `src/audio_play.rs`): Recursive `sounds/` scan indexes `Voice/US/XGG.xsb` (89 wavebanks, 3,163 cues, plus direct `"Bank#Index"` wave playback). Render-side detection drives a single-voice priority queue with 10–60 s per-event cooldowns for the focus army & shared allied intel (nuke launch/inbound/intercepted, commander under attack, 12 unit-specific experimental callouts, 15 directional/domain/tier base-under-attack callouts, 8 structure-lost callouts, shield down, mass/energy low/empty, unit cap, transport full; SupCom 1 storage-full cues reported `MISSING` on standalone FA).
+- **Per-Map Biome Ambience & Adaptive Music** (`src/audio_play.rs`, `src/play.rs`): `.scmap` terrain strata + water fraction select `Temperate` / `Oceanic` / `Volcanic` / `Arid` / `Tundra` dual-layer ambient loops scaled by strategic zoom; smoothed camera-weighted combat intensity crossfades `Base_Building` ↔ `Battle` playlists with hysteresis (`0.45` / `0.15`, 18 s calm hold) and ducks under announcer VO without touching sim hashes.
+
+```sh
+cargo run --release -- audio coverage
+cargo run --release -- audio cues --all
+cargo run --release -- audio render-mix fa-unpack/audio/phase43_mix.wav SCMP_001 --from 11800 --ticks 1800
+```

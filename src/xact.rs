@@ -28,8 +28,8 @@ pub const MAX_VOICES: usize = 40;
 /// Phase 24: looping unit sounds (construction / movement) allowed at once; they share
 /// the one-shot pool above.
 pub const MAX_LOOP_VOICES: usize = 8;
-/// Max simultaneous music/ambient voices (crossfades need 2 + ambient).
-const MAX_STREAM_VOICES: usize = 4;
+/// Max simultaneous music/ambient voices (music crossfade = 2 + dual map ambient = 2 + headroom).
+const MAX_STREAM_VOICES: usize = 6;
 
 /// XACT mini-format tags.
 pub const FORMAT_PCM: u16 = 0;
@@ -697,6 +697,42 @@ pub struct CueLibrary {
     pub decode_failures: usize,
 }
 
+/// Parses a direct wave-index reference `"<WaveBank>#<Index>"` (e.g. `"XGG#0"`), used
+/// when a wave exists in an `.xwb` bank without an `.xsb` cue wrapper.
+pub fn parse_wave_ref(spec: &str) -> Option<(&str, u16)> {
+    let (bank, idx_s) = spec.split_once('#')?;
+    let bank = bank.trim();
+    if bank.is_empty() {
+        return None;
+    }
+    let idx = idx_s.trim().parse::<u16>().ok()?;
+    Some((bank, idx))
+}
+
+/// Collects files inside `sounds_dir`: top-level entries first (sorted), then
+/// subdirectories recursively (sorted, e.g. `Voice/US/*.xsb`), so root banks keep priority
+/// while localized voice banks are indexed automatically.
+pub fn collect_sound_paths(sounds_dir: &Path) -> Vec<PathBuf> {
+    fn walk_subdirs(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(rd) = fs::read_dir(dir) else {
+            return;
+        };
+        let mut entries: Vec<PathBuf> = rd.filter_map(|e| e.ok()).map(|e| e.path()).collect();
+        entries.sort();
+        let (mut dirs, mut files): (Vec<PathBuf>, Vec<PathBuf>) =
+            entries.into_iter().partition(|p| p.is_dir());
+        files.sort();
+        dirs.sort();
+        out.extend(files);
+        for d in dirs {
+            walk_subdirs(&d, out);
+        }
+    }
+    let mut out = Vec::new();
+    walk_subdirs(sounds_dir, &mut out);
+    out
+}
+
 impl CueLibrary {
     pub fn empty() -> Self {
         Self {
@@ -708,15 +744,11 @@ impl CueLibrary {
         }
     }
 
-    /// Parses every `.xsb` in `sounds_dir` (they are tiny) and records `.xwb` paths.
+    /// Parses every `.xsb` in `sounds_dir` recursively (incl. `Voice/<lang>/`) and records
+    /// `.xwb` paths. Top-level banks win when two `.xsb` files define the same cue name.
     pub fn scan(sounds_dir: &Path) -> Self {
         let mut lib = Self::empty();
-        let Ok(rd) = fs::read_dir(sounds_dir) else {
-            return lib;
-        };
-        let mut paths: Vec<PathBuf> = rd.filter_map(|e| e.ok()).map(|e| e.path()).collect();
-        paths.sort();
-        for p in paths {
+        for p in collect_sound_paths(sounds_dir) {
             let ext = p
                 .extension()
                 .and_then(|s| s.to_str())
@@ -728,7 +760,7 @@ impl CueLibrary {
                 .map(str::to_ascii_lowercase)
                 .unwrap_or_default();
             if ext == "xwb" {
-                lib.bank_files.insert(stem, p);
+                lib.bank_files.entry(stem).or_insert(p);
             } else if ext == "xsb"
                 && let Ok(bytes) = fs::read(&p)
                 && let Ok(sb) = SoundBank::parse(&bytes)
@@ -757,9 +789,21 @@ impl CueLibrary {
         self.cues.len()
     }
 
+    /// Every indexed cue definition in case-insensitive alphabetical order.
+    pub fn cues(&self) -> impl Iterator<Item = &CueDef> {
+        self.cues.values()
+    }
+
     /// Case-insensitive cue lookup.
     pub fn cue(&self, name: &str) -> Option<&CueDef> {
         self.cues.get(&name.to_ascii_lowercase())
+    }
+
+    /// Metadata of a direct `Bank#Index` wave if the bank and entry exist.
+    pub fn wave_entry(&mut self, wb_name: &str, idx: u16) -> Option<(String, WaveEntryInfo)> {
+        let (bank, _) = self.bank(wb_name)?;
+        let entry = bank.entries.get(usize::from(idx))?.clone();
+        Some((bank.name.clone(), entry))
     }
 
     /// True if `name` exists and references at least one wave.
@@ -795,26 +839,35 @@ impl CueLibrary {
         Some((bank, path))
     }
 
-    /// Decodes (and caches) every distinct wave of cue `name`.
+    /// Decodes (and caches) every distinct wave of cue `name` (or direct `"Bank#Index"`).
     pub fn clips(&mut self, name: &str) -> Vec<Arc<PcmClip>> {
-        let Some(def) = self.cue(name).cloned() else {
-            return Vec::new();
-        };
-        self.decode_waves(&def.waves)
+        if let Some(def) = self.cue(name).cloned() {
+            return self.decode_waves(&def.waves);
+        }
+        if let Some((wb, idx)) = parse_wave_ref(name) {
+            return self.decode_waves(&[(wb.to_string(), idx)]);
+        }
+        Vec::new()
     }
 
     /// Phase 24: decoded clips per layer of cue `name` (layers without any decodable wave
-    /// are dropped). A plain cue yields one layer holding its variations.
+    /// are dropped). A plain cue or `"Bank#Index"` wave ref yields one layer.
     pub fn layer_clips(&mut self, name: &str) -> Vec<Vec<Arc<PcmClip>>> {
-        let Some(def) = self.cue(name).cloned() else {
-            return Vec::new();
-        };
-        let tracks = if def.tracks.is_empty() { vec![def.waves.clone()] } else { def.tracks.clone() };
-        tracks
-            .iter()
-            .map(|t| self.decode_waves(t))
-            .filter(|c| !c.is_empty())
-            .collect()
+        if let Some(def) = self.cue(name).cloned() {
+            let tracks = if def.tracks.is_empty() { vec![def.waves.clone()] } else { def.tracks.clone() };
+            return tracks
+                .iter()
+                .map(|t| self.decode_waves(t))
+                .filter(|c| !c.is_empty())
+                .collect();
+        }
+        if let Some((wb, idx)) = parse_wave_ref(name) {
+            let decoded = self.decode_waves(&[(wb.to_string(), idx)]);
+            if !decoded.is_empty() {
+                return vec![decoded];
+            }
+        }
+        Vec::new()
     }
 
     fn decode_waves(&mut self, waves: &[(String, u16)]) -> Vec<Arc<PcmClip>> {
@@ -843,13 +896,18 @@ impl CueLibrary {
         out
     }
 
-    /// Opens wave `variant % n` of cue `name` as a disk stream (16-bit PCM only).
+    /// Opens wave `variant % n` of cue `name` (or `"Bank#Index"`) as a disk stream (16-bit PCM only).
     pub fn stream(&mut self, name: &str, variant: usize) -> Option<PcmStream> {
-        let def = self.cue(name)?.clone();
-        if def.waves.is_empty() {
+        let (wb, idx) = if let Some(def) = self.cue(name).cloned() {
+            if def.waves.is_empty() {
+                return None;
+            }
+            def.waves[variant % def.waves.len()].clone()
+        } else if let Some((wb, idx)) = parse_wave_ref(name) {
+            (wb.to_string(), idx)
+        } else {
             return None;
-        }
-        let (wb, idx) = def.waves[variant % def.waves.len()].clone();
+        };
         let (bank, path) = self.bank(&wb)?;
         let e = bank.entries.get(usize::from(idx))?;
         if e.format_tag != FORMAT_PCM || e.bits_per_sample != 16 {
@@ -2303,5 +2361,57 @@ mod tests {
         eng.fade_out(id, 0.05);
         let _ = eng.render(4_800);
         assert!(!eng.voice_active(id));
+    }
+
+    #[test]
+    fn recursive_scan_and_direct_wave_index_playback() {
+        assert_eq!(parse_wave_ref("XGG#12"), Some(("XGG", 12)));
+        assert_eq!(parse_wave_ref(" #0 "), None);
+        assert_eq!(parse_wave_ref("XGG#nope"), None);
+
+        let root = std::env::temp_dir().join(format!("farust_xact_scan_{}", std::process::id()));
+        let voice_dir = root.join("Voice").join("US");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&voice_dir).unwrap();
+
+        let xwb = build_synthetic_xwb();
+        std::fs::write(voice_dir.join("Test.xwb"), &xwb).unwrap();
+
+        let mut xsb = vec![0u8; 256];
+        xsb[0..4].copy_from_slice(SDBK_MAGIC);
+        xsb[19..21].copy_from_slice(&1u16.to_le_bytes());
+        xsb[25..27].copy_from_slice(&1u16.to_le_bytes());
+        xsb[27] = 1;
+        let cn = b"Voice_Alert\0";
+        xsb[30..32].copy_from_slice(&(cn.len() as u16).to_le_bytes());
+        let (sc_off, cn_off, wb_off, snd_off) = (138u32, 148u32, 164u32, 228u32);
+        let offs = [sc_off, u32::MAX, cn_off, u32::MAX, u32::MAX, u32::MAX, wb_off, u32::MAX, u32::MAX, snd_off];
+        for (i, v) in offs.iter().enumerate() {
+            xsb[34 + i * 4..38 + i * 4].copy_from_slice(&v.to_le_bytes());
+        }
+        xsb[74..78].copy_from_slice(b"Test");
+        xsb[sc_off as usize + 1..sc_off as usize + 5].copy_from_slice(&snd_off.to_le_bytes());
+        xsb[cn_off as usize..cn_off as usize + cn.len()].copy_from_slice(cn);
+        xsb[wb_off as usize..wb_off as usize + 4].copy_from_slice(b"Test");
+        xsb[snd_off as usize] = 0;
+        xsb[snd_off as usize + 7..snd_off as usize + 9].copy_from_slice(&12u16.to_le_bytes());
+        xsb[snd_off as usize + 9..snd_off as usize + 11].copy_from_slice(&0u16.to_le_bytes());
+        xsb[snd_off as usize + 11] = 0;
+        std::fs::write(voice_dir.join("Test.xsb"), &xsb).unwrap();
+
+        let lib = CueLibrary::scan(&root);
+        assert!(lib.has("Voice_Alert"), "nested Voice/US SoundBank must be indexed");
+        let eng = AudioEngine::with_library(lib, false, false);
+        // Play by cue name from nested Voice/US/Test.xsb
+        let by_cue = eng.resolve("Voice_Alert", CueSpec::voice(1.0, 0.0)).expect("resolve nested cue");
+        assert!(matches!(eng.trigger(by_cue, None, 1.0), TriggerOutcome::Played(_)));
+        // Play directly by wave index ("Test#0") without needing a cue wrapper
+        let by_idx = eng.resolve("Test#0", CueSpec::voice(1.0, 0.0)).expect("resolve wave index");
+        assert!(matches!(eng.trigger(by_idx, None, 1.0), TriggerOutcome::Played(_)));
+        assert!(eng.resolve("Test#99", CueSpec::voice(1.0, 0.0)).is_none());
+        let pcm = eng.render(480);
+        assert!(pcm.iter().any(|s| s.abs() > 0.01));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -349,10 +349,39 @@ bumps `SIM_VERSION`, re-baselines golden hashes deliberately, and keeps
   emissive/glow maps on units, MSAA/FXAA option, gamma setting.
 - Exit: `bench-render` at 8k units keeps frame p50 within +15% of Phase 25.
 
-### Phase 43 — Announcer, ambience & adaptive music (planned)
-- Announcer callouts (mass storage full, base under attack, experimental
-  detected), map ambient loops, music intensity driven by combat volume.
-- Exit: `farust audio coverage` reports every announcer event mapped.
+### Phase 43 — Announcer, ambience & adaptive music (done)
+- Recursive SoundBank/WaveBank scan & direct `"Bank#Index"` wave playback
+  (`src/xact.rs`, `src/main.rs`): indexes nested `sounds/Voice/<lang>/XGG.xsb`
+  (89 `.xwb` wavebanks, 3,163 cues, 3,043/3,043 waves decoded) and raises
+  `MAX_STREAM_VOICES` to 6 so music crossfades and dual-layer ambience never
+  evict each other. `farust audio cues --all` dumps every indexed cue.
+- Render-side announcer (`AnnouncerEvent`, `AnnouncerQueue`, `EconWatch` in
+  `src/audio_play.rs`): 16 tactical/economy events derived from sim events,
+  army economy, unit damage/shields/transports/cap and shared allied intel for
+  the focus army, with priority ordering, single-voice playback (0.35 s breath
+  gap, 12 s staleness expiry), and 10–60 s per-event cooldowns. Maps 14/16 to
+  authentic `XGG.xsb` cues (including 12 per-experimental `XGG_HQ_GD1_04179..04190`,
+  15 domain/tier/compass inbound `04142..04172`, and 8 structure-lost `04213..04221`
+  variants); `mass_storage_full` / `energy_storage_full` target SupCom 1's
+  `UEFComputer_Resources_01313`/`01312` and honestly report `MISSING` on
+  standalone FA installs where `COMPUTER_*_VO` is absent.
+- Per-map biome ambience (`MapBiome`, `MapAmbience` in `src/audio_play.rs`,
+  `src/play.rs`): classifies `.scmap` stratum paths, skybox and heightmap water
+  fraction into `Temperate` / `Oceanic` / `Volcanic` / `Arid` / `Tundra` dual
+  looping streams (`AMB_Planet_Rumble_zoom` + surface water/fire/tundra/arid
+  detail) cross-scaled by camera zoom.
+- Adaptive music (`MusicDirector` in `src/audio_play.rs`): camera- and
+  focus-army-weighted combat impulse with asymmetric EMA smoothing (2.5 s
+  attack / 8.0 s release), Schmitt-trigger hysteresis (`0.45` enter / `0.15`
+  exit, 10 s min battle dwell, 18 s calm hold), crossfades `Base_Building` ↔
+  `Battle`, and ducks to `0.62×` under announcer VO.
+- Exit: `farust audio coverage` reports all 16 announcer events (`14/16` mapped,
+  `2 MISSING` on standalone FA) plus biome ambience & music playlists;
+  `audio render-mix` on `SCMP_001` (`--from 11800 --ticks 1800`) voices 13
+  announcer callouts, oceanic dual-layer ambience and `Base_Building` → `Battle`
+  transition with `identical` state hash (`6c2f941aef13f77b`). 268/268 unit
+  tests pass; `sim-run --ticks 10000` `35db8f2bd7a6faf2`, `skirmish SCMP_001`
+  `192e89b083b978cb`. Done.
 
 ### Arc D — Netcode & online (44–47)
 
