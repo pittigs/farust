@@ -831,10 +831,29 @@ bumps `SIM_VERSION`, re-baselines golden hashes deliberately, and keeps
   the linker: `cargo build --release --target x86_64-pc-windows-gnu`, then
   `wine farust.exe join 127.0.0.1:PORT` against a Linux host and compare hashes.
 
-### Phase 57 — CI, packaging & 1.0 (planned)
-- CI running tests, fuzzers and golden-hash suites; crash reporter with
-  desync dumps; AppImage/Flatpak + Windows zip; 1.0 release checklist.
-- Exit: tagged 1.0 builds produced by CI for all three platforms.
+### Phase 57 — CI, packaging & 1.0 (done locally; CI run needs a remote)
+- `.github/workflows/ci.yml`: on every push/PR, `cargo test --release` on Linux x86_64 +
+  aarch64, Windows, macOS arm64 + x86_64 (the suite needs no game data: 372 tests pass
+  with `FA_PATH=/nonexistent` and an empty home), the Phase 4 sim golden
+  (`35db8f2bd7a6faf2`), the parser fuzzers (`fuzz-parsers --no-real`), clippy (report
+  only) and Windows/macOS cross type checks.
+- `.github/workflows/release.yml`: tag `v*` → tests on each runner → archives
+  (Linux x86_64/aarch64 `.tar.gz` + x86_64 AppImage, Windows `.zip`, macOS arm64/x86_64
+  `.tar.gz`) → draft GitHub release. `FARUST_BUILD_ID` stamps `farust version`.
+- `packaging/package.sh` (same archive locally; AppImage when `appimagetool` exists),
+  desktop file + AppStream metainfo (`desktop-file-validate` clean), Flatpak manifest
+  (`packaging/flatpak/`, Steam/GOG folders read-only).
+- Crash reporter (`src/crash.rs`): panic hook writes `<data>/crashes/<utc>-<pid>/crash.txt`
+  with build identity, command line, panic site, backtrace and the newest desync dump's
+  `report.txt` (< 1 h old); nothing is uploaded. `farust crash-test` exercises it;
+  `farust version` prints build / rules / protocol versions.
+- `docs/RELEASE.md`: the 1.0 checklist (license and app id are maintainer decisions).
+- Verified locally: `packaging/package.sh` → `dist/farust-0.1.0-linux-x86_64.tar.gz`
+  (binary, docs, missions, example mod, FIRST-RUN.txt); the packaged binary reports
+  `build 658932e-dirty`; `farust crash-test` writes a complete report; workflow and
+  Flatpak YAML parse.
+- Exit pending: "tagged 1.0 builds produced by CI for all three platforms" needs the
+  repository pushed to GitHub (no remote is configured here) plus the license decision.
 
 ### Other known gaps
 - FAF network/replay compatibility stays out of scope (see Risks).

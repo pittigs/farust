@@ -353,3 +353,17 @@ cargo run --release -- mission missions/x1ca_001.farust-mission --human-ai hard 
 cargo run --release -- platform
 cargo check --release --target x86_64-pc-windows-gnu    # also *-apple-darwin, aarch64-unknown-linux-gnu
 ```
+
+## Step 57 — CI, packaging & crash reports
+
+- CI on Linux (x86_64/aarch64), Windows and macOS (`.github/workflows/ci.yml`); tagged
+  releases build archives + AppImage and draft a GitHub release (`release.yml`).
+- `packaging/package.sh` builds the release archive locally; Flatpak manifest in
+  `packaging/flatpak/`.
+- Crash reports in `<data>/crashes/` (with the latest desync dump); 1.0 checklist in
+  `docs/RELEASE.md`.
+
+```sh
+cargo run --release -- version
+bash packaging/package.sh            # -> dist/farust-<version>-<os>-<arch>.tar.gz
+```

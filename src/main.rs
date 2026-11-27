@@ -5,6 +5,7 @@ mod audio_play;
 mod blueprint;
 mod camera;
 mod chat;
+mod crash;
 mod combat;
 mod command_card;
 mod controls;
@@ -76,6 +77,7 @@ fn print_usage() {
     eprintln!("  farust maps [GAME_DIR] [--limit N] [--check]      (stock + user maps, with source)");
     eprintln!("  farust roster [GAME_DIR] [--faction F] [--json]   (data-driven unit roster & coverage)");
     eprintln!("  farust loc [--check | <KEY> | --unit <ID>] [--lang CODE] [GAME_DIR] (localization tables)");
+    eprintln!("  farust version                                    (build, rules & protocol versions)");
     eprintln!("  farust platform                                   (OS dirs + Forged Alliance install discovery)");
     eprintln!("  farust mods [enable <SPEC> | disable <SPEC> | conflicts] (installed & persisted blueprint mods)");
     eprintln!("  global: --mod <DIR|NAME> (repeatable) enables a blueprint mod for any subcommand");
@@ -122,6 +124,8 @@ fn print_usage() {
 }
 
 fn main() {
+    // Phase 57: crash reports (with the newest desync dump) under <data>/crashes/.
+    crash::install();
     let raw: Vec<String> = std::env::args().collect();
     // Phase 24/26: `--mod <DIR|NAME>` and `+connect_lobby <CODE>` are global; strip before dispatch.
     let mut args: Vec<String> = Vec::with_capacity(raw.len());
@@ -312,6 +316,11 @@ fn run(args: &[String], connect_lobby: Option<&str>) -> Result<(), String> {
         "loc" => loc::cmd_loc(args),
         "mods" => mods::cmd_mods(args),
         "platform" => platform::cmd_platform(),
+        "version" | "--version" | "-V" => {
+            println!("{}", crash::version_line());
+            Ok(())
+        }
+        "crash-test" => crash::cmd_crash_test(),
         "map" => cmd_map(args),
         "mission" => mission::cmd_mission(args),
         "map-roundtrip" => map_author::cmd_map_roundtrip(args),

@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>org.farust.Farust</id>
+  <name>FARust</name>
+  <summary>Deterministic RTS engine for Forged Alliance game data</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <!-- TODO before 1.0: set project_license once the project has a LICENSE (docs/RELEASE.md). -->
+  <description>
+    <p>
+      A clean-room engine that plays skirmishes, missions and lockstep multiplayer matches
+      with the data of an installed copy of Supreme Commander: Forged Alliance.
+      The original game is required and is only read, never modified.
+    </p>
+  </description>
+  <launchable type="desktop-id">org.farust.Farust.desktop</launchable>
+  <categories>
+    <category>Game</category>
+    <category>StrategyGame</category>
+  </categories>
+  <content_rating type="oars-1.1">
+    <content_attribute id="violence-fantasy">moderate</content_attribute>
+    <content_attribute id="social-chat">intense</content_attribute>
+  </content_rating>
+  <releases>
+    <release version="1.0.0" date="2026-12-01" type="development"/>
+  </releases>
+</component>
