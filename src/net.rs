@@ -58,7 +58,9 @@ pub const TURN_TICKS: u64 = 3;
 pub const DEFAULT_INPUT_DELAY: u64 = 2;
 /// v3: menu-hosted lobbies greet with `Welcome` (`net_lobby.rs`); in-game turns carry [`NetControl`]s.
 /// v4 (Phase 24): handshake carries the enabled mods' identities.
-pub const PROTOCOL_VERSION: u32 = 4;
+/// v5 (Phase 28): wall sections are buildable and block pathing (older peers would reject
+/// wall `Build` commands and desync), so mixed v4/v5 games are refused at the handshake.
+pub const PROTOCOL_VERSION: u32 = 5;
 /// The host's army (star-topology relay); only it may change the game speed.
 pub const HOST_ARMY: ArmyId = 0;
 /// Sender id of host-generated control messages (`Dropped`).

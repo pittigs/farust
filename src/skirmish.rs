@@ -318,6 +318,8 @@ pub enum Role {
     MissileSilo,
     MissileDefense,
     Experimental,
+    /// Phase 28: wall section — an inert structure that blocks land/amphibious pathing.
+    Wall,
 }
 
 impl Role {
@@ -338,6 +340,7 @@ impl Role {
                 | Role::AntiAir
                 | Role::MissileSilo
                 | Role::MissileDefense
+                | Role::Wall
         )
     }
     pub fn is_factory(self) -> bool {
@@ -366,6 +369,7 @@ impl Role {
             Role::MissileSilo => 15,
             Role::MissileDefense => 16,
             Role::Experimental => 17,
+            Role::Wall => 18,
         }
     }
 }
@@ -475,6 +479,7 @@ fn default_strategic_icon(role: Role, tier: u8) -> &'static str {
         Role::Engineer => "icon_land1_engineer",
         Role::Experimental => "icon_experimental_generic",
         Role::Mobile => "icon_land1_directfire",
+        Role::Wall => "icon_structure_wall",
     }
 }
 
@@ -1762,6 +1767,8 @@ struct UnitSpatialSnap {
     radius: i64,
     speed: i64,
     is_struct: bool,
+    /// Phase 28: wall sections are only auto-targeted when nothing else is in range.
+    is_wall: bool,
     can_fire_aa: bool,
     can_fire_surface: bool,
     max_range: i64,
@@ -1964,6 +1971,13 @@ pub struct Skirmish {
     grid: Arc<PathGrid>,
     naval_grid: Arc<PathGrid>,
     amphib_grid: Arc<PathGrid>,
+    /// Phase 28: terrain-only land / amphibious grids; live walls are stamped on top of
+    /// these into `grid` / `amphib_grid` by [`Skirmish::sync_walls`].
+    base_grid: Arc<PathGrid>,
+    base_amphib: Arc<PathGrid>,
+    /// Phase 28: live wall sections per land-grid cell (row-major, `base_grid` layout).
+    wall_cells: Vec<u16>,
+    walls_dirty: bool,
     flow_cache: FlowFieldCache,
     spatial: Arc<SpatialGrid>,
     spatial_snap: Arc<Vec<UnitSpatialSnap>>,
@@ -2034,9 +2048,13 @@ impl Skirmish {
             units: BTreeMap::new(),
             wrecks: BTreeMap::new(),
             projectiles: BTreeMap::new(),
+            wall_cells: vec![0; (grid_arc.width as usize) * (grid_arc.height as usize)],
+            walls_dirty: false,
             grid: Arc::clone(&grid_arc),
             naval_grid: Arc::clone(&grid_arc),
-            amphib_grid: grid_arc,
+            amphib_grid: Arc::clone(&grid_arc),
+            base_grid: Arc::clone(&grid_arc),
+            base_amphib: grid_arc,
             flow_cache: FlowFieldCache::new(),
             spatial,
             spatial_snap: Arc::new(Vec::new()),
@@ -2143,9 +2161,104 @@ impl Skirmish {
     ) {
         self.naval_grid = Arc::new(naval_grid);
         self.amphib_grid = Arc::new(amphib_grid);
+        self.base_amphib = Arc::clone(&self.amphib_grid);
         self.hydro_claims = vec![None; hydro_points.len()];
         self.hydro_points = hydro_points;
         self.flow_cache.clear();
+        if self.wall_cells.iter().any(|&c| c > 0) {
+            // Re-stamp existing walls onto the new amphibious grid.
+            self.wall_cells.iter_mut().for_each(|c| *c = 0);
+            self.walls_dirty = true;
+            self.sync_walls();
+        }
+    }
+
+    /// Phase 28: grid cells covered by a square footprint of half-size `r` centred on `p`.
+    fn footprint_cells(grid: &PathGrid, p: (i64, i64), r: i64) -> impl Iterator<Item = (u32, u32)> {
+        let r = r.max(1);
+        let (x0, z0) = grid.world_to_cell(p.0 - r, p.1 - r);
+        let (x1, z1) = grid.world_to_cell(p.0 + r - 1, p.1 + r - 1);
+        (z0..=z1).flat_map(move |z| (x0..=x1).map(move |x| (x, z)))
+    }
+
+    /// Phase 28: whether a live wall section covers the grid cell containing `p`.
+    pub fn is_wall_cell(&self, p: (i64, i64)) -> bool {
+        let g = &self.base_grid;
+        if p.0 < 0 || p.1 < 0 {
+            return false;
+        }
+        let (cx, cz) = g.world_to_cell(p.0, p.1);
+        self.wall_cells
+            .get((cz as usize) * (g.width as usize) + cx as usize)
+            .is_some_and(|&c| c > 0)
+    }
+
+    /// Phase 28: number of grid cells currently blocked by walls.
+    pub fn wall_cell_count(&self) -> usize {
+        self.wall_cells.iter().filter(|&&c| c > 0).count()
+    }
+
+    fn stamp_walls(base: &PathGrid, cells: &[u16]) -> PathGrid {
+        let mut g = base.clone();
+        for (i, _) in cells.iter().enumerate().filter(|(_, c)| **c > 0) {
+            let w = g.width as usize;
+            g.set_blocked((i % w) as u32, (i / w) as u32, true);
+        }
+        g
+    }
+
+    /// Phase 28: re-derives the wall overlay from live `Role::Wall` units when a wall was
+    /// spawned or died. On change, the land / amphibious grids are re-stamped, flow fields
+    /// and cached paths are dropped (so movers re-route around the new layout), and ground
+    /// units standing on a freshly walled cell are pushed to the nearest open cell.
+    /// A no-op (no hash-visible side effects) when the wall layout is unchanged.
+    fn sync_walls(&mut self) {
+        if !self.walls_dirty {
+            return;
+        }
+        self.walls_dirty = false;
+        let mut cells = vec![0u16; self.wall_cells.len()];
+        let w = self.base_grid.width as usize;
+        for u in self.units.values().filter(|u| u.alive && u.role == Role::Wall) {
+            for (cx, cz) in Self::footprint_cells(&self.base_grid, (u.pos.x, u.pos.y), u.radius) {
+                let c = &mut cells[(cz as usize) * w + cx as usize];
+                *c = c.saturating_add(1);
+            }
+        }
+        if cells == self.wall_cells {
+            return;
+        }
+        let newly: Vec<bool> = cells.iter().zip(&self.wall_cells).map(|(&n, &o)| n > 0 && o == 0).collect();
+        self.wall_cells = cells;
+        self.grid = Arc::new(Self::stamp_walls(&self.base_grid, &self.wall_cells));
+        let same_dims = self.base_amphib.width == self.base_grid.width && self.base_amphib.height == self.base_grid.height;
+        self.amphib_grid = if same_dims {
+            Arc::new(Self::stamp_walls(&self.base_amphib, &self.wall_cells))
+        } else {
+            Arc::clone(&self.base_amphib)
+        };
+        self.flow_cache.clear();
+        let mut evict = Vec::new();
+        for u in self.units.values_mut() {
+            if u.domain == NavDomain::Air {
+                continue;
+            }
+            u.path.clear();
+            u.path_goal = None;
+            if u.alive && u.speed > 0 && u.carried_by.is_none() {
+                let (cx, cz) = self.base_grid.world_to_cell(u.pos.x, u.pos.y);
+                if newly[(cz as usize) * w + cx as usize] {
+                    evict.push(u.id);
+                }
+            }
+        }
+        for id in evict {
+            let p = self.units[&id].pos;
+            let np = self.walkable_near(id, (p.x, p.y));
+            let u = self.units.get_mut(&id).unwrap();
+            u.pos.x = np.0;
+            u.pos.y = np.1;
+        }
     }
 
     /// Attach or detach a persistent `WorkerPool` for batched A* pathfinding.
@@ -2598,18 +2711,21 @@ impl Skirmish {
         if check_grid.is_blocked(cx, cy) {
             return false;
         }
-        let margin = SCALE;
+        // Phase 28: wall sections may sit flush against each other and other structures.
+        let is_wall = t.role == Role::Wall;
+        let margin_with = |other_wall: bool| if is_wall || other_wall { 0 } else { SCALE };
         let overlaps_structure = self.units().any(|u| {
             u.role.is_structure() && {
-                let lim = (u.radius + r + margin) as i128;
+                let lim = (u.radius + r + margin_with(u.role == Role::Wall)) as i128;
                 dist_sq((u.pos.x, u.pos.y), (x, y)) < lim * lim
             }
         });
         let overlaps_site = self.units().any(|u| {
             u.build.as_ref().is_some_and(|j| {
                 u.role.is_builder() && {
-                    let other = self.catalog.get(&j.unit_type).map(|t| t.radius).unwrap_or(0);
-                    let lim = (other + r + margin) as i128;
+                    let other_t = self.catalog.get(&j.unit_type);
+                    let other = other_t.map(|t| t.radius).unwrap_or(0);
+                    let lim = (other + r + margin_with(other_t.is_some_and(|t| t.role == Role::Wall))) as i128;
                     dist_sq((j.x, j.y), (x, y)) < lim * lim
                 }
             })
@@ -3250,6 +3366,9 @@ impl Skirmish {
         let can_aa = weapons.iter().any(|w| w.anti_air);
         let can_surf = weapons.iter().any(|w| w.anti_surface);
         let shield_init = t.shield_max_hp;
+        if t.role == Role::Wall {
+            self.walls_dirty = true;
+        }
         self.units.insert(
             id,
             Unit {
@@ -3327,6 +3446,7 @@ impl Skirmish {
                 radius: u.radius,
                 speed: u.speed,
                 is_struct: u.role.is_structure(),
+                is_wall: u.role == Role::Wall,
                 can_fire_aa: u.can_fire_aa,
                 can_fire_surface: u.can_fire_surface,
                 max_range: u.max_range,
@@ -3406,7 +3526,7 @@ impl Skirmish {
             self.recompute_adjacency();
         }
         { let _p = scope("sim.economy"); self.step_income(); self.step_shields(); self.step_enhancements(); self.step_silos(); }
-        { let _p = scope("sim.construction"); self.step_construction(); }
+        { let _p = scope("sim.construction"); self.step_construction(); self.sync_walls(); }
         { let _p = scope("sim.spatial"); self.rebuild_spatial(); }
         { let _p = scope("sim.movement"); self.step_movement(); }
         { let _p = scope("sim.separation"); self.step_separation(); }
@@ -4298,6 +4418,7 @@ impl Skirmish {
         let lim = (radius as i128) * (radius as i128);
         let mut best_mobile: Option<(i128, UnitId)> = None;
         let mut best_struct: Option<(i128, UnitId)> = None;
+        let mut best_wall: Option<(i128, UnitId)> = None;
         spatial
             .for_each_enemy_in_radius(p.0, p.1, radius + 6 * SCALE, team, |idx| {
                 let u = &snap[idx as usize];
@@ -4312,7 +4433,9 @@ impl Skirmish {
                 if d > lim {
                     return;
                 }
-                let slot = if u.is_struct {
+                let slot = if u.is_wall {
+                    &mut best_wall
+                } else if u.is_struct {
                     &mut best_struct
                 } else {
                     &mut best_mobile
@@ -4321,7 +4444,7 @@ impl Skirmish {
                     *slot = Some((d, u.id));
                 }
             });
-        best_mobile.or(best_struct).map(|(_, id)| id)
+        best_mobile.or(best_struct).or(best_wall).map(|(_, id)| id)
     }
 
     /// Attack-move/patrol acquisition for every eligible mover, solved up front on the pool.
@@ -4539,10 +4662,15 @@ impl Skirmish {
         let pre_acquired = self.prefetch_attack_move_targets();
         let _pg = crate::profiler::scope("move.goals");
         for id in ids {
-            let Some((goal, _tol)) = self.pop_completed_and_goal(id, Some(&pre_acquired)) else {
+            let Some((mut goal, _tol)) = self.pop_completed_and_goal(id, Some(&pre_acquired)) else {
                 continue;
             };
             let domain = self.units[&id].domain;
+            // Phase 28: a goal inside a wall (e.g. attacking a wall section) is reached from
+            // the nearest open cell instead of walking straight through the wall line.
+            if domain != NavDomain::Air && self.is_wall_cell(goal) {
+                goal = self.walkable_near(id, goal);
+            }
             if domain != NavDomain::Air {
                 let gcell = self.domain_grid(domain).world_to_cell(goal.0, goal.1);
                 *group_counts.entry((domain, gcell.0, gcell.1)).or_insert(0) += 1;
@@ -4756,12 +4884,18 @@ impl Skirmish {
 
         let (max_x, max_y) = self.size;
         for (id, dx, dy) in deltas {
-            if (dx != 0 || dy != 0)
-                && let Some(u) = self.units.get_mut(&id)
-            {
-                u.pos.x = (u.pos.x + dx).clamp(0, max_x);
-                u.pos.y = (u.pos.y + dy).clamp(0, max_y);
+            if dx == 0 && dy == 0 {
+                continue;
             }
+            let Some(u) = self.units.get(&id) else { continue };
+            let np = ((u.pos.x + dx).clamp(0, max_x), (u.pos.y + dy).clamp(0, max_y));
+            // Phase 28: crowd pushes never shove ground units into a wall cell.
+            if u.domain != NavDomain::Air && self.is_wall_cell(np) && !self.is_wall_cell((u.pos.x, u.pos.y)) {
+                continue;
+            }
+            let u = self.units.get_mut(&id).unwrap();
+            u.pos.x = np.0;
+            u.pos.y = np.1;
         }
     }
 
@@ -5118,6 +5252,7 @@ impl Skirmish {
         let p = (u.x, u.y);
         let mut best_mobile: Option<(i128, UnitId)> = None;
         let mut best_struct: Option<(i128, UnitId)> = None;
+        let mut best_wall: Option<(i128, UnitId)> = None;
         grid.for_each_enemy_in_radius(p.0, p.1, lim_r + 6 * SCALE, u.team, |oidx| {
             let o = &snap[oidx as usize];
             if o.team == u.team || o.hidden_from(u.army) {
@@ -5132,7 +5267,9 @@ impl Skirmish {
             if d > lim_sq || d > reach * reach {
                 return;
             }
-            let slot = if o.is_struct {
+            let slot = if o.is_wall {
+                &mut best_wall
+            } else if o.is_struct {
                 &mut best_struct
             } else {
                 &mut best_mobile
@@ -5141,7 +5278,7 @@ impl Skirmish {
                 *slot = Some((d, o.id));
             }
         });
-        (u.id, best_mobile.or(best_struct).map(|(_, id)| id))
+        (u.id, best_mobile.or(best_struct).or(best_wall).map(|(_, id)| id))
     }
 
     fn step_weapons(&mut self) {
@@ -5563,6 +5700,7 @@ impl Skirmish {
                 let holds_on = self.units.values().any(|u| {
                     u.alive
                         && u.army == army
+                        && u.role != Role::Wall
                         && (victory == VictoryCondition::Annihilation || u.role.is_structure() || u.role.is_builder())
                 });
                 if !holds_on {
@@ -5593,6 +5731,9 @@ impl Skirmish {
             {
                 self.hydro_claims[i] = None;
             }
+        }
+        if self.units.values().any(|u| !u.alive && u.role == Role::Wall) {
+            self.walls_dirty = true;
         }
         self.units.retain(|_, u| u.alive);
         let live: Vec<UnitId> = self.units.keys().copied().collect();
@@ -5953,6 +6094,132 @@ pub(crate) mod tests {
         let f = w.unit(fighter).unwrap();
         assert!(f.pos.x > 160 * SCALE, "air unit flies cleanly over blocked wall");
         assert_eq!(f.altitude, 16 * SCALE);
+    }
+
+    /// Phase 28 fixture: open 256 m map (64×64 cells of 4 m) with a 1 m wall type `RWALL`.
+    fn wall_world() -> Skirmish {
+        let mut cat = test_catalog();
+        let mut wall = ty("RWALL", Role::Wall, 4000, 0, 0, 0);
+        wall.radius = SCALE / 2;
+        cat.types.insert("RWALL".into(), wall);
+        Skirmish::new(
+            cat,
+            PathGrid::new(64, 64, 4 * SCALE),
+            (256 * SCALE, 256 * SCALE),
+            vec![],
+            &[
+                ArmySetup { name: "A".into(), faction: 0, start: (20 * SCALE, 20 * SCALE), team: 0 },
+                ArmySetup { name: "B".into(), faction: 1, start: (236 * SCALE, 20 * SCALE), team: 1 },
+            ],
+            11,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn wall_line_blocks_land_pathing_until_destroyed() {
+        let mut w = wall_world();
+        // A 1 m-spaced wall line along x = 128 m, from z = 40 m to z = 200 m.
+        let mut walls = Vec::new();
+        for z in 40..200 {
+            walls.push(w.spawn_unit(0, "RWALL", (128 * SCALE + SCALE / 2, z * SCALE + SCALE / 2)).unwrap());
+        }
+        let tank = w.spawn_unit(0, "RT", (100 * SCALE, 120 * SCALE)).unwrap();
+        w.step();
+        assert_eq!(w.wall_cell_count(), 40, "160 sections stamp a 40-cell line");
+        assert!(w.grid().is_blocked(32, 30));
+        w.issue(0, Command::Move { units: vec![tank], x: 156 * SCALE, y: 120 * SCALE, queue: false });
+        let mut max_detour = 0i64;
+        for _ in 0..1200 {
+            w.step();
+            let u = w.unit(tank).unwrap();
+            assert!(!w.is_wall_cell((u.pos.x, u.pos.y)), "tank entered a wall cell at {:?}", u.pos);
+            max_detour = max_detour.max((u.pos.y - 120 * SCALE).abs());
+            if u.orders.is_empty() {
+                break;
+            }
+        }
+        let u = w.unit(tank).unwrap();
+        assert_eq!((u.pos.x, u.pos.y), (156 * SCALE, 120 * SCALE), "tank reaches the far side");
+        assert!(max_detour >= 70 * SCALE, "tank walks around the wall end (detour {max_detour})");
+
+        // Destroying the walls re-opens the grid and frees the cells.
+        for id in &walls {
+            w.units.get_mut(id).unwrap().hp = 0;
+        }
+        w.step();
+        w.step();
+        assert_eq!(w.wall_cell_count(), 0);
+        assert!(!w.grid().is_blocked(32, 30));
+        w.issue(0, Command::Move { units: vec![tank], x: 100 * SCALE, y: 120 * SCALE, queue: false });
+        for _ in 0..200 {
+            w.step();
+            let u = w.unit(tank).unwrap();
+            assert!((u.pos.y - 120 * SCALE).abs() <= 2 * SCALE, "straight line once walls are gone");
+        }
+    }
+
+    #[test]
+    fn wall_spawned_on_unit_evicts_it_and_large_groups_reroute() {
+        let mut w = wall_world();
+        let tank = w.spawn_unit(0, "RT", (50 * SCALE + 200, 50 * SCALE + 200)).unwrap();
+        w.spawn_unit(0, "RWALL", (50 * SCALE + SCALE / 2, 50 * SCALE + SCALE / 2)).unwrap();
+        w.step();
+        let u = w.unit(tank).unwrap();
+        assert!(!w.is_wall_cell((u.pos.x, u.pos.y)), "tank pushed off the new wall cell");
+
+        // A flow-field group (>= 6 movers) also respects a wall line built mid-route.
+        let mut w = wall_world();
+        let group: Vec<UnitId> = (0..8)
+            .map(|i| w.spawn_unit(0, "RT", (90 * SCALE + i * 2 * SCALE, 120 * SCALE)).unwrap())
+            .collect();
+        w.issue(0, Command::Move { units: group.clone(), x: 170 * SCALE, y: 120 * SCALE, queue: false });
+        w.run(5);
+        for z in 60..180 {
+            w.spawn_unit(0, "RWALL", (130 * SCALE + SCALE / 2, z * SCALE + SCALE / 2)).unwrap();
+        }
+        for _ in 0..1500 {
+            w.step();
+            for id in &group {
+                let u = w.unit(*id).unwrap();
+                assert!(!w.is_wall_cell((u.pos.x, u.pos.y)), "group member {id} crossed the wall");
+            }
+        }
+        assert!(group.iter().all(|id| w.unit(*id).unwrap().pos.x > 150 * SCALE), "group gets around the wall");
+    }
+
+    #[test]
+    fn walls_are_last_resort_targets_and_do_not_hold_off_defeat() {
+        let mut w = wall_world();
+        let pd = w.spawn_unit(0, "RPD", (120 * SCALE, 150 * SCALE)).unwrap();
+        let wall = w.spawn_unit(1, "RWALL", (124 * SCALE + SCALE / 2, 150 * SCALE + SCALE / 2)).unwrap();
+        let tank = w.spawn_unit(1, "BT", (140 * SCALE, 150 * SCALE)).unwrap();
+        w.run(20);
+        assert!(w.unit(tank).is_none_or(|t| t.hp < t.max_hp), "PD shoots the tank first");
+        assert_eq!(w.unit(wall).unwrap().hp, w.unit(wall).unwrap().max_hp, "wall ignored while a tank is in range");
+        let _ = pd;
+
+        // Annihilation: an army that only has walls left is defeated.
+        let mut w = wall_world().with_options(GameOptions { victory: VictoryCondition::Annihilation, ..GameOptions::default() });
+        w.spawn_unit(1, "RWALL", (200 * SCALE + SCALE / 2, 200 * SCALE + SCALE / 2)).unwrap();
+        let blue_acu = w.commander_of(1).unwrap().id;
+        w.units.get_mut(&blue_acu).unwrap().hp = 0;
+        w.run(3);
+        assert!(w.army(1).unwrap().defeated, "walls alone do not keep an army alive");
+        assert_eq!(w.result(), Some(GameResult::Victory(0)));
+    }
+
+    #[test]
+    fn walls_place_flush_but_other_structures_keep_their_margin() {
+        let mut w = wall_world();
+        w.spawn_unit(0, "RWALL", (100 * SCALE + SCALE / 2, 100 * SCALE + SCALE / 2)).unwrap();
+        assert!(w.site_is_free("RWALL", 101 * SCALE + SCALE / 2, 100 * SCALE + SCALE / 2), "adjacent wall section");
+        assert!(!w.site_is_free("RWALL", 100 * SCALE + SCALE / 2, 100 * SCALE + SCALE / 2), "same spot");
+        // PD (3 m half-size) may touch a wall but not overlap it.
+        assert!(w.site_is_free("RPD", 104 * SCALE + SCALE / 2, 100 * SCALE + SCALE / 2));
+        assert!(!w.site_is_free("RPD", 103 * SCALE, 100 * SCALE + SCALE / 2));
+        w.spawn_unit(0, "RPD", (60 * SCALE, 60 * SCALE)).unwrap();
+        assert!(!w.site_is_free("RPD", 66 * SCALE + SCALE / 2, 60 * SCALE), "PDs keep the 1 m margin");
     }
 
     #[test]

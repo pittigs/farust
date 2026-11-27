@@ -28,6 +28,8 @@ use crate::skirmish::{ArmyId, Command, FORMATION_SPACING, IntelVisibility, Role,
 pub const DOUBLE_TAP_SECS: f64 = 0.35;
 /// Upper bound on structures laid by one construction drag.
 pub const MAX_DRAG_LINE_SITES: usize = 24;
+/// Phase 28: upper bound on wall sections laid by one construction drag.
+pub const MAX_DRAG_WALL_SITES: usize = 96;
 /// Number of control group slots (`0..=9`).
 pub const CONTROL_GROUP_SLOTS: usize = 10;
 
@@ -270,6 +272,24 @@ pub fn drag_line_sites(a: (i64, i64), b: (i64, i64), radius: i64) -> Vec<(i64, i
             let t = i as f64 * step;
             (round_i64(a.0 as f64 + ux * t), round_i64(a.1 as f64 + uy * t))
         })
+        .collect()
+}
+
+/// Phase 28: wall sections along a drag line from `a` to `b`. Sites snap to the wall's own
+/// footprint grid (`2 * radius`, normally the 1 m build grid) and step one footprint at a time
+/// along the dominant axis, so the result is a gap-free 8-connected chain without duplicates.
+pub fn drag_wall_sites(a: (i64, i64), b: (i64, i64), radius: i64) -> Vec<(i64, i64)> {
+    let cell = (2 * radius).max(1);
+    let snap = |v: i64| v.div_euclid(cell);
+    let (ax, ay) = (snap(a.0), snap(a.1));
+    let (bx, by) = (snap(b.0), snap(b.1));
+    let (dx, dy) = (bx - ax, by - ay);
+    let n = dx.abs().max(dy.abs()).min(MAX_DRAG_WALL_SITES as i64 - 1);
+    let span = dx.abs().max(dy.abs()).max(1);
+    let centre = |c: i64| c * cell + cell / 2;
+    let step = |d: i64, i: i64| (2 * d * i + span).div_euclid(2 * span);
+    (0..=n)
+        .map(|i| (centre(ax + step(dx, i)), centre(ay + step(dy, i))))
         .collect()
 }
 
@@ -687,7 +707,12 @@ impl PlaySession {
         if matches!(t.role, Role::Extractor | Role::Hydro) {
             return Vec::new();
         }
-        drag_line_sites(a, b, t.radius)
+        let sites = if t.role == Role::Wall {
+            drag_wall_sites(a, b, t.radius)
+        } else {
+            drag_line_sites(a, b, t.radius)
+        };
+        sites
             .into_iter()
             .map(|p| (p, self.world.site_is_free(btype, p.0, p.1)))
             .collect()
@@ -1331,6 +1356,26 @@ mod tests {
         let d = drag_line_sites((0, 0), (20 * SCALE, 20 * SCALE), r);
         let dist = (((d[1].0 - d[0].0) as f64).powi(2) + ((d[1].1 - d[0].1) as f64).powi(2)).sqrt();
         assert!((dist - step as f64).abs() < 2.0);
+    }
+
+    #[test]
+    fn wall_drag_sites_form_a_flush_chain() {
+        let r = SCALE / 2;
+        // Straight 10 m line: 11 sections, 1 m apart, snapped to cell centres.
+        let line = drag_wall_sites((200, 300), (10 * SCALE + 200, 300), r);
+        assert_eq!(line.len(), 11);
+        assert_eq!(line[0], (500, 500));
+        assert!(line.windows(2).all(|p| p[1].0 - p[0].0 == SCALE && p[1].1 == p[0].1));
+        // Shallow diagonal: every step moves one cell along x and at most one along z.
+        let diag = drag_wall_sites((0, 0), (-9 * SCALE, 4 * SCALE), r);
+        assert_eq!(diag.len(), 10);
+        assert_eq!(*diag.last().unwrap(), (-9 * SCALE + 500, 4 * SCALE + 500));
+        for p in diag.windows(2) {
+            assert_eq!(p[1].0 - p[0].0, -SCALE);
+            assert!((0..=SCALE).contains(&(p[1].1 - p[0].1)));
+        }
+        assert_eq!(drag_wall_sites((0, 0), (500 * SCALE, 0), r).len(), MAX_DRAG_WALL_SITES);
+        assert_eq!(drag_wall_sites((10, 10), (20, 20), r), vec![(500, 500)]);
     }
 
     #[test]

@@ -208,10 +208,242 @@ Game dir (default, override with `FA_PATH`):
 - Sim determinism hashes unchanged (`35db8f2bd7a6faf2` / `192e89b083b978cb`);
   252/252 tests pass (including 30/30 on `net_lobby` loopback test). Done.
 
-### Known gaps / next candidates
-- 18 roster units excluded for unmodelled mechanics (walls, air staging,
-  engineering stations, orbital satellite, crab eggs — see `farust roster`).
-- FAF network/replay compatibility (see Risks).
+### Phase 26 — Online play with friends (done)
+- **Invite codes & zero-dependency TCP rendezvous + relay** (`src/rendezvous.rs`):
+  unambiguous 8-character codes (`XXXX-XXXX`), `RendezvousServer` (`farust rendezvous [BIND_ADDR]`),
+  host control channel expiring codes automatically on match start or close, and
+  client resolution trying direct addresses first before falling back cleanly to a
+  server-spliced TCP reverse tunnel when behind NAT.
+- **Lockstep & lobby integration** (`src/net_lobby.rs`, `src/net.rs`, `src/menu.rs`, `src/main.rs`):
+  `farust host --code` / `farust join --code` / `--relay` / `+connect_lobby <CODE>`,
+  Multiplayer Hub (`HOST WITH INVITE CODE` toggle, rendezvous server field, `HOST ADDRESS OR INVITE CODE`),
+  and Multiplayer Lobby `[COPY CODE]` header + `[R]`/`[D]` relay status indicators.
+
+### Phase 27 — Old-school FA layout & visual theme (done)
+- **Persistent theme toggle** (`src/settings.rs`, `src/menu.rs`): `ui_theme=modern|classic`
+  (plus `FARUST_UI_THEME` env override and Options `UI Theme` selector; defaults to `modern`).
+- **Authentic Classic FA HUD & Faction Skins** (`src/ui_kit.rs`, `src/hud.rs`):
+  4 faction palettes (`UEF` steel-blue, `Aeon` emerald/gold, `Cybran` crimson/charcoal, `Seraphim`
+  obsidian/amber), classic FA `.scd` menu backdrops (`background-colossus_bmp.dds` /
+  `background-paint01_bmp.dds`), top-left split Mass/Energy console + open top-center sky +
+  top-right tactical clock pod, bottom-left minimap + `[Orders | Command Card | Queue | Enhancements]`
+  bottom console, and bottom-right unit portrait/vitals panel.
+
+## Roadmap — Phases 28–57 (planned)
+
+Ordered so each arc builds on the previous one. Every sim-touching phase
+bumps `SIM_VERSION`, re-baselines golden hashes deliberately, and keeps
+`1t == Nt` parity; render/audio phases must leave sim hashes unchanged.
+
+### Arc A — Close the simulation gaps (28–35)
+
+### Phase 28 — Walls & structure footprints (done)
+- `Role::Wall` (`src/skirmish.rs`, `src/roster.rs`): blueprint `WALL` structures are
+  playable for all four factions (roster excluded 18 → 14; `roster --verify SCMP_009`
+  builds 356/356). Walls sit flush against each other and other structures.
+- Wall overlay: live wall footprints are stamped onto terrain-only base grids
+  (`sync_walls`, land + amphibious; naval and air unaffected). On change, flow fields
+  and cached paths are dropped so movers re-route, ground units on a new wall cell are
+  pushed to the nearest open cell, separation never shoves units into walls, and goals
+  inside a wall are approached from the nearest open cell. Dead walls re-open the cells.
+- Walls are last-resort auto-targets and do not keep an army alive under
+  supremacy/annihilation (FA's `ALLUNITS - WALL`).
+- LMB-drag wall lines (`controls::drag_wall_sites`): snapped to the 1 m grid, gap-free
+  8-connected chains, up to 96 sections per drag.
+- Lockstep protocol v5 (older peers would reject wall `Build` commands).
+- Exit: walled-corridor detour, mid-route re-route for flow-field groups, eviction,
+  target priority, defeat and placement tests pass (263/263). Games without walls are
+  bit-identical: `sim-run` `35db8f2bd7a6faf2`, `skirmish SCMP_001` `192e89b083b978cb`,
+  `bench-scale --units 2048` `69975978586139a0` (`1t == 20t`). Done.
+- Deferred: reclaiming live walls (moves to Phase 34 with prop reclaim) and
+  structures other than walls blocking pathing (moves to Phase 29).
+
+### Phase 29 — Ballistics & line of fire (planned)
+- Every structure footprint becomes a pathing blocker (reusing the Phase 28 wall
+  overlay), with factory roll-off points so produced units exit cleanly.
+- Replace direct-fire hitscan with simulated integer projectiles
+  (`MuzzleVelocity`, `FiringTolerance`, turret yaw/pitch limits from the
+  blueprint), terrain and wall occlusion, misses vs. moving targets, beam
+  weapons kept as instant but terrain-checked.
+- Exit: shots fired over a ridge hit the ridge; `bench-scale --units 2048`
+  stays ≥ 180 ticks/s.
+
+### Phase 30 — Air fuel, staging & repair (planned)
+- `Fuel` / `FuelUseTime` / `FuelRechargeRate`, out-of-fuel speed penalty,
+  air staging docking slots, refuel + repair, auto-return-to-staging toggle.
+- Exit: the 4 air staging blueprints are playable; fighters on patrol return
+  to staging when fuel runs low.
+
+### Phase 31 — Engineering stations & drones (planned)
+- Kennel / Hive builder stations, UEF pod drones and Cybran build drones as
+  sim units owned by a parent, upgrades T2→T3, auto-assist radius.
+- Exit: the 5 engineering-station blueprints leave the exclusion list.
+
+### Phase 32 — Mobile factories, carriers & eggs (planned)
+- Production from mobile units: Fatboy, Atlantis, Czar, Tempest, Megalith
+  crab eggs (`XRL0002–0005`) with hatching, internal storage and launch.
+- Exit: all four crab eggs are buildable; the exclusion list is down to the
+  orbital satellite.
+
+### Phase 33 — Experimental & special-ability completeness (planned)
+- Novax orbital satellite (`XEB2402`), resource generators (Paragon),
+  teleport, artillery experimentals, Yolona Oss, Salvation, Eye of Rhianne /
+  Soothsayer intel. New `farust roster --abilities` audit lists every
+  blueprint ability flag and whether it is modelled.
+- Exit: `farust roster` reports 0 excluded units; the ability audit has no
+  unmodelled flags on playable units.
+
+### Phase 34 — Map prop reclaim & destructible trees (planned)
+- Reclaiming live units (walls first, carried over from Phase 28).
+- `.scmap` prop reclaim values (mass/energy/time), tree falling and burning
+  (render), reclaim beams on props, area reclaim covering props, AI
+  reclaim fields.
+- Exit: an engineer area-reclaim on a forest on `SCMP_009` yields mass, and
+  replays of it hash identically.
+
+### Phase 35 — Fire states & unit behaviours (planned)
+- Hold fire / return fire / ground fire (`Command::SetFireState`,
+  `Command::AttackGround`), guard, pause construction, target priorities from
+  blueprint `TargetPriorities`, air dive/hover, dock and stop-and-shoot.
+- Exit: a replay covering every new command round-trips through replay v5.
+
+### Arc B — Controls & UX (36–39)
+
+### Phase 36 — Build templates, hotbuild & waypoint editing (planned)
+- Saved build templates (base layouts), hotbuild key cycling, dragging queued
+  waypoints, ferry routes for transports, shift-queue visual editing.
+- Exit: a template placed in-game builds identically in a replay.
+
+### Phase 37 — Localization & tooltips (planned)
+- Parse FA `loc` string tables, unit/enhancement descriptions and help text,
+  tooltips on every command-card button, language selection in Options.
+- Exit: switching to German shows localized unit names and tooltips.
+
+### Phase 38 — Observer & caster tools (planned)
+- Live spectator slots in the lobby, observer HUD (all-army economy, army
+  value graph, APM), follow-unit camera, picture-in-picture minimap.
+- Exit: a 2-player match with 1 live observer completes without desync.
+
+### Phase 39 — Onboarding & accessibility (planned)
+- Interactive tutorial scenario, colour-blind team palettes, UI scale,
+  rebindable mouse buttons, subtitle captions for voice cues.
+- Exit: the tutorial completes start to finish from `farust menu`.
+
+### Arc C — Visual & audio fidelity III (40–43)
+
+### Phase 40 — FA effect blueprints (planned)
+- Parse emitter/beam/trail blueprints from `effects.scd` and drive the
+  `vfx.rs` GPU particle pool with them (muzzle flashes, impacts, explosions,
+  shield hits, build beams). Render-only.
+- Exit: weapon effects use FA emitters for ≥ 90% of weapons; sim hash
+  unchanged.
+
+### Phase 41 — Dynamic decals & terrain marks (planned)
+- Runtime scorch, crater and tread decals with a bounded decal atlas and
+  fade-out, footprint decals under structures, wreck shadows.
+- Exit: a 20-minute battle stays under a fixed decal budget without frame
+  time regressions.
+
+### Phase 42 — HDR, bloom & glow (planned)
+- HDR render target, FA-like tonemap and bloom from `.scmap` lighting values,
+  emissive/glow maps on units, MSAA/FXAA option, gamma setting.
+- Exit: `bench-render` at 8k units keeps frame p50 within +15% of Phase 25.
+
+### Phase 43 — Announcer, ambience & adaptive music (planned)
+- Announcer callouts (mass storage full, base under attack, experimental
+  detected), map ambient loops, music intensity driven by combat volume.
+- Exit: `farust audio coverage` reports every announcer event mapped.
+
+### Arc D — Netcode & online (44–47)
+
+### Phase 44 — UDP lockstep & NAT hole punching (planned)
+- UDP transport with sequence/ack/resend, NAT hole punching through the
+  Phase 26 rendezvous server, TCP relay kept as fallback, adaptive input
+  delay from measured RTT.
+- Exit: a match survives 5% simulated packet loss with no desync; the netem
+  loopback test passes.
+
+### Phase 45 — Reconnect & late join (planned)
+- Rejoin after a drop: savegame snapshot transfer + catch-up re-sim, AI
+  hands control back, observers can join a live match.
+- Exit: killing and restarting one peer mid-match ends on the same final
+  hash as an uninterrupted run.
+
+### Phase 46 — Steamworks lobby & friend invites (planned, blocked)
+- Formerly the Phase 28 candidate. Needs a dedicated Steam Direct App ID;
+  `CreateLobby` stores the Phase 26 invite code in lobby metadata,
+  `GameLobbyJoinRequested_t` and `+connect_lobby` join directly. Behind a
+  `steam` cargo feature so the default build stays dependency-light.
+- Exit: a friend invite from the Steam overlay lands in the FARust lobby.
+
+### Phase 47 — Replay vault & sharing (planned)
+- Replay index with metadata, thumbnails and search, optional upload to and
+  download from the rendezvous server, event bookmarks (kills, experimentals).
+- Exit: a replay uploaded by one client plays back verified on another.
+
+### Arc E — Content & authoring (48–51)
+
+### Phase 48 — Scenario scripting engine (planned)
+- Rust-native, data-driven mission scripts (triggers, objectives, timers,
+  spawn waves, dialogue, scripted camera). Not Moho Lua; deterministic and
+  included in replays.
+- Exit: a custom "defend the base for 10 minutes" mission is playable and
+  replayable.
+
+### Phase 49 — First campaign operation (planned)
+- Reimplement one FA campaign operation (e.g. `X1CA_001`) on the scripting
+  engine using the user's map data, voice cues and objectives.
+- Exit: the operation is beatable start to finish with all primary objectives.
+
+### Phase 50 — Map authoring tools (planned)
+- `.scmap` v2.60 writer, in-game marker/prop editor, heightmap brush,
+  round-trip `parse → write → parse` identity on all 61 stock maps.
+- Exit: a map edited in FARust loads and plays as a skirmish map.
+
+### Phase 51 — Mod manager & lobby mod sync (planned)
+- In-game mod manager (enable/disable, conflicts), automatic mod transfer
+  between lobby peers with hash verification, mod-defined weapons/abilities
+  as data.
+- Exit: a client missing the host's mod receives it and the match starts.
+
+### Arc F — AI III (52–53)
+
+### Phase 52 — Strategic AI planner (planned)
+- Map-aware expansion and mex control, multi-front army management,
+  experimental timing, naval/air dominance goals, built on `ai_threat.rs`.
+  Elo ladder added to `farust ai-arena`.
+- Exit: the new `hard` AI beats Phase 19 `hard` in ≥ 70% of 100 arena games.
+
+### Phase 53 — AI personalities & co-op commands (planned)
+- Personalities (turtle, rush, air, tech), allied AI that responds to pings
+  ("attack here", "send engineers"), difficulty-scaled cheats as an option.
+- Exit: pinged requests are acted on within 30 s in co-op matches.
+
+### Arc G — Scale, platforms & release (54–57)
+
+### Phase 54 — Parallel sim II, 10k units (planned)
+- Deterministic parallel phases for projectiles, damage application and
+  economy via per-thread buffers merged in canonical order.
+- Exit: `bench-scale --units 10000` ≥ 60 ticks/s with exact `1t == Nt` hash.
+
+### Phase 55 — GPU-driven rendering (planned)
+- Compute-shader culling + LOD selection, indirect draws, GPU instance
+  buffers updated incrementally.
+- Exit: 10k units at ≥ 60 fps at strategic zoom on the reference machine.
+
+### Phase 56 — Windows & macOS ports (planned)
+- Native audio output (WASAPI / CoreAudio) behind the existing silent
+  fallback, FA install discovery per OS, cross-architecture determinism test
+  (x86_64 vs aarch64 hashes must match).
+- Exit: a Linux–Windows lockstep match ends on an identical hash.
+
+### Phase 57 — CI, packaging & 1.0 (planned)
+- CI running tests, fuzzers and golden-hash suites; crash reporter with
+  desync dumps; AppImage/Flatpak + Windows zip; 1.0 release checklist.
+- Exit: tagged 1.0 builds produced by CI for all three platforms.
+
+### Other known gaps
+- FAF network/replay compatibility stays out of scope (see Risks).
 
 ## Risks / non-goals
 

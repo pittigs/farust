@@ -151,7 +151,7 @@ pub fn infer_role(b: &BpInfo) -> Result<Role, &'static str> {
         return Err("neither mobile nor structure");
     }
     if h("WALL") {
-        return Err("walls (pathing blockers)");
+        return Ok(Role::Wall);
     }
     if h("AIRSTAGINGPLATFORM") {
         return Err("air staging / refuelling");
@@ -251,7 +251,7 @@ impl BuildGroup {
         match role {
             Role::Factory | Role::AirFactory | Role::NavalFactory => BuildGroup::Factory,
             Role::Extractor | Role::Generator | Role::Hydro | Role::MassStorage | Role::EnergyStorage => BuildGroup::Economy,
-            Role::PointDefense | Role::AntiAir | Role::Shield | Role::MissileDefense => BuildGroup::Defense,
+            Role::PointDefense | Role::AntiAir | Role::Shield | Role::MissileDefense | Role::Wall => BuildGroup::Defense,
             Role::Radar => BuildGroup::Intel,
             Role::MissileSilo => BuildGroup::Strategic,
             Role::Experimental => BuildGroup::Experimental,
@@ -1005,7 +1005,7 @@ mod tests {
         }
         // Air unit is listed by the land factory in FA but needs an air factory here.
         assert!(matches!(st("TSA0101"), Status::Excluded(_)));
-        assert_eq!(st("TSB5101"), Status::Excluded("walls (pathing blockers)"));
+        assert_eq!(st("TSB5101"), Status::Playable, "Phase 28: walls are playable");
         assert!(matches!(st("TSL0999"), Status::Excluded(m) if m.contains("mobile factory")));
         assert_eq!(st("TSC0001"), Status::NotInTree);
 
@@ -1018,9 +1018,9 @@ mod tests {
         assert!(acu.iter().any(|o| o.id == "TSB2301" && o.tier == 2 && o.group == BuildGroup::Defense));
         assert!(acu.iter().any(|o| o.id == "TSL0401" && o.group == BuildGroup::Experimental));
         assert!(!r.can("TSL0105", "TSB2301", BuildKind::Build));
-        assert_eq!(r.playable[0].len(), 9);
+        assert_eq!(r.playable[0].len(), 10);
         let cov = coverage(&r);
-        assert_eq!(cov[0][0], (5, 8));
+        assert_eq!(cov[0][0], (6, 8));
         assert_eq!(cov[0][3], (1, 1));
     }
 

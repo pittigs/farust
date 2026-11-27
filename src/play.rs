@@ -296,9 +296,10 @@ impl UnitMeshCache {
             Role::Radar,
             Role::Engineer,
             Role::Mobile,
+            Role::Wall,
         ]
         .into_iter()
-        .map(|r| (r, procedural_role_mesh(r, if r == Role::Factory { 5.0 } else { 1.8 })))
+        .map(|r| (r, procedural_role_mesh(r, match r { Role::Factory => 5.0, Role::Wall => 1.0, _ => 1.8 })))
         .collect();
 
         Self { by_type, fallback, living }
@@ -395,6 +396,9 @@ fn procedural_role_mesh(role: Role, span: f32) -> NormalizedMesh {
         Role::Engineer => {
             append_local_box(&mut positions, &mut normals, &mut uvs, &mut indices, [0.0, 0.0, 0.0], [half * 0.75, span * 0.32, half * 0.85]);
             append_local_box(&mut positions, &mut normals, &mut uvs, &mut indices, [0.0, span * 0.32, half * 0.3], [half * 0.35, span * 0.35, half * 0.35]);
+        }
+        Role::Wall => {
+            append_local_box(&mut positions, &mut normals, &mut uvs, &mut indices, [0.0, 0.0, 0.0], [half, span * 0.9, half]);
         }
         Role::Mobile | Role::Experimental => {
             append_local_box(&mut positions, &mut normals, &mut uvs, &mut indices, [0.0, 0.0, 0.0], [half * 0.75, span * 0.35, half]);
