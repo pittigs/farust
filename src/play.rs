@@ -24,7 +24,7 @@ use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 use crate::camera::OrbitCamera;
-use crate::dds_decode::{RgbaImage, decode_dds_rgba8};
+use crate::dds_decode::{RgbaImage, SpecGlowMap, decode_dds_rgba8};
 use crate::hud::{self, HudAction, HudLayout};
 use crate::replay::Replay;
 use crate::scd;
@@ -37,7 +37,7 @@ use crate::skirmish::{
     UnitOrder,
 };
 use crate::skirmish_ai::ScriptedAi;
-use crate::viewer::{self, DEPTH_FORMAT, GpuMeshTemplate, GpuSceneResources, GpuUnitInstance, MSAA_SAMPLES};
+use crate::viewer::{self, GpuMeshTemplate, GpuSceneResources, GpuUnitInstance};
 
 // ---------------------------------------------------------------------------
 // Terrain sampling & mouse-ray picking
@@ -187,6 +187,7 @@ pub struct NormalizedMesh {
     pub uvs: Vec<[f32; 2]>,
     pub indices: Vec<u32>,
     pub albedo: Option<RgbaImage>,
+    pub spec_glow: Option<SpecGlowMap>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -257,15 +258,14 @@ impl UnitMeshCache {
                             && let Ok(scm) = ScmMesh::parse(bytes)
                             && let Some(mut norm) = normalize_scm(&scm, *target_span)
                         {
+                            let spec = files
+                                .get(&format!("units/{l}/{l}_specteam.dds"))
+                                .and_then(|b| crate::dds_decode::decode_dds_rgba8(b).ok());
+                            norm.spec_glow = spec.as_ref().map(SpecGlowMap::from_spec_team);
                             norm.albedo = files
                                 .get(&format!("units/{l}/{l}_albedo.dds"))
                                 .and_then(|b| crate::dds_decode::decode_dds_rgba8(b).ok())
-                                .map(|albedo| {
-                                    let spec = files
-                                        .get(&format!("units/{l}/{l}_specteam.dds"))
-                                        .and_then(|b| crate::dds_decode::decode_dds_rgba8(b).ok());
-                                    scene::pack_albedo_team_mask(albedo, spec.as_ref())
-                                });
+                                .map(|albedo| scene::pack_albedo_team_mask(albedo, spec.as_ref()));
                             loaded = Some(norm);
                             break;
                         }
@@ -357,6 +357,7 @@ fn normalize_scm(scm: &ScmMesh, target_span: f32) -> Option<NormalizedMesh> {
         uvs,
         indices,
         albedo: None,
+        spec_glow: None,
     })
 }
 
@@ -416,6 +417,7 @@ fn procedural_role_mesh(role: Role, span: f32) -> NormalizedMesh {
         uvs,
         indices,
         albedo: None,
+        spec_glow: None,
     }
 }
 
@@ -2066,6 +2068,7 @@ pub(crate) fn build_terrain_loaded_scene(
         overlay_vertices,
         overlay_indices,
         albedo,
+        spec_glow: None,
         initial_camera: camera,
         clear_color: [
             f64::from(fc[0].clamp(0.05, 1.0)),
@@ -2109,6 +2112,7 @@ pub(crate) fn upload_unit_templates(
             &verts,
             &nm.indices,
             nm.albedo.as_ref(),
+            nm.spec_glow.as_ref(),
             id,
         );
         templates.insert(id.clone(), tpl);
@@ -2289,7 +2293,9 @@ pub fn render_skirmish_snapshot(
     .map_err(|e| format!("failed to create GPU device: {e}"))?;
 
     let format = wgpu::TextureFormat::Rgba8UnormSrgb;
-    let mut resources = GpuSceneResources::new(&device, &queue, &scene, format, MSAA_SAMPLES, &camera);
+    let msaa4_ok = viewer::hdr_msaa4_supported(&adapter);
+    let mut resources =
+        GpuSceneResources::new(&device, &queue, &scene, format, width, height, msaa4_ok, &camera);
     if let Some(ref mm) = minimap_img {
         resources.set_minimap_texture(&device, &queue, mm);
     }
@@ -2308,15 +2314,6 @@ pub fn render_skirmish_snapshot(
         height,
     );
 
-    let (_msaa_tex, msaa_view) = viewer::create_attachment(
-        &device,
-        width,
-        height,
-        format,
-        MSAA_SAMPLES,
-        wgpu::TextureUsages::RENDER_ATTACHMENT,
-        "play_snap_msaa",
-    );
     let (resolve_tex, resolve_view) = viewer::create_attachment(
         &device,
         width,
@@ -2325,15 +2322,6 @@ pub fn render_skirmish_snapshot(
         1,
         wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
         "play_snap_resolve",
-    );
-    let (_depth_tex, depth_view) = viewer::create_attachment(
-        &device,
-        width,
-        height,
-        DEPTH_FORMAT,
-        MSAA_SAMPLES,
-        wgpu::TextureUsages::RENDER_ATTACHMENT,
-        "play_snap_depth",
     );
 
     let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
@@ -2349,13 +2337,7 @@ pub fn render_skirmish_snapshot(
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("play_snap_encoder"),
     });
-    resources.encode_draw(
-        &mut encoder,
-        &msaa_view,
-        Some(&resolve_view),
-        &depth_view,
-        scene.clear_color,
-    );
+    resources.encode_draw(&mut encoder, &resolve_view, scene.clear_color);
     encoder.copy_texture_to_buffer(
         wgpu::TexelCopyTextureInfo {
             texture: &resolve_tex,
@@ -2448,8 +2430,6 @@ struct PlayGpuState {
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
-    msaa_view: wgpu::TextureView,
-    depth_view: wgpu::TextureView,
     resources: GpuSceneResources,
     templates: BTreeMap<String, GpuMeshTemplate>,
     camera: OrbitCamera,
@@ -2616,8 +2596,17 @@ impl PlayApp {
         let clear_color = terrain_scene.clear_color;
         let prop_cpu = terrain_scene.prop_batches.clone();
 
-        let mut resources =
-            GpuSceneResources::new(&device, &queue, &terrain_scene, format, MSAA_SAMPLES, &camera);
+        let msaa4_ok = viewer::hdr_msaa4_supported(&adapter);
+        let mut resources = GpuSceneResources::new(
+            &device,
+            &queue,
+            &terrain_scene,
+            format,
+            width,
+            height,
+            msaa4_ok,
+            &camera,
+        );
         resources.enable_gpu_timer(&device, &queue);
         if let Some(ref mm) = minimap_img {
             resources.set_minimap_texture(&device, &queue, mm);
@@ -2643,33 +2632,12 @@ impl PlayApp {
             height,
         );
 
-        let (_msaa_tex, msaa_view) = viewer::create_attachment(
-            &device,
-            width,
-            height,
-            format,
-            MSAA_SAMPLES,
-            wgpu::TextureUsages::RENDER_ATTACHMENT,
-            "play_win_msaa",
-        );
-        let (_depth_tex, depth_view) = viewer::create_attachment(
-            &device,
-            width,
-            height,
-            DEPTH_FORMAT,
-            MSAA_SAMPLES,
-            wgpu::TextureUsages::RENDER_ATTACHMENT,
-            "play_win_depth",
-        );
-
         Ok(PlayGpuState {
             window,
             surface,
             device,
             queue,
             config,
-            msaa_view,
-            depth_view,
             resources,
             templates,
             camera,
@@ -3011,30 +2979,12 @@ impl ApplicationHandler for PlayApp {
                     st.config.width = new_size.width;
                     st.config.height = new_size.height;
                     st.surface.configure(&st.device, &st.config);
-                    let (_, msaa_view) = viewer::create_attachment(
-                        &st.device,
-                        new_size.width,
-                        new_size.height,
-                        st.config.format,
-                        MSAA_SAMPLES,
-                        wgpu::TextureUsages::RENDER_ATTACHMENT,
-                        "play_win_msaa",
-                    );
-                    let (_, depth_view) = viewer::create_attachment(
-                        &st.device,
-                        new_size.width,
-                        new_size.height,
-                        DEPTH_FORMAT,
-                        MSAA_SAMPLES,
-                        wgpu::TextureUsages::RENDER_ATTACHMENT,
-                        "play_win_depth",
-                    );
-                    st.msaa_view = msaa_view;
-                    st.depth_view = depth_view;
+                    st.resources.resize(&st.device, new_size.width, new_size.height);
                     st.camera.set_aspect(new_size.width, new_size.height);
-                    // Window re-config: apply the active shadow quality live.
+                    // Window re-config: apply active shadow & HDR post settings live.
                     st.resources
                         .set_shadow_quality(&st.device, crate::settings::shadow_quality());
+                    st.resources.sync_render_settings(&st.device, &st.queue);
                     st.resources.update_camera(&st.queue, &st.camera);
                     st.dirty_dynamic = true;
                     st.window.request_redraw();
@@ -3938,13 +3888,7 @@ impl ApplicationHandler for PlayApp {
                         });
                 {
                     let _p = crate::profiler::scope("render.encode_submit");
-                    st.resources.encode_draw(
-                        &mut encoder,
-                        &st.msaa_view,
-                        Some(&resolve_view),
-                        &st.depth_view,
-                        st.clear_color,
-                    );
+                    st.resources.encode_draw(&mut encoder, &resolve_view, st.clear_color);
                     st.queue.submit(Some(encoder.finish()));
                     st.resources.gpu_timer_after_submit();
                 }

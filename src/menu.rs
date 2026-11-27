@@ -198,6 +198,9 @@ enum Action {
     ToggleFullscreen,
     ToggleVsync,
     CycleShadow,
+    ToggleBloom,
+    CycleAa,
+    SliderGamma(u16),
     CycleUiTheme,
     CycleLanguage,
     SliderMaster(u8),
@@ -1126,31 +1129,36 @@ impl MenuState {
         let rx = c.x + col_w + 24.0;
         let lw = 150.0;
         let ctrl_w = (col_w - lw - 28.0).max(160.0);
-        let mut y = c.y + 54.0;
-        let step = 42.0;
+        let mut y = c.y + 52.0;
+        let step = ((c.h - 68.0) / 12.0).clamp(32.0, 42.0);
+        let row_h = (step - 10.0).clamp(24.0, 30.0);
         let mut out = vec![
-            (Rect::new(lx + 14.0 + lw, y, ctrl_w, 30.0), Action::CycleResolution),
-            (Rect::new(lx + 14.0 + lw, y + step, ctrl_w, 30.0), Action::ToggleFullscreen),
-            (Rect::new(lx + 14.0 + lw, y + step * 2.0, ctrl_w, 30.0), Action::ToggleVsync),
-            (Rect::new(lx + 14.0 + lw, y + step * 3.0, ctrl_w, 30.0), Action::CycleShadow),
-            (Rect::new(lx + 14.0 + lw, y + step * 4.0, ctrl_w, 30.0), Action::SliderMaster(self.draft.master_volume)),
-            (Rect::new(lx + 14.0 + lw, y + step * 5.0, ctrl_w, 30.0), Action::SliderMusic(self.draft.music_volume)),
-            (Rect::new(lx + 14.0 + lw, y + step * 6.0, ctrl_w, 30.0), Action::SliderSfx(self.draft.sfx_volume)),
-            (Rect::new(lx + 14.0 + lw, y + step * 7.0, ctrl_w, 30.0), Action::CycleUiTheme),
-            (Rect::new(lx + 14.0 + lw, y + step * 8.0, ctrl_w, 30.0), Action::CycleLanguage),
+            (Rect::new(lx + 14.0 + lw, y, ctrl_w, row_h), Action::CycleResolution),
+            (Rect::new(lx + 14.0 + lw, y + step, ctrl_w, row_h), Action::ToggleFullscreen),
+            (Rect::new(lx + 14.0 + lw, y + step * 2.0, ctrl_w, row_h), Action::ToggleVsync),
+            (Rect::new(lx + 14.0 + lw, y + step * 3.0, ctrl_w, row_h), Action::CycleShadow),
+            (Rect::new(lx + 14.0 + lw, y + step * 4.0, ctrl_w, row_h), Action::ToggleBloom),
+            (Rect::new(lx + 14.0 + lw, y + step * 5.0, ctrl_w, row_h), Action::CycleAa),
+            (Rect::new(lx + 14.0 + lw, y + step * 6.0, ctrl_w, row_h), Action::SliderGamma(self.draft.gamma_x100)),
+            (Rect::new(lx + 14.0 + lw, y + step * 7.0, ctrl_w, row_h), Action::SliderMaster(self.draft.master_volume)),
+            (Rect::new(lx + 14.0 + lw, y + step * 8.0, ctrl_w, row_h), Action::SliderMusic(self.draft.music_volume)),
+            (Rect::new(lx + 14.0 + lw, y + step * 9.0, ctrl_w, row_h), Action::SliderSfx(self.draft.sfx_volume)),
+            (Rect::new(lx + 14.0 + lw, y + step * 10.0, ctrl_w, row_h), Action::CycleUiTheme),
+            (Rect::new(lx + 14.0 + lw, y + step * 11.0, ctrl_w, row_h), Action::CycleLanguage),
         ];
         let _ = &mut y;
+        let rstep = 42.0;
         let rctrl_w = (col_w - lw - 28.0).max(160.0);
         out.extend([
             (Rect::new(rx + 14.0 + lw, y, rctrl_w, 30.0), Action::Focus(FocusField::OptPlayerName)),
-            (Rect::new(rx + 14.0 + lw, y + step, rctrl_w, 30.0), Action::CycleDefaultFaction),
-            (Rect::new(rx + 14.0 + lw, y + step * 2.0, rctrl_w, 30.0), Action::ToggleEdgeScroll),
-            (Rect::new(rx + 14.0 + lw, y + step * 3.0, rctrl_w, 30.0), Action::Focus(FocusField::OptLastHost)),
-            (Rect::new(rx + 14.0 + lw, y + step * 4.0, rctrl_w, 30.0), Action::ToggleCardHotkeys),
-            (Rect::new(rx + 14.0 + lw, y + step * 5.0, rctrl_w, 30.0), Action::Go(ScreenId::Keys)),
-            (Rect::new(rx + 14.0 + lw, y + step * 6.0, rctrl_w, 30.0), Action::ToggleColorblind),
-            (Rect::new(rx + 14.0 + lw, y + step * 7.0, rctrl_w, 30.0), Action::ToggleMouseSwap),
-            (Rect::new(rx + 14.0 + lw, y + step * 8.0, rctrl_w, 30.0), Action::ToggleSubtitles),
+            (Rect::new(rx + 14.0 + lw, y + rstep, rctrl_w, 30.0), Action::CycleDefaultFaction),
+            (Rect::new(rx + 14.0 + lw, y + rstep * 2.0, rctrl_w, 30.0), Action::ToggleEdgeScroll),
+            (Rect::new(rx + 14.0 + lw, y + rstep * 3.0, rctrl_w, 30.0), Action::Focus(FocusField::OptLastHost)),
+            (Rect::new(rx + 14.0 + lw, y + rstep * 4.0, rctrl_w, 30.0), Action::ToggleCardHotkeys),
+            (Rect::new(rx + 14.0 + lw, y + rstep * 5.0, rctrl_w, 30.0), Action::Go(ScreenId::Keys)),
+            (Rect::new(rx + 14.0 + lw, y + rstep * 6.0, rctrl_w, 30.0), Action::ToggleColorblind),
+            (Rect::new(rx + 14.0 + lw, y + rstep * 7.0, rctrl_w, 30.0), Action::ToggleMouseSwap),
+            (Rect::new(rx + 14.0 + lw, y + rstep * 8.0, rctrl_w, 30.0), Action::ToggleSubtitles),
             (f.footer_button(0, false, 160.0), Action::BackToMain),
             (f.footer_button(1, false, 160.0), Action::ResetOptions),
             (f.footer_button(0, true, 220.0), Action::SaveOptions),
@@ -1195,6 +1203,20 @@ impl MenuState {
                 Action::CycleShadow => {
                     label(&tr("ui.shadows", "Shadows"));
                     c.cycler(r, self.draft.shadow_quality.key(), st);
+                }
+                Action::ToggleBloom => {
+                    label(&tr("ui.bloom", "Bloom"));
+                    c.checkbox(r, self.draft.bloom, st);
+                }
+                Action::CycleAa => {
+                    label(&tr("ui.aa", "Anti-Aliasing"));
+                    c.cycler(r, self.draft.aa.label(), st);
+                }
+                Action::SliderGamma(_) => {
+                    label(&tr("ui.gamma", "Gamma"));
+                    let frac = (self.draft.gamma_x100.saturating_sub(settings::GAMMA_MIN_X100)) as f32
+                        / (settings::GAMMA_MAX_X100 - settings::GAMMA_MIN_X100) as f32;
+                    c.slider(r, frac.clamp(0.0, 1.0), &settings::format_gamma_x100(self.draft.gamma_x100), st);
                 }
                 Action::CycleUiTheme => {
                     label(&tr("ui.ui_theme", "UI Theme"));
@@ -1491,6 +1513,17 @@ impl MenuState {
                 let i = ShadowQuality::ALL.iter().position(|q| *q == self.draft.shadow_quality).unwrap_or(0);
                 self.draft.shadow_quality = ShadowQuality::ALL[(i + 1) % ShadowQuality::ALL.len()];
             }
+            Action::ToggleBloom => self.draft.bloom = !self.draft.bloom,
+            Action::CycleAa => {
+                let i = settings::AaMode::ALL.iter().position(|m| *m == self.draft.aa).unwrap_or(0);
+                self.draft.aa = settings::AaMode::ALL[(i + 1) % settings::AaMode::ALL.len()];
+            }
+            Action::SliderGamma(_) => {
+                let track_w = (rect.w - 56.0).max(20.0);
+                let frac = ((px - rect.x) / track_w).clamp(0.0, 1.0);
+                let span = (settings::GAMMA_MAX_X100 - settings::GAMMA_MIN_X100) as f32;
+                self.draft.gamma_x100 = settings::GAMMA_MIN_X100 + (frac * span).round() as u16;
+            }
             Action::CycleUiTheme => {
                 let i = UiTheme::ALL.iter().position(|t| *t == self.draft.ui_theme).unwrap_or(0);
                 self.draft.ui_theme = UiTheme::ALL[(i + 1) % UiTheme::ALL.len()];
@@ -1561,15 +1594,22 @@ impl MenuState {
             return false;
         }
         for (r, act) in self.options_widgets(w, h) {
-            if matches!(act, Action::SliderMaster(_) | Action::SliderMusic(_) | Action::SliderSfx(_))
-                && r.contains(px, py)
+            if matches!(
+                act,
+                Action::SliderMaster(_) | Action::SliderMusic(_) | Action::SliderSfx(_) | Action::SliderGamma(_)
+            ) && r.contains(px, py)
             {
                 let track_w = (r.w - 56.0).max(20.0);
-                let val = (((px - r.x) / track_w).clamp(0.0, 1.0) * 100.0).round() as u8;
+                let frac = ((px - r.x) / track_w).clamp(0.0, 1.0);
+                let val = (frac * 100.0).round() as u8;
                 match act {
                     Action::SliderMaster(_) => self.draft.master_volume = val,
                     Action::SliderMusic(_) => self.draft.music_volume = val,
                     Action::SliderSfx(_) => self.draft.sfx_volume = val,
+                    Action::SliderGamma(_) => {
+                        let span = (settings::GAMMA_MAX_X100 - settings::GAMMA_MIN_X100) as f32;
+                        self.draft.gamma_x100 = settings::GAMMA_MIN_X100 + (frac * span).round() as u16;
+                    }
                     _ => {}
                 }
                 return true;
