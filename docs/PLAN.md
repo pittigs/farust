@@ -339,13 +339,26 @@ bumps `SIM_VERSION`, re-baselines golden hashes deliberately, and keeps
 - Not modelled: carrier aircraft storage (`StorageSlots`) and launch, AI use of mobile
   factories / Megalith eggs.
 
-### Phase 33 — Experimental & special-ability completeness (planned)
-- Novax orbital satellite (`XEB2402`), resource generators (Paragon),
-  teleport, artillery experimentals, Yolona Oss, Salvation, Eye of Rhianne /
-  Soothsayer intel. New `farust roster --abilities` audit lists every
-  blueprint ability flag and whether it is modelled.
-- Exit: `farust roster` reports 0 excluded units; the ability audit has no
-  unmodelled flags on playable units.
+### Phase 33 — Experimental & special-ability completeness (done)
+- Novax: `Role::Orbital` launch centres (`ORBITALSYSTEM`) put their faction's `SATELLITE`
+  blueprint (`XEA0002`) into orbit on completion; `UNTARGETABLE` units are never acquired
+  or attackable; the satellite falls with its centre. Roster excluded 1 → 0: all 374 units
+  of the FA skirmish tree are playable (`roster --verify SCMP_009` 370/370).
+- EMP stun: weapon `Buffs` STUN entries, unit `Buffs.Stun` (on EMP impact / on death) and
+  silo missiles (Cybran nukes) stun enemy surface mobiles — no moving, firing or building.
+- Death weapons (`DeathWeapon`/`DeathImpact`/`Death`/`FireOnDeath`, incl. ACU and Paragon
+  death nukes) damage every surface unit in radius, friend or foe; chain deaths resolve the
+  next tick. Kamikaze weapons (Fire Beetle) detonate once and kill their carrier (they
+  previously re-fired a 4,500-damage shot every reload).
+- `farust roster --abilities [--missing]`: every `Display.Abilities` entry of the playable
+  roster with unit count, status and data coverage: 26 modelled (data 39/39 death, 5/5
+  stun, 2/2 kamikaze, 8/8 factory, 6/6 staging), 7 partial (sonar, torpedo, depth charge,
+  submersible, carrier storage, massive, missile deflection), 3 not modelled (anti-torpedo,
+  deploy, sacrifice), 1 n/a (not capturable). Rules v6.
+- Exit: EMP stun, friend-and-foe death blast, single kamikaze detonation and untargetable
+  satellite tests pass (313/313); `bench-scale --units 2048` 173 / 317 ticks/s, exact
+  `1t == 20t`; 12-game `ai-arena` all decisive. Done — the "no unmodelled flags" goal is
+  not met: the 3 not-modelled and 7 partial abilities above remain.
 
 ### Phase 34 — Map prop reclaim & destructible trees (planned)
 - Reclaiming live units (walls first, carried over from Phase 28).

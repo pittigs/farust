@@ -271,6 +271,16 @@ pub struct UnitTypeExt {
     pub mobile_factory: bool,
     /// Phase 32: non-engineer that places structures (Megalith laying eggs).
     pub mobile_builder: bool,
+    /// Phase 33: death weapon (`DeathWeapon` / `DeathImpact` / `WeaponCategory = 'Death'`):
+    /// damage and radius dealt to every unit around the wreck ("Volatile").
+    pub death_damage: i64,
+    pub death_radius: i64,
+    /// Phase 33: `Buffs.Stun` — (ticks, radius, on EMP impact, on death).
+    pub stun: Option<(u32, i64, bool, bool)>,
+    /// Phase 33: `UNTARGETABLE` category (orbital satellites).
+    pub untargetable: bool,
+    /// Phase 33: satellite an orbital launch centre keeps in orbit (resolved by the catalog).
+    pub satellite: Option<String>,
 }
 
 /// Phase 30: air staging platform data (`Transport.DockingSlots`, `AI.Refueling*`,
@@ -358,6 +368,8 @@ pub enum Role {
     /// Phase 31: engineering station (UEF Kennel, Cybran Hive) — automatically assists and
     /// repairs allied work in its radius, itself or through its pod drones.
     EngStation,
+    /// Phase 33: orbital launch centre (Novax) — keeps its satellite in orbit.
+    Orbital,
 }
 
 impl Role {
@@ -381,6 +393,7 @@ impl Role {
                 | Role::Wall
                 | Role::AirStaging
                 | Role::EngStation
+                | Role::Orbital
         )
     }
     pub fn is_factory(self) -> bool {
@@ -412,6 +425,7 @@ impl Role {
             Role::Wall => 18,
             Role::AirStaging => 19,
             Role::EngStation => 20,
+            Role::Orbital => 21,
         }
     }
 }
@@ -443,7 +457,30 @@ pub struct WeaponType {
     pub beam: bool,
     /// Phase 29: aim ahead of moving targets (`LeadTarget`).
     pub lead_target: bool,
+    /// Phase 33: `DamageType = 'EMP'` — applies the unit's `Buffs.Stun` on impact.
+    pub emp: bool,
+    /// Phase 33: `WeaponCategory = 'Kamikaze'` — detonates the unit on firing.
+    pub kamikaze: bool,
+    /// Phase 33: weapon `Buffs` STUN applied on impact (ticks, radius).
+    pub stun: Option<(u32, i64)>,
 }
+
+/// Phase 33: the first `BuffType = 'STUN'` entry of a weapon's `Buffs` list that applies
+/// on impact, as (ticks, radius milli).
+fn weapon_stun(w: &Value) -> Option<(u32, i64)> {
+    w.get("Buffs")?.table_list().into_iter().find_map(|b| {
+        let on_impact = b.get("Add").and_then(|a| a.get_bool("OnImpact")).unwrap_or(true);
+        (b.get_str("BuffType") == Some("STUN") && on_impact).then(|| {
+            let ticks = (b.get_f64("Duration").unwrap_or(0.0).max(0.0) * TICK_HZ as f64).round() as u32;
+            let radius = (b.get_f64("Radius").unwrap_or(0.0).max(0.0) * SCALE as f64).round() as i64;
+            (ticks, radius)
+        })
+    }).filter(|s| s.0 > 0)
+}
+
+/// Phase 33: a death effect to resolve after cleanup: (army, position, death damage, death
+/// radius, on-death stun).
+type DeathFx = (ArmyId, (i64, i64), i64, i64, Option<(u32, i64)>);
 
 /// Phase 29: spatial reach (beyond half a shell's per-tick segment) searched for units the
 /// shell passes through; hit boxes wider than this are only hit near their centre line.
@@ -456,8 +493,9 @@ pub const LOF_CLEARANCE: i64 = SCALE / 4;
 /// under different rules (1 = Phases ≤ 28; 2 = Phase 29 ballistics, turrets and structure
 /// footprints blocking pathing).
 /// 3 = Phase 30 air fuel & staging; 4 = Phase 31 engineering stations & pod drones;
-/// 5 = Phase 32 mobile factories, mobile staging & hatching eggs.
-pub const RULES_VERSION: u32 = 5;
+/// 5 = Phase 32 mobile factories, mobile staging & hatching eggs; 6 = Phase 33 Novax
+/// satellite, EMP stun, death explosions & kamikaze weapons.
+pub const RULES_VERSION: u32 = 6;
 
 /// Phase 29: milliradians per degree, scaled by 1000 (17.453 mrad / deg).
 const MRAD_PER_DEG_MILLI: i64 = 17_453;
@@ -500,6 +538,8 @@ pub struct UnitType {
     pub missile_damage: i64,
     pub missile_splash: i64,
     pub missile_range: i64,
+    /// Phase 33: stun carried by this silo's missiles (Cybran nukes).
+    pub missile_stun: Option<(u32, i64)>,
     pub intercept_radius: i64,
     /// Footprint half-size (milli) and render size (milli).
     pub radius: i64,
@@ -549,6 +589,7 @@ fn default_strategic_icon(role: Role, tier: u8) -> &'static str {
         Role::Wall => "icon_structure_wall",
         Role::AirStaging => "icon_structure2_air",
         Role::EngStation => "icon_structure2_engineer",
+        Role::Orbital => "icon_experimental_generic",
     }
 }
 
@@ -613,6 +654,7 @@ impl UnitType {
             .unwrap_or_default();
 
         let mut missile_damage = 0i64;
+        let mut missile_stun: Option<(u32, i64)> = None;
         let mut missile_splash = 0i64;
         let mut missile_range = 0i64;
         let mut intercept_radius = 0i64;
@@ -631,6 +673,7 @@ impl UnitType {
                     && (label.contains("Missile") || has_cat("SILO"));
 
                 if is_nuke || is_tac_missile {
+                    missile_stun = missile_stun.or(weapon_stun(t));
                     let md = t.get_f64("Damage").unwrap_or(0.0).max(nuke_dmg).max(if is_nuke { 70_000.0 } else { 6_000.0 });
                     let mr = t.get_f64("NukeInnerRingRadius").or_else(|| t.get_f64("DamageRadius")).unwrap_or(if is_nuke { 25.0 } else { 4.0 });
                     missile_damage = q(md);
@@ -699,6 +742,9 @@ impl UnitType {
                     || t.get_bool("ContinuousBeam").unwrap_or(false)
                     || muzzle_velocity <= 0;
                 let lead_target = t.get_bool("LeadTarget").unwrap_or(true);
+                let emp = t.get_str("DamageType") == Some("EMP");
+                let stun = weapon_stun(t);
+                let kamikaze = t.get_str("WeaponCategory") == Some("Kamikaze");
                 Some(WeaponType {
                     label,
                     damage: q(d),
@@ -712,8 +758,11 @@ impl UnitType {
                     turret_pitch_bone,
                     turret_yaw_speed,
                     firing_tolerance,
-                    beam,
+                    beam: beam && !kamikaze,
                     lead_target,
+                    emp,
+                    kamikaze,
+                    stun,
                 })
             })
             .collect();
@@ -864,6 +913,7 @@ impl UnitType {
             missile_damage,
             missile_splash,
             missile_range,
+            missile_stun,
             intercept_radius,
             radius: q(half).max(SCALE / 4),
             size: [q(size_x), q(size_y), q(size_z)],
@@ -947,6 +997,33 @@ impl UnitTypeExt {
                     .round() as i64;
             }
         }
+        for w in raw_weapons {
+            let label = w.get_str("Label").unwrap_or("");
+            if label == "DeathWeapon"
+                || label == "DeathImpact"
+                || w.get_str("WeaponCategory") == Some("Death")
+                || w.get_bool("FireOnDeath").unwrap_or(false)
+            {
+                let d = w.get_f64("Damage").unwrap_or(0.0).max(w.get_f64("NukeInnerRingDamage").unwrap_or(0.0));
+                let r = w.get_f64("DamageRadius").unwrap_or(0.0).max(w.get_f64("NukeInnerRingRadius").unwrap_or(0.0));
+                if d > 0.0 && r > 0.0 && q(d) > out.death_damage {
+                    out.death_damage = q(d);
+                    out.death_radius = q(r);
+                }
+            }
+        }
+        if let Some(st) = root.get("Buffs").and_then(|b| b.get("Stun"))
+            && st.get_str("BuffType") == Some("STUN")
+        {
+            let add = st.get("Add");
+            let flag = |k: &str| add.and_then(|a| a.get_bool(k)).unwrap_or(false);
+            let ticks = (st.get_f64("Duration").unwrap_or(0.0).max(0.0) * TICK_HZ as f64).round() as u32;
+            let radius = q(st.get_f64("Radius").unwrap_or(0.0).max(0.0));
+            if ticks > 0 {
+                out.stun = Some((ticks, radius, flag("OnImpact"), flag("OnDeath")));
+            }
+        }
+        out.untargetable = has_cat("UNTARGETABLE");
         if role.is_structure() {
             out.hatch = root
                 .get("Economy")
@@ -1536,6 +1613,25 @@ impl Catalog {
                 self.types.insert(id.clone(), UnitType::from_blueprint(&id, role, root));
             }
         }
+        // Phase 33: an orbital launch centre's satellite is its faction's `SATELLITE` unit.
+        let launchers: Vec<String> = self.types.values().filter(|t| t.role == Role::Orbital).map(|t| t.id.clone()).collect();
+        for lid in launchers {
+            let fac = infos.get(&lid.to_ascii_uppercase()).and_then(roster::BpInfo::faction);
+            let sat = infos
+                .values()
+                .filter(|b| b.has("SATELLITE") && b.faction() == fac)
+                .map(|b| b.id.clone())
+                .min();
+            if let Some(sid) = sat
+                && let Some(root) = roots.get(&sid)
+            {
+                if !self.types.contains_key(&sid) {
+                    let role = roster::infer_role(&infos[&sid]).unwrap_or(Role::Mobile);
+                    self.types.insert(sid.clone(), UnitType::from_blueprint(&sid, role, root));
+                }
+                self.types.get_mut(&lid).unwrap().ext.satellite = Some(sid);
+            }
+        }
         // Phase 31: pod drones are spawned by their stations, never built: load them too.
         let pods: Vec<String> = self.types.values().flat_map(|t| t.ext.pods.iter().cloned()).collect();
         for id in pods {
@@ -1833,6 +1929,9 @@ pub struct WeaponState {
     pub firing_tolerance: i64,
     pub beam: bool,
     pub lead_target: bool,
+    pub emp: bool,
+    pub kamikaze: bool,
+    pub stun: Option<(u32, i64)>,
     /// Phase 29: current turret yaw (mrad, `atan2(dx, dz)` convention).
     pub yaw: i64,
 }
@@ -1852,6 +1951,9 @@ impl WeaponState {
             firing_tolerance: w.firing_tolerance,
             beam: w.beam,
             lead_target: w.lead_target,
+            emp: w.emp,
+            kamikaze: w.kamikaze,
+            stun: w.stun,
             yaw: 0,
         }
     }
@@ -1935,6 +2037,10 @@ pub struct Unit {
     pub drone_of: Option<UnitId>,
     /// Phase 31: (station) ticks spent rebuilding a missing pod drone.
     pub pod_timer: u32,
+    /// Phase 33: ticks left stunned (no moving, firing or building).
+    pub stunned: u32,
+    /// Phase 33: never auto- or manually targeted (orbital satellites).
+    pub untargetable: bool,
 }
 
 impl Unit {
@@ -1946,7 +2052,7 @@ impl Unit {
     /// Whether army `army` may target this unit (not aboard a transport, and not cloaked
     /// unless revealed by `army`'s or its allies' omni sensors).
     pub fn targetable_by(&self, army: ArmyId) -> bool {
-        self.carried_by.is_none() && (!self.cloaked || (self.omni_mask >> (army & 7)) & 1 == 1)
+        !self.untargetable && self.carried_by.is_none() && (!self.cloaked || (self.omni_mask >> (army & 7)) & 1 == 1)
     }
 }
 
@@ -1973,6 +2079,8 @@ struct UnitSpatialSnap {
     is_wall: bool,
     /// Phase 29: hit-box height (milli) for direct-fire collisions.
     height: i64,
+    /// Phase 33: orbital satellites are never acquired as targets.
+    untargetable: bool,
     can_fire_aa: bool,
     can_fire_surface: bool,
     max_range: i64,
@@ -1984,7 +2092,7 @@ struct UnitSpatialSnap {
 impl UnitSpatialSnap {
     /// Phase 18: cloak blocks automatic target acquisition unless omni reveals it.
     fn hidden_from(&self, army: ArmyId) -> bool {
-        self.cloaked && (self.omni_mask >> (army & 7)) & 1 == 0
+        self.untargetable || (self.cloaked && (self.omni_mask >> (army & 7)) & 1 == 0)
     }
 }
 
@@ -2013,6 +2121,9 @@ pub struct Projectile {
     pub z: i64,
     pub start_z: i64,
     pub target_z: i64,
+    /// Phase 33: EMP stun (ticks, radius) applied around the impact point.
+    pub stun_ticks: u32,
+    pub stun_radius: i64,
 }
 
 /// Visual/audio telemetry emitted during simulation ticks (excluded from `state_hash()`).
@@ -3734,11 +3845,17 @@ impl Skirmish {
                 auto_refuel: t.ext.fuel_ticks > 0,
                 drone_of: None,
                 pod_timer: 0,
+                stunned: 0,
+                untargetable: t.ext.untargetable,
             },
         );
         // Phase 31: a finished engineering station comes with its pod drones.
         for pod in spawn_pods {
             self.spawn_pod(id, &pod);
+        }
+        // Phase 33: an orbital launch centre puts its satellite into orbit.
+        if let Some(sat) = t.ext.satellite.clone() {
+            self.spawn_pod(id, &sat);
         }
         Some(id)
     }
@@ -3797,7 +3914,7 @@ impl Skirmish {
         let ids: Vec<UnitId> = self.units.keys().copied().collect();
         for &id in &ids {
             let Some(parent) = self.units[&id].drone_of else { continue };
-            if !self.units.get(&parent).is_some_and(|s| s.alive && s.role == Role::EngStation) {
+            if !self.units.get(&parent).is_some_and(|s| s.alive) {
                 self.units.get_mut(&id).unwrap().hp = 0;
             }
         }
@@ -3865,6 +3982,7 @@ impl Skirmish {
                 is_struct: u.role.is_structure(),
                 is_wall: u.role == Role::Wall,
                 height: u.height,
+                untargetable: u.untargetable,
                 can_fire_aa: u.can_fire_aa,
                 can_fire_surface: u.can_fire_surface,
                 max_range: u.max_range,
@@ -3939,6 +4057,9 @@ impl Skirmish {
         self.tick += 1;
         let _ = self.next_rng();
         { let _p = scope("sim.commands"); self.apply_commands(); }
+        for u in self.units.values_mut() {
+            u.stunned = u.stunned.saturating_sub(1);
+        }
         if self.tick == 1 || self.tick % 10 == 0 {
             let _p = scope("sim.adjacency");
             self.recompute_adjacency();
@@ -4460,7 +4581,7 @@ impl Skirmish {
                     ),
                     None => continue,
                 };
-            if !alive {
+            if !alive || self.units[&id].stunned > 0 {
                 continue;
             }
 
@@ -4475,6 +4596,7 @@ impl Skirmish {
                     let is_nuke = ut.is_some_and(|t| t.tier >= 3);
                     let dmg = ut.map(|t| t.missile_damage).unwrap_or(6_000 * SCALE);
                     let spl = ut.map(|t| t.missile_splash).unwrap_or(4 * SCALE);
+                    let missile_stun = ut.and_then(|t| t.missile_stun);
                     self.spawn_projectile_full(
                         army,
                         Vec2 { x: pos.0, y: pos.1 },
@@ -4487,6 +4609,12 @@ impl Skirmish {
                         is_nuke,
                         false,
                     );
+                    if let Some((ticks, radius)) = missile_stun
+                        && let Some(p) = self.projectiles.get_mut(&(self.next_projectile_id - 1))
+                    {
+                        p.stun_ticks = ticks;
+                        p.stun_radius = radius;
+                    }
                     self.emit_event(SimEvent::MissileLaunched {
                         pos: (pos.0, pos.1, 4 * SCALE),
                         is_nuke,
@@ -4936,7 +5064,7 @@ impl Skirmish {
             let Some(u) = self.units.get(&id) else {
                 return None;
             };
-            if !u.alive || u.speed <= 0 || u.carried_by.is_some() {
+            if !u.alive || u.speed <= 0 || u.carried_by.is_some() || u.stunned > 0 {
                 return None;
             }
             let Some(head) = u.orders.front().cloned() else {
@@ -5779,6 +5907,8 @@ impl Skirmish {
                 z: 0,
                 start_z: 0,
                 target_z: 0,
+                stun_ticks: 0,
+                stun_radius: 0,
             },
         );
     }
@@ -5941,7 +6071,7 @@ impl Skirmish {
         let ids: Vec<UnitId> = self.units.keys().copied().collect();
         for id in ids {
             let (army, pos, alt, role, explicit, overcharge, has_guns) = match self.units.get(&id) {
-                Some(u) if u.alive && u.carried_by.is_none() => (
+                Some(u) if u.alive && u.carried_by.is_none() && u.stunned == 0 => (
                     u.army,
                     (u.pos.x, u.pos.y),
                     u.altitude,
@@ -6066,6 +6196,18 @@ impl Skirmish {
                         heavy: w.splash_radius > 0 || w.damage >= 100 * SCALE,
                         anti_air: t_air,
                     });
+                    let stun = w.stun.or_else(|| {
+                        w.emp
+                            .then(|| self.catalog.get(&self.units[&id].type_id).and_then(|t| t.ext.stun).filter(|s| s.2).map(|s| (s.0, s.1)))
+                            .flatten()
+                    });
+                    if w.kamikaze {
+                        // Phase 33: detonate in place — damage enemies around, then die.
+                        self.splash_damage(army, pos, w.splash_radius.max(SCALE), w.damage, Some(id), false, &shield_ids);
+                        self.units.get_mut(&id).unwrap().hp = 0;
+                        self.emit_event(SimEvent::Explosion { pos: (pos.0, pos.1, SCALE / 2), radius: w.splash_radius.max(2 * SCALE), is_nuke: false });
+                        break;
+                    }
                     if w.splash_radius > 0 {
                         let spd = if w.muzzle_velocity > 0 {
                             w.muzzle_velocity
@@ -6084,6 +6226,12 @@ impl Skirmish {
                             false,
                             t_air,
                         );
+                        if let Some((ticks, radius)) = stun
+                            && let Some(p) = self.projectiles.get_mut(&(self.next_projectile_id - 1))
+                        {
+                            p.stun_ticks = ticks;
+                            p.stun_radius = radius;
+                        }
                     } else if t_air {
                         // Anti-air stays hitscan (FA AA is homing / flak).
                         self.apply_shield_and_damage(tid, w.damage, army, Some(id), &shield_ids);
@@ -6096,7 +6244,12 @@ impl Skirmish {
                             let aim = centre(tp);
                             match self.terrain.segment_hit(muzzle, aim, LOF_CLEARANCE, SCALE, tr + SCALE) {
                                 Some(_) => {}
-                                None => self.apply_shield_and_damage(tid, w.damage, army, Some(id), &shield_ids),
+                                None => {
+                                    self.apply_shield_and_damage(tid, w.damage, army, Some(id), &shield_ids);
+                                    if let Some((ticks, radius)) = stun {
+                                        self.apply_stun(army, tp, radius, ticks);
+                                    }
+                                }
                             }
                         } else {
                             // Projectile: lead the target by its last-tick velocity.
@@ -6109,6 +6262,12 @@ impl Skirmish {
                                 }
                             }
                             self.spawn_direct_projectile(army, id, muzzle, centre(aim2), spd, w.damage);
+                            if let Some((ticks, radius)) = stun
+                                && let Some(p) = self.projectiles.get_mut(&(self.next_projectile_id - 1))
+                            {
+                                p.stun_ticks = ticks;
+                                p.stun_radius = radius;
+                            }
                         }
                     }
                 }
@@ -6155,6 +6314,8 @@ impl Skirmish {
                 z: start.2,
                 start_z: start.2,
                 target_z: target.2,
+                stun_ticks: 0,
+                stun_radius: 0,
             },
         );
     }
@@ -6220,6 +6381,10 @@ impl Skirmish {
                 self.projectiles.remove(&pid);
                 let shooter = self.units.contains_key(&p.shooter).then_some(p.shooter);
                 self.apply_shield_and_damage(uid, p.damage, p.army, shooter, shield_ids);
+                if p.stun_ticks > 0 {
+                    let up = self.units.get(&uid).map_or((b.0, b.1), |u| (u.pos.x, u.pos.y));
+                    self.apply_stun(p.army, up, p.stun_radius, p.stun_ticks);
+                }
             }
             (_, Some(_)) => {
                 self.projectiles.remove(&pid);
@@ -6367,6 +6532,71 @@ impl Skirmish {
                     self.apply_shield_and_damage(uid, p.damage, p.army, None, &shield_ids);
                 }
             }
+            if p.stun_ticks > 0 {
+                self.apply_stun(p.army, (p.target.x, p.target.y), p.stun_radius, p.stun_ticks);
+            }
+        }
+    }
+
+    /// Phase 33: stuns every non-allied mobile surface unit within `radius` of `p` for
+    /// `ticks` (FA `Buffs.Stun`, `TargetAllow = 'MOBILE'`). Ascending id; never shortens.
+    fn apply_stun(&mut self, army: ArmyId, p: (i64, i64), radius: i64, ticks: u32) {
+        if ticks == 0 {
+            return;
+        }
+        let lim = (radius.max(SCALE) as i128).pow(2);
+        let ids: Vec<UnitId> = self
+            .units
+            .values()
+            .filter(|u| {
+                u.alive
+                    && u.speed > 0
+                    && !u.role.is_structure()
+                    && u.domain != NavDomain::Air
+                    && u.carried_by.is_none()
+                    && !self.are_allies(army, u.army)
+                    && dist_sq(p, (u.pos.x, u.pos.y)) <= lim
+            })
+            .map(|u| u.id)
+            .collect();
+        for id in ids {
+            let u = self.units.get_mut(&id).unwrap();
+            u.stunned = u.stunned.max(ticks);
+            u.path.clear();
+            u.path_goal = None;
+        }
+    }
+
+    /// Phase 33: area damage at `p` (`radius` + target hit box) to surface units — enemies of
+    /// `army` only, or everyone when `friendly_fire` (death explosions). Ascending id.
+    #[allow(clippy::too_many_arguments)]
+    fn splash_damage(
+        &mut self,
+        army: ArmyId,
+        p: (i64, i64),
+        radius: i64,
+        damage: i64,
+        attacker: Option<UnitId>,
+        friendly_fire: bool,
+        shield_ids: &[UnitId],
+    ) {
+        let hits: Vec<UnitId> = self
+            .units
+            .values()
+            .filter(|u| {
+                u.alive
+                    && u.hp > 0
+                    && Some(u.id) != attacker
+                    && u.carried_by.is_none()
+                    && !u.untargetable
+                    && u.altitude <= 4 * SCALE
+                    && (friendly_fire || !self.are_allies(army, u.army))
+                    && dist_sq(p, (u.pos.x, u.pos.y)) <= ((radius + u.radius) as i128).pow(2)
+            })
+            .map(|u| u.id)
+            .collect();
+        for uid in hits {
+            self.apply_shield_and_damage(uid, damage, army, attacker, shield_ids);
         }
     }
 
@@ -6390,6 +6620,7 @@ impl Skirmish {
             }
         }
         let mut dead_commanders = Vec::new();
+        let mut death_fx: Vec<DeathFx> = Vec::new();
         let ids: Vec<UnitId> = self.units.keys().copied().collect();
         for id in &ids {
             let (army, killer, killer_unit, role, pos, type_id, died) = {
@@ -6412,6 +6643,12 @@ impl Skirmish {
                 }
             };
             if died {
+                if let Some(t) = self.catalog.get(&type_id) {
+                    let stun = t.ext.stun.filter(|s| s.3).map(|s| (s.0, s.1));
+                    if t.ext.death_damage > 0 || stun.is_some() {
+                        death_fx.push((army, (pos.x, pos.y), t.ext.death_damage, t.ext.death_radius, stun));
+                    }
+                }
                 self.armies[army as usize].units_lost += 1;
                 if let Some(k) = killer {
                     self.armies[k as usize].kills += 1;
@@ -6465,6 +6702,20 @@ impl Skirmish {
                             },
                         );
                     }
+                }
+            }
+        }
+        // Phase 33: death weapons hit everything around the wreck (chain deaths resolve next
+        // tick); on-death EMP stuns enemy mobiles.
+        if !death_fx.is_empty() {
+            let shield_ids = self.shield_candidates();
+            for (army, p, dmg, radius, stun) in death_fx {
+                if dmg > 0 {
+                    self.splash_damage(army, p, radius, dmg, None, true, &shield_ids);
+                    self.emit_event(SimEvent::Explosion { pos: (p.0, p.1, SCALE), radius: radius.max(2 * SCALE), is_nuke: radius >= 15 * SCALE });
+                }
+                if let Some((ticks, r)) = stun {
+                    self.apply_stun(army, p, r, ticks);
                 }
             }
         }
@@ -6589,6 +6840,7 @@ impl Skirmish {
             m(&mut h, &[u8::from(u.auto_refuel)]);
             m(&mut h, &u.drone_of.unwrap_or(0).to_le_bytes());
             m(&mut h, &u.pod_timer.to_le_bytes());
+            m(&mut h, &u.stunned.to_le_bytes());
             m(&mut h, &(u.orders.len() as u32).to_le_bytes());
             m(&mut h, &(u.production.len() as u32).to_le_bytes());
             m(&mut h, &(u.path.len() as u32).to_le_bytes());
@@ -6690,6 +6942,9 @@ pub(crate) mod tests {
                     firing_tolerance: 35,
                     beam: true,
                     lead_target: true,
+                    emp: false,
+                    kamikaze: false,
+                    stun: None,
                 }]
             } else {
                 vec![]
@@ -6734,6 +6989,7 @@ pub(crate) mod tests {
             missile_damage: if role == Role::MissileSilo { 1000 * SCALE } else { 0 },
             missile_splash: if role == Role::MissileSilo { 4 * SCALE } else { 0 },
             missile_range: if role == Role::MissileSilo { 200 * SCALE } else { 0 },
+            missile_stun: None,
             intercept_radius: if role == Role::MissileDefense { 30 * SCALE } else { 0 },
             radius: if role.is_structure() { 3 * SCALE } else { SCALE / 2 },
             size: [SCALE; 3],
@@ -7386,6 +7642,91 @@ pub(crate) mod tests {
         let hatched: Vec<&Unit> = w.units().filter(|u| u.type_id == "RENG" && u.army == 0).collect();
         assert_eq!(hatched.len(), 1, "egg hatched into an engineer");
         assert!(dist_sq((hatched[0].pos.x, hatched[0].pos.y), (84 * SCALE, 80 * SCALE)) <= (2 * SCALE as i128).pow(2));
+    }
+
+    #[test]
+    fn emp_hits_stun_targets_and_they_cannot_move_or_fire() {
+        let mut w = wall_world();
+        let mut emp = ty("REMP", Role::Mobile, 500, 0, 5, 20);
+        emp.weapons[0].stun = Some((30, 3 * SCALE));
+        emp.weapons[0].reset = 200;
+        w.catalog.types.insert("REMP".into(), emp);
+        w.spawn_unit(0, "REMP", (100 * SCALE, 100 * SCALE)).unwrap();
+        let tank = w.spawn_unit(1, "BT", (115 * SCALE, 100 * SCALE)).unwrap();
+        w.issue(1, Command::Move { units: vec![tank], x: 115 * SCALE, y: 200 * SCALE, queue: false });
+        w.step();
+        let stunned = w.unit(tank).unwrap().stunned;
+        assert!(stunned > 20, "EMP hit stuns the tank ({stunned})");
+        let p0 = w.unit(tank).unwrap().pos;
+        let shots0 = w.shots_fired();
+        w.run(20);
+        assert_eq!(w.unit(tank).unwrap().pos, p0, "stunned tank does not move");
+        assert_eq!(w.shots_fired(), shots0, "nobody fires: the emitter is reloading, the tank is stunned");
+        w.run(20);
+        assert!(w.unit(tank).unwrap().pos.y > p0.y, "moves again once the stun wears off");
+    }
+
+    #[test]
+    fn death_weapons_hit_friend_and_foe_and_kamikazes_detonate_once() {
+        let mut w = wall_world();
+        let mut boom_t = ty("RBOOM", Role::Generator, 100, 0, 0, 0);
+        boom_t.ext.death_damage = 100 * SCALE;
+        boom_t.ext.death_radius = 6 * SCALE;
+        w.catalog.types.insert("RBOOM".into(), boom_t);
+        let boom = w.spawn_unit(0, "RBOOM", (100 * SCALE, 100 * SCALE)).unwrap();
+        let own = w.spawn_unit(0, "RENG", (104 * SCALE, 100 * SCALE)).unwrap();
+        let foe = w.spawn_unit(1, "BENG", (100 * SCALE, 104 * SCALE)).unwrap();
+        let far = w.spawn_unit(1, "BENG", (100 * SCALE, 120 * SCALE)).unwrap();
+        w.units.get_mut(&boom).unwrap().hp = 0;
+        w.step();
+        let dmg = |w: &Skirmish, id| w.unit(id).map_or(i64::MAX, |u| u.max_hp - u.hp);
+        assert_eq!(dmg(&w, own), 100 * SCALE, "friendly unit caught in the blast");
+        assert_eq!(dmg(&w, foe), 100 * SCALE, "enemy unit caught in the blast");
+        assert_eq!(dmg(&w, far), 0, "outside the radius");
+
+        let mut w = wall_world();
+        let mut beetle = ty("RBEETLE", Role::Mobile, 100, 4, 400, 3);
+        beetle.weapons[0].kamikaze = true;
+        beetle.weapons[0].splash_radius = 3 * SCALE;
+        beetle.weapons[0].reset = 1;
+        w.catalog.types.insert("RBEETLE".into(), beetle);
+        let b = w.spawn_unit(0, "RBEETLE", (100 * SCALE, 100 * SCALE)).unwrap();
+        let victim = w.spawn_unit(1, "BPD", (110 * SCALE, 100 * SCALE)).unwrap();
+        w.issue(0, Command::Attack { units: vec![b], target: victim, queue: false });
+        w.run(40);
+        assert!(w.unit(b).is_none(), "the kamikaze died in its own blast");
+        let v = w.unit(victim).unwrap();
+        assert_eq!(v.max_hp - v.hp, 400 * SCALE, "exactly one detonation");
+    }
+
+    #[test]
+    fn orbital_centre_launches_an_untargetable_satellite_that_dies_with_it() {
+        let mut w = wall_world();
+        let mut sat = ty("RSAT", Role::Mobile, 100, 10, 75, 30);
+        sat.domain = NavDomain::Air;
+        sat.elevation = 25 * SCALE;
+        sat.ext.untargetable = true;
+        let mut novax = ty("RNOVAX", Role::Orbital, 9_000, 0, 0, 0);
+        novax.ext.satellite = Some("RSAT".into());
+        w.catalog.types.insert("RSAT".into(), sat);
+        w.catalog.types.insert("RNOVAX".into(), novax);
+        let centre = w.spawn_unit(0, "RNOVAX", (60 * SCALE, 60 * SCALE)).unwrap();
+        let sats = w.pods_of(centre);
+        assert_eq!(sats.len(), 1, "satellite launched");
+        let s = sats[0];
+        assert!(w.unit(s).unwrap().untargetable);
+
+        // Enemy AA right below never engages it, and explicit attacks are refused.
+        let aa = w.spawn_unit(1, "BAIR", (60 * SCALE, 60 * SCALE)).unwrap();
+        w.units.get_mut(&aa).unwrap().speed = 0;
+        let hp0 = w.unit(s).unwrap().hp;
+        w.issue(1, Command::Attack { units: vec![aa], target: s, queue: false });
+        w.run(30);
+        assert_eq!(w.unit(s).unwrap().hp, hp0, "satellite untouched");
+
+        w.units.get_mut(&centre).unwrap().hp = 0;
+        w.run(3);
+        assert!(w.unit(s).is_none(), "satellite falls with its launch centre");
     }
 
     #[test]

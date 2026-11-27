@@ -40,7 +40,7 @@ const GATHER_DIST: i64 = 28 * U;
 const ACU_LEASH: i64 = 60 * U;
 const ACU_MEX_RANGE: i64 = 60 * U;
 /// Number of [`Role`] codes (`Role::code` is 0..ROLES).
-const ROLES: usize = 21;
+const ROLES: usize = 22;
 /// Raids start after 4 minutes of game time.
 const RAID_START: u64 = 2_400;
 /// Air units at least this fast (milli per tick) are used for strikes, otherwise kept home.

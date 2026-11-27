@@ -64,7 +64,8 @@ pub const DEFAULT_INPUT_DELAY: u64 = 2;
 /// v7 (Phase 30): sim rules v3 (air fuel & staging).
 /// v8 (Phase 31): sim rules v4 (engineering stations & pod drones).
 /// v9 (Phase 32): sim rules v5 (mobile factories & staging, hatching eggs).
-pub const PROTOCOL_VERSION: u32 = 9;
+/// v10 (Phase 33): sim rules v6 (Novax, EMP stun, death weapons, kamikaze).
+pub const PROTOCOL_VERSION: u32 = 10;
 /// The host's army (star-topology relay); only it may change the game speed.
 pub const HOST_ARMY: ArmyId = 0;
 /// Sender id of host-generated control messages (`Dropped`).
