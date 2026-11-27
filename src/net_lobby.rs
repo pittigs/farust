@@ -299,6 +299,7 @@ impl NetLobbyState {
         Ok((
             Handshake {
                 observers: 0,
+                join_turn: 0,
                 map_id: self.map_id.clone(),
                 seed: self.seed,
                 setups,

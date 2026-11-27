@@ -588,11 +588,30 @@ bumps `SIM_VERSION`, re-baselines golden hashes deliberately, and keeps
 - Not done: menu lobby (`net_lobby.rs`) still runs its pre-game handshake over TCP; symmetric-NAT
   port prediction (falls back to TCP relay).
 
-### Phase 45 — Reconnect & late join (planned)
-- Rejoin after a drop: savegame snapshot transfer + catch-up re-sim, AI
-  hands control back, observers can join a live match.
-- Exit: killing and restarting one peer mid-match ends on the same final
-  hash as an uninterrupted run.
+### Phase 45 — Reconnect & late join (done, direct TCP hosts)
+- Direct TCP hosts keep listening for the whole match (protocol v16). A peer that connects
+  with `MSG_REJOIN` receives the handshake (`join_turn`) plus every turn bundle so far and
+  re-simulates them (the "snapshot" is the deterministic turn history; every re-simulated
+  turn is still hash-verified against the recorded hashes, including its own old ones).
+  Packets before `join_turn` are produced but never sent, so a headless peer's local AI
+  rebuilds exactly the state it had.
+- `host --rejoin-grace SECS` (default 20 s with `--play`, 0 headless, max 30 s): when a
+  player drops, the host holds the turn for it to reconnect; if it does, the match goes on
+  as if nothing happened. After the grace the AI takes over as before (Phase 21).
+- Late return after the takeover: the host announces `NetControl::Rejoined { army, turn }`
+  `input_delay + 1` turns ahead; every peer hands the army back from the AI at that turn.
+- `join ADDR --rejoin ARMY|observer`: reconnect as a player, or join a running match as a
+  new live observer. `join --play --rejoin` re-simulates at full speed before the window
+  opens (`NetHandle::start_rejoined`). Live observers keep the observer HUD.
+- Exit met: `host 127.0.0.1:15612 SCMP_001 --players 2 --headless-ticks 24000 --rejoin-grace 20`,
+  client killed with `kill -9` at turn 2032, restarted with `join … --rejoin 1`: both peers
+  end at tick 12272 on `1c15072179b37e4e`, identical to the uninterrupted run. A late
+  `--rejoin observer` (turn 2353) ends on the same hash. Tests:
+  `killed_peer_rejoins_within_grace_and_ends_on_the_uninterrupted_hash`,
+  `late_rejoin_takes_control_back_from_the_ai_and_a_late_observer_follows`.
+- Limits: invite-code / UDP / menu-lobby hosts do not accept rejoins yet; the host's
+  recording of a rejoined interactive client starts at the rejoin turn; the interactive
+  rejoin path is covered by the shared `catch_up` logic but was not exercised in a window.
 
 ### Phase 46 — Steamworks lobby & friend invites (planned, blocked)
 - Formerly the Phase 28 candidate. Needs a dedicated Steam Direct App ID;

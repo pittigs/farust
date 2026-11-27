@@ -103,8 +103,8 @@ fn print_usage() {
     eprintln!("  farust replay index [GAME_DIR] [--vault DIR] [--search TEXT] [--map M] [--player P] [--faction F] [--winner W] [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--no-sim] [--rebuild] [--json]");
     eprintln!("  farust replay upload <FILE> [--rendezvous HOST:PORT] [--vault DIR]");
     eprintln!("  farust replay download <CODE> [--rendezvous HOST:PORT] [--vault DIR] [--out FILE] [GAME_DIR]");
-    eprintln!("  farust host [<ADDR:PORT>] [MAP] [GAME_DIR] [--code] [--rendezvous ADDR] [--udp] [--netem SPEC] [--players N] [--armies 1,2] [--factions uef,cybran] [--seed S] [--play] [--mute] [--size WxH] [--headless-ticks N]");
-    eprintln!("  farust join <ADDR:PORT | CODE> [GAME_DIR] [--code CODE] [--rendezvous ADDR] [--udp] [--netem SPEC] [--relay] [--play] [--mute] [--size WxH] [--headless-ticks N]");
+    eprintln!("  farust host [<ADDR:PORT>] [MAP] [GAME_DIR] [--code] [--rendezvous ADDR] [--udp] [--netem SPEC] [--players N] [--armies 1,2] [--factions uef,cybran] [--seed S] [--observers K] [--rejoin-grace SECS] [--play] [--mute] [--size WxH] [--headless-ticks N]");
+    eprintln!("  farust join <ADDR:PORT | CODE> [GAME_DIR] [--code CODE] [--rendezvous ADDR] [--udp] [--netem SPEC] [--relay] [--rejoin ARMY|observer] [--play] [--mute] [--size WxH] [--headless-ticks N]");
     eprintln!("  farust rendezvous [BIND_ADDR] [--replay-dir DIR] [--max-replay-mb N] [--max-storage-mb N]");
     eprintln!("  global: +connect_lobby <CODE|ADDR:PORT>           (Steam-compatible lobby auto-join arg)");
     eprintln!();
@@ -1350,6 +1350,8 @@ fn positional_after(args: &[String], start: usize) -> Option<PathBuf> {
             || a == "--headless-ticks"
             || a == "--players"
             || a == "--observers"
+            || a == "--rejoin-grace"
+            || a == "--rejoin"
             || a == "--camera-dist"
             || a == "--out"
             || a == "--rendezvous"
@@ -2206,7 +2208,7 @@ fn cmd_host(args: &[String]) -> Result<(), String> {
         let a = args[i].as_str();
         if matches!(
             a,
-            "--seed" | "--headless-ticks" | "--players" | "--observers" | "--armies" | "--factions" | "--size" | "--rendezvous" | "--netem"
+            "--seed" | "--headless-ticks" | "--players" | "--observers" | "--rejoin-grace" | "--armies" | "--factions" | "--size" | "--rendezvous" | "--netem"
         ) {
             i += 2;
             continue;
@@ -2280,6 +2282,7 @@ fn cmd_host(args: &[String]) -> Result<(), String> {
         tick_limit: if interactive { 0 } else { ticks },
         assigned_army: 0,
         observers: flag_usize(args, "--observers").unwrap_or(0).min(8),
+        join_turn: 0,
     };
 
     let proto_label = match (use_udp, netem_spec) {
@@ -2294,7 +2297,7 @@ fn cmd_host(args: &[String]) -> Result<(), String> {
         hs.setups.len() - players,
         players - 1
     );
-    let (host, bound) = if use_code && use_udp {
+    let (mut host, bound) = if use_code && use_udp {
         let (h, b, _code) = net::LockstepHost::bind_players_udp_with_code(
             addr,
             &rv_addr,
@@ -2326,6 +2329,12 @@ fn cmd_host(args: &[String]) -> Result<(), String> {
         })?
     };
     println!("All players connected on {bound}");
+    // Phase 45: direct TCP hosts accept reconnects, AI hand-backs and late observers.
+    if !use_code && !use_udp {
+        let grace = flag_usize(args, "--rejoin-grace").unwrap_or(if interactive { 20 } else { 0 }) as u64;
+        host.enable_rejoin(None, &hs, std::time::Duration::from_secs(grace))?;
+        println!("Rejoin enabled on {bound} (a dropped player is waited for {grace}s before the AI takes over)");
+    }
     let meshes = interactive.then(|| play::UnitMeshCache::load(Some(&game_dir), &catalog));
     let world = net::world_from_handshake(catalog, &map, &hs)?;
     if let Some(meshes) = meshes {
@@ -2335,7 +2344,6 @@ fn cmd_host(args: &[String]) -> Result<(), String> {
         net::NetHandle::start(&session.world, &hs, Box::new(host))?.attach(&mut session);
         return play::run_play_window(Some(&game_dir), session, map, meshes, width, height);
     }
-    let mut host = host;
     let res = run_headless_peer("host", &mut host, world, &hs, ticks);
     if let Some(st) = host.netem_stats()
         && (st.dropped > 0 || st.duplicated > 0 || st.reordered > 0)
@@ -2367,7 +2375,7 @@ fn cmd_join(args: &[String], connect_lobby: Option<&str>) -> Result<(), String> 
     let mut i = 2usize;
     while i < args.len() {
         let a = args[i].as_str();
-        if matches!(a, "--code" | "--rendezvous" | "--headless-ticks" | "--size" | "--netem") {
+        if matches!(a, "--code" | "--rendezvous" | "--headless-ticks" | "--size" | "--netem" | "--rejoin") {
             i += 2;
             continue;
         }
@@ -2394,7 +2402,21 @@ fn cmd_join(args: &[String], connect_lobby: Option<&str>) -> Result<(), String> 
         .unwrap_or_else(scd::default_game_dir);
     let interactive = has_flag(args, "--play");
 
-    let (client, hs) = if rendezvous::looks_like_code(&target) {
+    // Phase 45: `--rejoin ARMY|observer` reconnects to a running match (direct TCP).
+    let rejoin = flag_str(args, "--rejoin")
+        .map(|v| match v {
+            "observer" | "obs" => Ok(net::REJOIN_OBSERVER),
+            n => n.parse::<u8>().map_err(|_| format!("invalid --rejoin '{n}' (army number or 'observer')")),
+        })
+        .transpose()?;
+    let (client, hs) = if let Some(army) = rejoin {
+        if rendezvous::looks_like_code(&target) || use_udp {
+            return Err("--rejoin needs a direct TCP host address (ADDR:PORT)".to_string());
+        }
+        let (c, hs) = net::LockstepClient::connect_rejoin_retry(&target, army, std::time::Duration::from_secs(30))?;
+        println!("Rejoining at turn {} (re-simulating the match so far)", hs.join_turn);
+        (c, hs)
+    } else if rendezvous::looks_like_code(&target) {
         if use_udp {
             let (c, hs, via) = net::LockstepClient::connect_code_udp_retry(
                 &rv_addr,
@@ -2454,7 +2476,12 @@ fn cmd_join(args: &[String], connect_lobby: Option<&str>) -> Result<(), String> 
             session.fog_of_war = false;
         }
         session.muted = has_flag(args, "--mute");
-        net::NetHandle::start(&session.world, &hs, Box::new(client))?.attach(&mut session);
+        let handle = if hs.join_turn > 0 {
+            net::NetHandle::start_rejoined(&mut session.world, &hs, Box::new(client))?
+        } else {
+            net::NetHandle::start(&session.world, &hs, Box::new(client))?
+        };
+        handle.attach(&mut session);
         return play::run_play_window(Some(&game_dir), session, map, meshes, width, height);
     }
     let mut client = client;
