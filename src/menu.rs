@@ -42,6 +42,8 @@ pub enum ScreenId {
     Multiplayer,
     MpLobby,
     Replays,
+    /// Phase 51: In-game mod manager (enable/disable, conflicts).
+    Mods,
     Options,
     /// Phase 23: Options -> Keys (key remapping).
     Keys,
@@ -57,10 +59,11 @@ impl FromStr for ScreenId {
             "multiplayer" | "mp" => Ok(ScreenId::Multiplayer),
             "mp-host" | "mp-lobby" | "mplobby" | "host" => Ok(ScreenId::MpLobby),
             "replays" | "replay" => Ok(ScreenId::Replays),
+            "mods" | "mod" | "mod-manager" => Ok(ScreenId::Mods),
             "options" | "settings" => Ok(ScreenId::Options),
             "keys" | "keybinds" | "keybindings" | "controls" => Ok(ScreenId::Keys),
             other => Err(format!(
-                "unknown menu screen '{other}' (main, skirmish, multiplayer, mp-lobby, replays, options, keys)"
+                "unknown menu screen '{other}' (main, skirmish, multiplayer, mp-lobby, replays, mods, options, keys)"
             )),
         }
     }
@@ -134,6 +137,16 @@ struct ReplayItem {
     entry: VaultEntry,
 }
 
+#[derive(Debug, Clone)]
+struct ModListItem {
+    spec: String,
+    loaded: Option<crate::mods::Mod>,
+    error: Option<String>,
+    dir: Option<PathBuf>,
+    blueprint_ids: Vec<String>,
+    enabled: bool,
+}
+
 enum MpSession {
     None,
     Host(Box<NetLobbyHost>),
@@ -199,6 +212,12 @@ enum Action {
     ClearReplaySearch,
     ShareReplay,
     DownloadReplay,
+    // Phase 51 Mod Manager
+    SelectMod(usize),
+    ToggleMod(usize),
+    ToggleSelectedMod,
+    DisableAllMods,
+    RefreshMods,
     // Options
     CycleResolution,
     ToggleFullscreen,
@@ -242,6 +261,11 @@ struct MenuState {
     replay_download_code: String,
     replay_selected: usize,
     replay_scroll: usize,
+    /// Phase 51 Mod Manager screen state.
+    mods_items: Vec<ModListItem>,
+    mods_conflicts: Vec<crate::mods::ModConflict>,
+    mods_selected: usize,
+    mods_scroll: usize,
     /// Phase 23 Keys screen: action being rebound (`add` = keep existing chords).
     keys_capture: Option<(crate::keymap::Action, bool)>,
     keys_scroll: usize,
@@ -325,6 +349,10 @@ impl MenuState {
             replay_download_code: String::new(),
             replay_selected: 0,
             replay_scroll: 0,
+            mods_items: Vec::new(),
+            mods_conflicts: Vec::new(),
+            mods_selected: 0,
+            mods_scroll: 0,
             keys_capture: None,
             keys_scroll: 0,
             shift_held: false,
@@ -342,7 +370,10 @@ impl MenuState {
             map_count,
         };
         #[cfg(not(test))]
-        st.refresh_replays(opts.screen == ScreenId::Replays);
+        {
+            st.refresh_replays(opts.screen == ScreenId::Replays);
+            st.refresh_mods();
+        }
         st.ensure_lobby_preview_image();
         if let Some(ref target) = opts.connect_lobby {
             st.mp_join_addr = target.clone();
@@ -544,6 +575,162 @@ impl MenuState {
         }
     }
 
+    fn refresh_mods(&mut self) {
+        let enabled_specs: Vec<String> = self.settings.mods.clone();
+        let mut items: Vec<ModListItem> = Vec::new();
+        let mut matched_specs: Vec<bool> = vec![false; enabled_specs.len()];
+
+        for (dir, res) in crate::mods::discover() {
+            let folder = dir
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| dir.display().to_string());
+            match res {
+                Ok(m) => {
+                    let mut is_enabled = false;
+                    for (si, sp) in enabled_specs.iter().enumerate() {
+                        if sp.eq_ignore_ascii_case(&m.uid)
+                            || sp.eq_ignore_ascii_case(&m.name)
+                            || sp.eq_ignore_ascii_case(&folder)
+                            || Path::new(sp) == dir.as_path()
+                        {
+                            is_enabled = true;
+                            matched_specs[si] = true;
+                        }
+                    }
+                    let (bp_ids, bp_err) = match m.blueprints() {
+                        Ok(bps) => (bps.into_iter().map(|(id, _)| id).collect(), None),
+                        Err(e) => (Vec::new(), Some(e)),
+                    };
+                    let spec = crate::mods::canonical_spec_for(&m, &m.uid);
+                    items.push(ModListItem {
+                        spec,
+                        loaded: Some(m),
+                        error: bp_err,
+                        dir: Some(dir),
+                        blueprint_ids: bp_ids,
+                        enabled: is_enabled,
+                    });
+                }
+                Err(e) => {
+                    let mut is_enabled = false;
+                    for (si, sp) in enabled_specs.iter().enumerate() {
+                        if sp.eq_ignore_ascii_case(&folder) || Path::new(sp) == dir.as_path() {
+                            is_enabled = true;
+                            matched_specs[si] = true;
+                        }
+                    }
+                    items.push(ModListItem {
+                        spec: folder,
+                        loaded: None,
+                        error: Some(e),
+                        dir: Some(dir),
+                        blueprint_ids: Vec::new(),
+                        enabled: is_enabled,
+                    });
+                }
+            }
+        }
+
+        // Also include any enabled specs outside mods_dir (external dirs or missing mods).
+        for (si, sp) in enabled_specs.iter().enumerate() {
+            if matched_specs[si] {
+                continue;
+            }
+            match crate::mods::resolve(sp) {
+                Ok(m) => {
+                    let (bp_ids, bp_err) = match m.blueprints() {
+                        Ok(bps) => (bps.into_iter().map(|(id, _)| id).collect(), None),
+                        Err(e) => (Vec::new(), Some(e)),
+                    };
+                    let dir = m.dir.clone();
+                    items.push(ModListItem {
+                        spec: sp.clone(),
+                        loaded: Some(m),
+                        error: bp_err,
+                        dir,
+                        blueprint_ids: bp_ids,
+                        enabled: true,
+                    });
+                }
+                Err(e) => {
+                    items.push(ModListItem {
+                        spec: sp.clone(),
+                        loaded: None,
+                        error: Some(e),
+                        dir: None,
+                        blueprint_ids: Vec::new(),
+                        enabled: true,
+                    });
+                }
+            }
+        }
+
+        self.mods_items = items;
+        if self.mods_selected >= self.mods_items.len() {
+            self.mods_selected = 0;
+        }
+        self.mods_scroll = self.mods_scroll.min(self.mods_items.len().saturating_sub(1));
+        self.recompute_mod_conflicts();
+    }
+
+    fn recompute_mod_conflicts(&mut self) {
+        let mut conflicts = Vec::new();
+        let mut enabled_loaded = Vec::new();
+        for it in &self.mods_items {
+            if !it.enabled {
+                continue;
+            }
+            if let Some(ref e) = it.error {
+                let label = it
+                    .loaded
+                    .as_ref()
+                    .map(|m| m.name.clone())
+                    .unwrap_or_else(|| it.spec.clone());
+                conflicts.push(crate::mods::ModConflict::LoadError { spec: label, error: e.clone() });
+            } else if let Some(ref m) = it.loaded {
+                enabled_loaded.push(m.clone());
+            }
+        }
+        conflicts.extend(crate::mods::detect_conflicts(&enabled_loaded));
+        self.mods_conflicts = conflicts;
+    }
+
+    fn persist_mods_selection(&mut self) {
+        let specs: Vec<String> = self
+            .mods_items
+            .iter()
+            .filter(|it| it.enabled)
+            .map(|it| it.spec.clone())
+            .collect();
+        self.settings.mods = specs.clone();
+        self.draft.mods = specs.clone();
+        #[cfg(not(test))]
+        {
+            if let Some(p) = settings::settings_path() {
+                if let Err(e) = self.settings.save_to(&p) {
+                    self.set_status(format!("Failed to save settings.ini: {e}"), true);
+                    return;
+                }
+            }
+            settings::set_active(Some(self.settings.clone()));
+            crate::mods::set_runtime_enabled(specs);
+        }
+        self.recompute_mod_conflicts();
+        let enabled_n = self.settings.mods.len();
+        if self.mods_conflicts.is_empty() {
+            self.set_status(format!("{enabled_n} mod(s) enabled (saved to settings.ini)"), false);
+        } else {
+            self.set_status(
+                format!(
+                    "{enabled_n} mod(s) enabled - {} CONFLICT(S) DETECTED",
+                    self.mods_conflicts.len()
+                ),
+                true,
+            );
+        }
+    }
+
     fn navigate(&mut self, to: ScreenId) {
         self.focus = FocusField::None;
         let from = self.screen;
@@ -577,6 +764,22 @@ impl MenuState {
                     ),
                     false,
                 );
+            }
+            ScreenId::Mods => {
+                #[cfg(not(test))]
+                self.refresh_mods();
+                #[cfg(test)]
+                self.recompute_mod_conflicts();
+                let en = self.mods_items.iter().filter(|m| m.enabled).count();
+                let cf = self.mods_conflicts.len();
+                if cf > 0 {
+                    self.set_status(format!("{en} enabled mod(s) - {cf} conflict(s) detected"), true);
+                } else {
+                    self.set_status(
+                        format!("{} mod(s) discovered ({en} enabled) in {}", self.mods_items.len(), crate::mods::mods_dir().display()),
+                        false,
+                    );
+                }
             }
             ScreenId::Skirmish => {
                 if let Some(ref mut lob) = self.lobby {
@@ -629,6 +832,7 @@ impl MenuState {
             ScreenId::Multiplayer => self.draw_mp_hub(c),
             ScreenId::MpLobby => self.draw_mp_lobby(c),
             ScreenId::Replays => self.draw_replays(c),
+            ScreenId::Mods => self.draw_mods(c),
             ScreenId::Options => self.draw_options(c),
             ScreenId::Keys => self.draw_keys(c),
         }
@@ -641,6 +845,7 @@ impl MenuState {
             ScreenId::Multiplayer => self.mp_hub_widgets(w, h),
             ScreenId::MpLobby => self.mp_lobby_widgets(w, h),
             ScreenId::Replays => self.replay_widgets(w, h),
+            ScreenId::Mods => self.mods_widgets(w, h),
             ScreenId::Options => self.options_widgets(w, h),
             ScreenId::Keys => self.keys_widgets(w, h),
         }
@@ -651,14 +856,15 @@ impl MenuState {
     fn main_widgets(&self, w: f32, h: f32) -> Vec<(Rect, Action)> {
         let bx = (w * 0.08).max(48.0);
         let bw = 280.0;
-        let bh = 46.0;
-        let gap = 12.0;
-        let by0 = (h * 0.34).max(190.0);
+        let bh = 44.0;
+        let gap = 10.0;
+        let by0 = (h * 0.30).max(185.0);
         let items = [
             ("SKIRMISH", Action::Go(ScreenId::Skirmish)),
             ("TUTORIAL", Action::StartTutorial),
             ("MULTIPLAYER", Action::Go(ScreenId::Multiplayer)),
             ("REPLAYS", Action::Go(ScreenId::Replays)),
+            ("MODS", Action::Go(ScreenId::Mods)),
             ("OPTIONS", Action::Go(ScreenId::Options)),
             ("QUIT TO DESKTOP", Action::Quit),
         ];
@@ -682,13 +888,15 @@ impl MenuState {
 
         let lang = self.preview_lang();
         let tr = |k: &str, fb: &str| crate::loc::tr_lang(&lang, k, fb);
-        let nav_box = Rect::new(bx - 16.0, (h * 0.34).max(190.0) - 18.0, 312.0, 374.0);
+        let by0 = (h * 0.30).max(185.0);
+        let nav_box = Rect::new(bx - 16.0, by0 - 18.0, 312.0, 404.0);
         c.panel(nav_box);
         let labels = [
             tr("ui.skirmish", "SKIRMISH"),
             tr("ui.tutorial", "TUTORIAL"),
             tr("ui.multiplayer", "MULTIPLAYER"),
             tr("ui.replays", "REPLAYS"),
+            tr("ui.mods", "MODS"),
             tr("ui.options", "OPTIONS"),
             tr("ui.quit_desktop", "QUIT TO DESKTOP"),
         ];
@@ -707,12 +915,18 @@ impl MenuState {
             let rp = Rect::new(rx, nav_box.y, 380.0, nav_box.h);
             let inner = c.titled_panel(rp, &tr("ui.profile", "COMMANDER PROFILE"));
             let mut y = inner.y + 4.0;
+            let mods_lbl = if self.settings.mods.is_empty() {
+                "Stock FA".to_string()
+            } else {
+                format!("{} enabled", self.settings.mods.len())
+            };
             for (k, v) in [
                 ("Commander", self.settings.player_name.clone()),
                 ("Faction", faction_label(self.settings.default_faction)),
                 ("Resolution", format!("{}x{}", self.settings.resolution.0, self.settings.resolution.1)),
                 ("Installed Maps", self.map_count.to_string()),
                 ("Local Replays", self.replays.len().to_string()),
+                ("Active Mods", mods_lbl),
                 ("Audio Volume", format!("{}%", self.settings.master_volume)),
             ] {
                 c.text(inner.x, y, bold(14.0), k, theme::DIM);
@@ -816,7 +1030,7 @@ impl MenuState {
 
     fn draw_mp_hub(&self, c: &mut Canvas) {
         let f = Frame::new(c.w, c.h);
-        c.chrome(&f, "MULTIPLAYER", "TCP Deterministic Lockstep (v4) - Direct + Invite Code Relay");
+        c.chrome(&f, "MULTIPLAYER", "TCP Deterministic Lockstep (v16) - Direct + Invite Code Relay + Auto Mod Sync");
         let cnt = f.content;
         let col_w = ((cnt.w - 28.0) * 0.5).min(540.0);
         let left_x = cnt.x + (cnt.w - (col_w * 2.0 + 28.0)) * 0.5;
@@ -954,6 +1168,20 @@ impl MenuState {
                 max_map_w,
             );
             c.text(cnt.x + 14.0, cnt.y + 12.0, bold(16.0), &hdr_txt, theme::GOLD);
+            let mods_line = if st.mods.is_empty() {
+                "MODS: Stock FA".to_string()
+            } else {
+                let names: Vec<String> = st.mods.iter().map(|m| format!("{} v{}", m.name, m.version)).collect();
+                format!("MODS (auto-sync): {}", names.join(", "))
+            };
+            let mods_fit = c.fonts.fit(body(12.5), &mods_line, left_w - 28.0);
+            c.text(
+                cnt.x + 14.0,
+                cnt.bottom() - 24.0,
+                body(12.5),
+                &mods_fit,
+                if st.mods.is_empty() { theme::DIM } else { theme::ACCENT },
+            );
             c.text(cnt.x + 14.0, cnt.y + 88.0, bold(13.0), "SLOTS & PLAYERS", theme::DIM);
 
             let mw = left_w - 24.0;
@@ -1429,6 +1657,272 @@ impl MenuState {
         c.footer_status(&f, &self.status, if self.status_err { theme::BAD } else { theme::GOOD });
     }
 
+    // ---- Phase 51 Mod Manager ------------------------------------------------
+
+    fn mods_widgets(&self, w: f32, h: f32) -> Vec<(Rect, Action)> {
+        let f = Frame::new(w, h);
+        let c = f.content;
+        let list_w = (c.w * 0.48).clamp(360.0, 580.0);
+        let mut out = Vec::new();
+
+        let row_y0 = c.y + 44.0;
+        let row_step = 60.0;
+        let max_rows = ((c.bottom() - 10.0 - row_y0) / row_step).floor().max(1.0) as usize;
+        for r in 0..max_rows {
+            let idx = self.mods_scroll + r;
+            if idx >= self.mods_items.len() {
+                break;
+            }
+            let ry = row_y0 + r as f32 * row_step;
+            if ry + 56.0 > c.bottom() - 6.0 {
+                break;
+            }
+            let row_x = c.x + 12.0;
+            let row_w = list_w - 24.0;
+            // Click row body to select; click left ON/OFF button to toggle.
+            out.push((Rect::new(row_x, ry, row_w, 56.0), Action::SelectMod(idx)));
+            out.push((Rect::new(row_x + 6.0, ry + 14.0, 52.0, 28.0), Action::ToggleMod(idx)));
+        }
+
+        out.push((f.footer_button(0, false, 150.0), Action::BackToMain));
+        out.push((f.footer_button(1, false, 150.0), Action::RefreshMods));
+        if self.mods_items.iter().any(|m| m.enabled) {
+            out.push((f.footer_button(1, true, 165.0), Action::DisableAllMods));
+        }
+        if self.mods_items.get(self.mods_selected).is_some() {
+            out.push((f.footer_button(0, true, 185.0), Action::ToggleSelectedMod));
+        }
+        out
+    }
+
+    fn mod_has_conflict(&self, it: &ModListItem) -> bool {
+        if !it.enabled {
+            return it.error.is_some();
+        }
+        if it.error.is_some() {
+            return true;
+        }
+        let Some(ref m) = it.loaded else {
+            return true;
+        };
+        self.mods_conflicts.iter().any(|c| match c {
+            crate::mods::ModConflict::BlueprintOverride { mods, .. } => {
+                mods.iter().any(|(n, _)| n == &m.name)
+            }
+            crate::mods::ModConflict::DuplicateUid { uid, .. } => {
+                uid.eq_ignore_ascii_case(&m.uid)
+            }
+            crate::mods::ModConflict::LoadError { spec, .. } => {
+                spec == &m.name || spec == &it.spec
+            }
+        })
+    }
+
+    fn draw_mods(&self, c: &mut Canvas) {
+        let f = Frame::new(c.w, c.h);
+        let enabled_n = self.mods_items.iter().filter(|m| m.enabled).count();
+        let conflict_n = self.mods_conflicts.len();
+        let subtitle = format!(
+            "{} installed · {} enabled · {} conflict(s) · {}",
+            self.mods_items.len(),
+            enabled_n,
+            conflict_n,
+            crate::mods::mods_dir().display()
+        );
+        c.chrome(&f, "MOD MANAGER", &subtitle);
+        let cnt = f.content;
+        let list_w = (cnt.w * 0.48).clamp(360.0, 580.0);
+        c.titled_panel(Rect::new(cnt.x, cnt.y, list_w, cnt.h), "DISCOVERED MODS");
+
+        let rx = cnt_right_x(cnt.x, list_w);
+        let rw = (cnt.right() - rx).max(260.0);
+        let det_in = c.titled_panel(Rect::new(rx, cnt.y, rw, cnt.h), "MOD DETAILS & CONFLICTS");
+
+        if self.mods_items.is_empty() {
+            c.text(cnt.x + 16.0, cnt.y + 58.0, body(15.0), "No mods discovered.", theme::DIM);
+            c.text(
+                cnt.x + 16.0,
+                cnt.y + 84.0,
+                body(13.0),
+                "Place mod folders (mod_info.lua + units/**/*.bp) in:",
+                theme::FAINT,
+            );
+            let dir_s = c.fonts.fit(body(13.0), &crate::mods::mods_dir().display().to_string(), list_w - 32.0);
+            c.text(cnt.x + 16.0, cnt.y + 106.0, body(13.0), &dir_s, theme::ACCENT);
+        }
+
+        // Right panel top: selected mod metadata
+        let conflict_top = (det_in.bottom() - 190.0).max(det_in.y + 180.0);
+        if let Some(it) = self.mods_items.get(self.mods_selected) {
+            let mut my = det_in.y + 4.0;
+            let title_str = it
+                .loaded
+                .as_ref()
+                .map(|m| format!("{}  v{}", m.name, m.version))
+                .unwrap_or_else(|| it.spec.clone());
+            c.text(det_in.x, my, bold(16.0), &c.fonts.fit(bold(16.0), &title_str, det_in.w), theme::GOLD);
+            my += 24.0;
+
+            let rows: Vec<(&str, String, [f32; 4])> = if let Some(ref m) = it.loaded {
+                vec![
+                    ("Status", if it.enabled { "Enabled (persisted)".into() } else { "Disabled".into() }, if it.enabled { theme::GOOD } else { theme::DIM }),
+                    ("UID", m.uid.clone(), theme::TEXT),
+                    ("Author", if m.author.is_empty() { "-".into() } else { m.author.clone() }, theme::TEXT),
+                    ("Blueprints", format!("{} file(s): {}", m.files.len(), if it.blueprint_ids.is_empty() { "-".into() } else { it.blueprint_ids.join(", ") }), theme::ACCENT),
+                    ("Content Hash", format!("#{:016x}", m.hash), theme::DIM),
+                    ("Path", it.dir.as_ref().map(|d| d.display().to_string()).unwrap_or_else(|| "(in-memory)".into()), theme::DIM),
+                ]
+            } else {
+                vec![
+                    ("Status", "Load Error".into(), theme::BAD),
+                    ("Spec", it.spec.clone(), theme::TEXT),
+                    ("Path", it.dir.as_ref().map(|d| d.display().to_string()).unwrap_or_else(|| "-".into()), theme::DIM),
+                ]
+            };
+
+            for (k, v, col) in rows {
+                if my + 20.0 > conflict_top - 48.0 {
+                    break;
+                }
+                c.text(det_in.x, my, bold(13.0), k, theme::DIM);
+                let val_r = Rect::new(det_in.x + 102.0, my - 1.0, (det_in.w - 102.0).max(60.0), 19.0);
+                let fit = c.fonts.fit(body(13.0), &v, val_r.w);
+                c.text_in(val_r, body(13.0), &fit, col, Align::Left);
+                my += 21.0;
+            }
+            if let Some(ref m) = it.loaded
+                && !m.description.is_empty()
+                && my + 22.0 < conflict_top - 10.0
+            {
+                my += 4.0;
+                c.text(det_in.x, my, bold(13.0), "DESCRIPTION", theme::DIM);
+                my += 19.0;
+                let desc = c.fonts.fit(body(13.0), &m.description, det_in.w);
+                c.text(det_in.x, my, body(13.0), &desc, theme::TEXT);
+            }
+            if let Some(ref err) = it.error
+                && my + 22.0 < conflict_top - 10.0
+            {
+                my += 4.0;
+                let err_fit = c.fonts.fit(body(13.0), &format!("Error: {err}"), det_in.w);
+                c.text(det_in.x, my, body(13.0), &err_fit, theme::BAD);
+            }
+        } else {
+            c.text(det_in.x, det_in.y + 8.0, body(14.0), "Select a mod on the left to inspect its blueprints and metadata.", theme::DIM);
+        }
+
+        // Right panel bottom: Conflicts list
+        c.rect(Rect::new(det_in.x, conflict_top - 6.0, det_in.w, 1.0), theme::BORDER);
+        let c_hdr = format!("CONFLICTS ({})", self.mods_conflicts.len());
+        let c_col = if self.mods_conflicts.is_empty() { theme::GOOD } else { theme::BAD };
+        c.text(det_in.x, conflict_top + 2.0, bold(13.5), &c_hdr, c_col);
+        if self.mods_conflicts.is_empty() {
+            c.text(
+                det_in.x,
+                conflict_top + 26.0,
+                body(13.0),
+                "No blueprint or load conflicts among enabled mods.",
+                theme::GOOD,
+            );
+            c.text(
+                det_in.x,
+                conflict_top + 48.0,
+                body(12.5),
+                "Multiplayer peers missing enabled mods receive them automatically with hash verification.",
+                theme::DIM,
+            );
+        } else {
+            let mut cy = conflict_top + 24.0;
+            for conflict in &self.mods_conflicts {
+                if cy + 20.0 > det_in.bottom() - 4.0 {
+                    break;
+                }
+                let line = format!("! {conflict}");
+                let fit = c.fonts.fit(body(12.5), &line, det_in.w);
+                c.text(det_in.x, cy, body(12.5), &fit, theme::BAD);
+                cy += 21.0;
+            }
+        }
+
+        // Interactive widgets
+        for (r, act) in self.mods_widgets(c.w, c.h) {
+            let st = WState { hover: c.is_hover(r), ..Default::default() };
+            match act {
+                Action::SelectMod(idx) => {
+                    let it = &self.mods_items[idx];
+                    let sel = idx == self.mods_selected;
+                    let has_err = self.mod_has_conflict(it);
+                    c.list_row(r, sel, st.hover);
+                    if has_err {
+                        c.outline(r, 1.5, theme::BAD);
+                    }
+                    let tx = r.x + 66.0;
+                    let tw = (r.right() - tx - 8.0).max(60.0);
+                    let (top_l, top_r, mid, bot) = if let Some(ref m) = it.loaded {
+                        let badge = if it.error.is_some() {
+                            "ERROR".to_string()
+                        } else if has_err {
+                            format!("{} bp · CONFLICT", m.files.len())
+                        } else {
+                            format!("{} bp", m.files.len())
+                        };
+                        let author = if m.author.is_empty() { "unknown" } else { &m.author };
+                        (
+                            format!("{} v{}", m.name, m.version),
+                            badge,
+                            format!("uid: {} · by {author}", m.uid),
+                            if m.description.is_empty() { "(no description)".to_string() } else { m.description.clone() },
+                        )
+                    } else {
+                        (
+                            it.spec.clone(),
+                            "LOAD ERROR".to_string(),
+                            it.error.clone().unwrap_or_else(|| "failed to load".into()),
+                            String::new(),
+                        )
+                    };
+                    let badge_w = 108.0;
+                    let fit_top = c.fonts.fit(bold(13.5), &top_l, (tw - badge_w).max(40.0));
+                    c.text(tx, r.y + 4.0, bold(13.5), &fit_top, if sel { theme::TEXT } else { theme::DIM });
+                    c.text_in(
+                        Rect::new(r.right() - badge_w - 6.0, r.y + 4.0, badge_w, 18.0),
+                        bold(11.5),
+                        &top_r,
+                        if has_err { theme::BAD } else { theme::ACCENT },
+                        Align::Right,
+                    );
+                    let fit_mid = c.fonts.fit(body(12.0), &mid, tw);
+                    c.text(tx, r.y + 22.0, body(12.0), &fit_mid, if it.loaded.is_none() { theme::BAD } else { theme::DIM });
+                    if !bot.is_empty() {
+                        let fit_bot = c.fonts.fit(body(11.5), &bot, tw);
+                        c.text(tx, r.y + 38.0, body(11.5), &fit_bot, theme::FAINT);
+                    }
+                }
+                Action::ToggleMod(idx) => {
+                    let on = self.mods_items[idx].enabled;
+                    c.button(
+                        r,
+                        if on { "ON" } else { "OFF" },
+                        WState { primary: on, active: on, ..st },
+                    );
+                }
+                Action::BackToMain => c.button(r, "BACK", st),
+                Action::RefreshMods => c.button(r, "REFRESH", st),
+                Action::DisableAllMods => c.button(r, "DISABLE ALL", st),
+                Action::ToggleSelectedMod => {
+                    let on = self.mods_items.get(self.mods_selected).is_some_and(|m| m.enabled);
+                    c.button(
+                        r,
+                        if on { "DISABLE MOD" } else { "ENABLE MOD" },
+                        WState { primary: !on, active: on, ..st },
+                    );
+                }
+                _ => {}
+            }
+        }
+        c.footer_status(&f, &self.status, if self.status_err { theme::BAD } else { theme::GOOD });
+    }
+
     // ---- Options -------------------------------------------------------------
 
     fn options_widgets(&self, w: f32, h: f32) -> Vec<(Rect, Action)> {
@@ -1617,6 +2111,272 @@ impl MenuState {
             }
         }
 
+        c.footer_status(&f, &self.status, if self.status_err { theme::BAD } else { theme::GOOD });
+    }
+
+    // ---- Phase 51 Mod Manager ------------------------------------------------
+
+    fn mods_widgets(&self, w: f32, h: f32) -> Vec<(Rect, Action)> {
+        let f = Frame::new(w, h);
+        let c = f.content;
+        let list_w = (c.w * 0.48).clamp(360.0, 580.0);
+        let mut out = Vec::new();
+
+        let row_y0 = c.y + 44.0;
+        let row_step = 60.0;
+        let max_rows = ((c.bottom() - 10.0 - row_y0) / row_step).floor().max(1.0) as usize;
+        for r in 0..max_rows {
+            let idx = self.mods_scroll + r;
+            if idx >= self.mods_items.len() {
+                break;
+            }
+            let ry = row_y0 + r as f32 * row_step;
+            if ry + 56.0 > c.bottom() - 6.0 {
+                break;
+            }
+            let row_x = c.x + 12.0;
+            let row_w = list_w - 24.0;
+            // Click row body to select; click left ON/OFF button to toggle.
+            out.push((Rect::new(row_x, ry, row_w, 56.0), Action::SelectMod(idx)));
+            out.push((Rect::new(row_x + 6.0, ry + 14.0, 52.0, 28.0), Action::ToggleMod(idx)));
+        }
+
+        out.push((f.footer_button(0, false, 150.0), Action::BackToMain));
+        out.push((f.footer_button(1, false, 150.0), Action::RefreshMods));
+        if self.mods_items.iter().any(|m| m.enabled) {
+            out.push((f.footer_button(1, true, 165.0), Action::DisableAllMods));
+        }
+        if self.mods_items.get(self.mods_selected).is_some() {
+            out.push((f.footer_button(0, true, 185.0), Action::ToggleSelectedMod));
+        }
+        out
+    }
+
+    fn mod_has_conflict(&self, it: &ModListItem) -> bool {
+        if !it.enabled {
+            return it.error.is_some();
+        }
+        if it.error.is_some() {
+            return true;
+        }
+        let Some(ref m) = it.loaded else {
+            return true;
+        };
+        self.mods_conflicts.iter().any(|c| match c {
+            crate::mods::ModConflict::BlueprintOverride { mods, .. } => {
+                mods.iter().any(|(n, _)| n == &m.name)
+            }
+            crate::mods::ModConflict::DuplicateUid { uid, .. } => {
+                uid.eq_ignore_ascii_case(&m.uid)
+            }
+            crate::mods::ModConflict::LoadError { spec, .. } => {
+                spec == &m.name || spec == &it.spec
+            }
+        })
+    }
+
+    fn draw_mods(&self, c: &mut Canvas) {
+        let f = Frame::new(c.w, c.h);
+        let enabled_n = self.mods_items.iter().filter(|m| m.enabled).count();
+        let conflict_n = self.mods_conflicts.len();
+        let subtitle = format!(
+            "{} installed · {} enabled · {} conflict(s) · {}",
+            self.mods_items.len(),
+            enabled_n,
+            conflict_n,
+            crate::mods::mods_dir().display()
+        );
+        c.chrome(&f, "MOD MANAGER", &subtitle);
+        let cnt = f.content;
+        let list_w = (cnt.w * 0.48).clamp(360.0, 580.0);
+        c.titled_panel(Rect::new(cnt.x, cnt.y, list_w, cnt.h), "DISCOVERED MODS");
+
+        let rx = cnt_right_x(cnt.x, list_w);
+        let rw = (cnt.right() - rx).max(260.0);
+        let det_in = c.titled_panel(Rect::new(rx, cnt.y, rw, cnt.h), "MOD DETAILS & CONFLICTS");
+
+        if self.mods_items.is_empty() {
+            c.text(cnt.x + 16.0, cnt.y + 58.0, body(15.0), "No mods discovered.", theme::DIM);
+            c.text(
+                cnt.x + 16.0,
+                cnt.y + 84.0,
+                body(13.0),
+                "Place mod folders (mod_info.lua + units/**/*.bp) in:",
+                theme::FAINT,
+            );
+            let dir_s = c.fonts.fit(body(13.0), &crate::mods::mods_dir().display().to_string(), list_w - 32.0);
+            c.text(cnt.x + 16.0, cnt.y + 106.0, body(13.0), &dir_s, theme::ACCENT);
+        }
+
+        // Right panel top: selected mod metadata
+        let conflict_top = (det_in.bottom() - 190.0).max(det_in.y + 180.0);
+        if let Some(it) = self.mods_items.get(self.mods_selected) {
+            let mut my = det_in.y + 4.0;
+            let title_str = it
+                .loaded
+                .as_ref()
+                .map(|m| format!("{}  v{}", m.name, m.version))
+                .unwrap_or_else(|| it.spec.clone());
+            c.text(det_in.x, my, bold(16.0), &c.fonts.fit(bold(16.0), &title_str, det_in.w), theme::GOLD);
+            my += 24.0;
+
+            let rows: Vec<(&str, String, [f32; 4])> = if let Some(ref m) = it.loaded {
+                vec![
+                    ("Status", if it.enabled { "Enabled (persisted)".into() } else { "Disabled".into() }, if it.enabled { theme::GOOD } else { theme::DIM }),
+                    ("UID", m.uid.clone(), theme::TEXT),
+                    ("Author", if m.author.is_empty() { "-".into() } else { m.author.clone() }, theme::TEXT),
+                    ("Blueprints", format!("{} file(s): {}", m.files.len(), if it.blueprint_ids.is_empty() { "-".into() } else { it.blueprint_ids.join(", ") }), theme::ACCENT),
+                    ("Content Hash", format!("#{:016x}", m.hash), theme::DIM),
+                    ("Path", it.dir.as_ref().map(|d| d.display().to_string()).unwrap_or_else(|| "(in-memory)".into()), theme::DIM),
+                ]
+            } else {
+                vec![
+                    ("Status", "Load Error".into(), theme::BAD),
+                    ("Spec", it.spec.clone(), theme::TEXT),
+                    ("Path", it.dir.as_ref().map(|d| d.display().to_string()).unwrap_or_else(|| "-".into()), theme::DIM),
+                ]
+            };
+
+            for (k, v, col) in rows {
+                if my + 20.0 > conflict_top - 48.0 {
+                    break;
+                }
+                c.text(det_in.x, my, bold(13.0), k, theme::DIM);
+                let val_r = Rect::new(det_in.x + 102.0, my - 1.0, (det_in.w - 102.0).max(60.0), 19.0);
+                let fit = c.fonts.fit(body(13.0), &v, val_r.w);
+                c.text_in(val_r, body(13.0), &fit, col, Align::Left);
+                my += 21.0;
+            }
+            if let Some(ref m) = it.loaded
+                && !m.description.is_empty()
+                && my + 22.0 < conflict_top - 10.0
+            {
+                my += 4.0;
+                c.text(det_in.x, my, bold(13.0), "DESCRIPTION", theme::DIM);
+                my += 19.0;
+                let desc = c.fonts.fit(body(13.0), &m.description, det_in.w);
+                c.text(det_in.x, my, body(13.0), &desc, theme::TEXT);
+            }
+            if let Some(ref err) = it.error
+                && my + 22.0 < conflict_top - 10.0
+            {
+                my += 4.0;
+                let err_fit = c.fonts.fit(body(13.0), &format!("Error: {err}"), det_in.w);
+                c.text(det_in.x, my, body(13.0), &err_fit, theme::BAD);
+            }
+        } else {
+            c.text(det_in.x, det_in.y + 8.0, body(14.0), "Select a mod on the left to inspect its blueprints and metadata.", theme::DIM);
+        }
+
+        // Right panel bottom: Conflicts list
+        c.rect(Rect::new(det_in.x, conflict_top - 6.0, det_in.w, 1.0), theme::BORDER);
+        let c_hdr = format!("CONFLICTS ({})", self.mods_conflicts.len());
+        let c_col = if self.mods_conflicts.is_empty() { theme::GOOD } else { theme::BAD };
+        c.text(det_in.x, conflict_top + 2.0, bold(13.5), &c_hdr, c_col);
+        if self.mods_conflicts.is_empty() {
+            c.text(
+                det_in.x,
+                conflict_top + 26.0,
+                body(13.0),
+                "No blueprint or load conflicts among enabled mods.",
+                theme::GOOD,
+            );
+            c.text(
+                det_in.x,
+                conflict_top + 48.0,
+                body(12.5),
+                "Multiplayer peers missing enabled mods receive them automatically with hash verification.",
+                theme::DIM,
+            );
+        } else {
+            let mut cy = conflict_top + 24.0;
+            for conflict in &self.mods_conflicts {
+                if cy + 20.0 > det_in.bottom() - 4.0 {
+                    break;
+                }
+                let line = format!("! {conflict}");
+                let fit = c.fonts.fit(body(12.5), &line, det_in.w);
+                c.text(det_in.x, cy, body(12.5), &fit, theme::BAD);
+                cy += 21.0;
+            }
+        }
+
+        // Interactive widgets
+        for (r, act) in self.mods_widgets(c.w, c.h) {
+            let st = WState { hover: c.is_hover(r), ..Default::default() };
+            match act {
+                Action::SelectMod(idx) => {
+                    let it = &self.mods_items[idx];
+                    let sel = idx == self.mods_selected;
+                    let has_err = self.mod_has_conflict(it);
+                    c.list_row(r, sel, st.hover);
+                    if has_err {
+                        c.outline(r, 1.5, theme::BAD);
+                    }
+                    let tx = r.x + 66.0;
+                    let tw = (r.right() - tx - 8.0).max(60.0);
+                    let (top_l, top_r, mid, bot) = if let Some(ref m) = it.loaded {
+                        let badge = if it.error.is_some() {
+                            "ERROR".to_string()
+                        } else if has_err {
+                            format!("{} bp · CONFLICT", m.files.len())
+                        } else {
+                            format!("{} bp", m.files.len())
+                        };
+                        let author = if m.author.is_empty() { "unknown" } else { &m.author };
+                        (
+                            format!("{} v{}", m.name, m.version),
+                            badge,
+                            format!("uid: {} · by {author}", m.uid),
+                            if m.description.is_empty() { "(no description)".to_string() } else { m.description.clone() },
+                        )
+                    } else {
+                        (
+                            it.spec.clone(),
+                            "LOAD ERROR".to_string(),
+                            it.error.clone().unwrap_or_else(|| "failed to load".into()),
+                            String::new(),
+                        )
+                    };
+                    let badge_w = 108.0;
+                    let fit_top = c.fonts.fit(bold(13.5), &top_l, (tw - badge_w).max(40.0));
+                    c.text(tx, r.y + 4.0, bold(13.5), &fit_top, if sel { theme::TEXT } else { theme::DIM });
+                    c.text_in(
+                        Rect::new(r.right() - badge_w - 6.0, r.y + 4.0, badge_w, 18.0),
+                        bold(11.5),
+                        &top_r,
+                        if has_err { theme::BAD } else { theme::ACCENT },
+                        Align::Right,
+                    );
+                    let fit_mid = c.fonts.fit(body(12.0), &mid, tw);
+                    c.text(tx, r.y + 22.0, body(12.0), &fit_mid, if it.loaded.is_none() { theme::BAD } else { theme::DIM });
+                    if !bot.is_empty() {
+                        let fit_bot = c.fonts.fit(body(11.5), &bot, tw);
+                        c.text(tx, r.y + 38.0, body(11.5), &fit_bot, theme::FAINT);
+                    }
+                }
+                Action::ToggleMod(idx) => {
+                    let on = self.mods_items[idx].enabled;
+                    c.button(
+                        r,
+                        if on { "ON" } else { "OFF" },
+                        WState { primary: on, active: on, ..st },
+                    );
+                }
+                Action::BackToMain => c.button(r, "BACK", st),
+                Action::RefreshMods => c.button(r, "REFRESH", st),
+                Action::DisableAllMods => c.button(r, "DISABLE ALL", st),
+                Action::ToggleSelectedMod => {
+                    let on = self.mods_items.get(self.mods_selected).is_some_and(|m| m.enabled);
+                    c.button(
+                        r,
+                        if on { "DISABLE MOD" } else { "ENABLE MOD" },
+                        WState { primary: !on, active: on, ..st },
+                    );
+                }
+                _ => {}
+            }
+        }
         c.footer_status(&f, &self.status, if self.status_err { theme::BAD } else { theme::GOOD });
     }
 
@@ -1855,6 +2615,36 @@ impl MenuState {
                 }
             }
             Action::DownloadReplay => self.download_replay_by_code(),
+            Action::SelectMod(idx) => {
+                if idx < self.mods_items.len() {
+                    self.mods_selected = idx;
+                }
+            }
+            Action::ToggleMod(idx) => {
+                if idx < self.mods_items.len() {
+                    self.mods_selected = idx;
+                    self.mods_items[idx].enabled = !self.mods_items[idx].enabled;
+                    self.persist_mods_selection();
+                }
+            }
+            Action::ToggleSelectedMod => {
+                if self.mods_selected < self.mods_items.len() {
+                    let idx = self.mods_selected;
+                    self.mods_items[idx].enabled = !self.mods_items[idx].enabled;
+                    self.persist_mods_selection();
+                }
+            }
+            Action::DisableAllMods => {
+                for it in &mut self.mods_items {
+                    it.enabled = false;
+                }
+                self.persist_mods_selection();
+            }
+            Action::RefreshMods => {
+                self.refresh_mods();
+                let en = self.mods_items.iter().filter(|m| m.enabled).count();
+                self.set_status(format!("Refreshed: {} mod(s) found ({en} enabled)", self.mods_items.len()), false);
+            }
             Action::CycleResolution => {
                 let i = RESOLUTIONS.iter().position(|r| *r == self.draft.resolution).unwrap_or(0);
                 self.draft.resolution = RESOLUTIONS[(i + 1) % RESOLUTIONS.len()];
@@ -2057,6 +2847,272 @@ impl MenuState {
                 Action::KeysReset => c.button(r, "DEFAULTS", st),
                 Action::SaveOptions => c.button(r, "SAVE & APPLY", WState { primary: true, ..st }),
                 Action::KeysScroll(d) => c.button(r, if d < 0 { "UP" } else { "DOWN" }, st),
+                _ => {}
+            }
+        }
+        c.footer_status(&f, &self.status, if self.status_err { theme::BAD } else { theme::GOOD });
+    }
+
+    // ---- Phase 51 Mod Manager ------------------------------------------------
+
+    fn mods_widgets(&self, w: f32, h: f32) -> Vec<(Rect, Action)> {
+        let f = Frame::new(w, h);
+        let c = f.content;
+        let list_w = (c.w * 0.48).clamp(360.0, 580.0);
+        let mut out = Vec::new();
+
+        let row_y0 = c.y + 44.0;
+        let row_step = 60.0;
+        let max_rows = ((c.bottom() - 10.0 - row_y0) / row_step).floor().max(1.0) as usize;
+        for r in 0..max_rows {
+            let idx = self.mods_scroll + r;
+            if idx >= self.mods_items.len() {
+                break;
+            }
+            let ry = row_y0 + r as f32 * row_step;
+            if ry + 56.0 > c.bottom() - 6.0 {
+                break;
+            }
+            let row_x = c.x + 12.0;
+            let row_w = list_w - 24.0;
+            // Click row body to select; click left ON/OFF button to toggle.
+            out.push((Rect::new(row_x, ry, row_w, 56.0), Action::SelectMod(idx)));
+            out.push((Rect::new(row_x + 6.0, ry + 14.0, 52.0, 28.0), Action::ToggleMod(idx)));
+        }
+
+        out.push((f.footer_button(0, false, 150.0), Action::BackToMain));
+        out.push((f.footer_button(1, false, 150.0), Action::RefreshMods));
+        if self.mods_items.iter().any(|m| m.enabled) {
+            out.push((f.footer_button(1, true, 165.0), Action::DisableAllMods));
+        }
+        if self.mods_items.get(self.mods_selected).is_some() {
+            out.push((f.footer_button(0, true, 185.0), Action::ToggleSelectedMod));
+        }
+        out
+    }
+
+    fn mod_has_conflict(&self, it: &ModListItem) -> bool {
+        if !it.enabled {
+            return it.error.is_some();
+        }
+        if it.error.is_some() {
+            return true;
+        }
+        let Some(ref m) = it.loaded else {
+            return true;
+        };
+        self.mods_conflicts.iter().any(|c| match c {
+            crate::mods::ModConflict::BlueprintOverride { mods, .. } => {
+                mods.iter().any(|(n, _)| n == &m.name)
+            }
+            crate::mods::ModConflict::DuplicateUid { uid, .. } => {
+                uid.eq_ignore_ascii_case(&m.uid)
+            }
+            crate::mods::ModConflict::LoadError { spec, .. } => {
+                spec == &m.name || spec == &it.spec
+            }
+        })
+    }
+
+    fn draw_mods(&self, c: &mut Canvas) {
+        let f = Frame::new(c.w, c.h);
+        let enabled_n = self.mods_items.iter().filter(|m| m.enabled).count();
+        let conflict_n = self.mods_conflicts.len();
+        let subtitle = format!(
+            "{} installed · {} enabled · {} conflict(s) · {}",
+            self.mods_items.len(),
+            enabled_n,
+            conflict_n,
+            crate::mods::mods_dir().display()
+        );
+        c.chrome(&f, "MOD MANAGER", &subtitle);
+        let cnt = f.content;
+        let list_w = (cnt.w * 0.48).clamp(360.0, 580.0);
+        c.titled_panel(Rect::new(cnt.x, cnt.y, list_w, cnt.h), "DISCOVERED MODS");
+
+        let rx = cnt_right_x(cnt.x, list_w);
+        let rw = (cnt.right() - rx).max(260.0);
+        let det_in = c.titled_panel(Rect::new(rx, cnt.y, rw, cnt.h), "MOD DETAILS & CONFLICTS");
+
+        if self.mods_items.is_empty() {
+            c.text(cnt.x + 16.0, cnt.y + 58.0, body(15.0), "No mods discovered.", theme::DIM);
+            c.text(
+                cnt.x + 16.0,
+                cnt.y + 84.0,
+                body(13.0),
+                "Place mod folders (mod_info.lua + units/**/*.bp) in:",
+                theme::FAINT,
+            );
+            let dir_s = c.fonts.fit(body(13.0), &crate::mods::mods_dir().display().to_string(), list_w - 32.0);
+            c.text(cnt.x + 16.0, cnt.y + 106.0, body(13.0), &dir_s, theme::ACCENT);
+        }
+
+        // Right panel top: selected mod metadata
+        let conflict_top = (det_in.bottom() - 190.0).max(det_in.y + 180.0);
+        if let Some(it) = self.mods_items.get(self.mods_selected) {
+            let mut my = det_in.y + 4.0;
+            let title_str = it
+                .loaded
+                .as_ref()
+                .map(|m| format!("{}  v{}", m.name, m.version))
+                .unwrap_or_else(|| it.spec.clone());
+            c.text(det_in.x, my, bold(16.0), &c.fonts.fit(bold(16.0), &title_str, det_in.w), theme::GOLD);
+            my += 24.0;
+
+            let rows: Vec<(&str, String, [f32; 4])> = if let Some(ref m) = it.loaded {
+                vec![
+                    ("Status", if it.enabled { "Enabled (persisted)".into() } else { "Disabled".into() }, if it.enabled { theme::GOOD } else { theme::DIM }),
+                    ("UID", m.uid.clone(), theme::TEXT),
+                    ("Author", if m.author.is_empty() { "-".into() } else { m.author.clone() }, theme::TEXT),
+                    ("Blueprints", format!("{} file(s): {}", m.files.len(), if it.blueprint_ids.is_empty() { "-".into() } else { it.blueprint_ids.join(", ") }), theme::ACCENT),
+                    ("Content Hash", format!("#{:016x}", m.hash), theme::DIM),
+                    ("Path", it.dir.as_ref().map(|d| d.display().to_string()).unwrap_or_else(|| "(in-memory)".into()), theme::DIM),
+                ]
+            } else {
+                vec![
+                    ("Status", "Load Error".into(), theme::BAD),
+                    ("Spec", it.spec.clone(), theme::TEXT),
+                    ("Path", it.dir.as_ref().map(|d| d.display().to_string()).unwrap_or_else(|| "-".into()), theme::DIM),
+                ]
+            };
+
+            for (k, v, col) in rows {
+                if my + 20.0 > conflict_top - 48.0 {
+                    break;
+                }
+                c.text(det_in.x, my, bold(13.0), k, theme::DIM);
+                let val_r = Rect::new(det_in.x + 102.0, my - 1.0, (det_in.w - 102.0).max(60.0), 19.0);
+                let fit = c.fonts.fit(body(13.0), &v, val_r.w);
+                c.text_in(val_r, body(13.0), &fit, col, Align::Left);
+                my += 21.0;
+            }
+            if let Some(ref m) = it.loaded
+                && !m.description.is_empty()
+                && my + 22.0 < conflict_top - 10.0
+            {
+                my += 4.0;
+                c.text(det_in.x, my, bold(13.0), "DESCRIPTION", theme::DIM);
+                my += 19.0;
+                let desc = c.fonts.fit(body(13.0), &m.description, det_in.w);
+                c.text(det_in.x, my, body(13.0), &desc, theme::TEXT);
+            }
+            if let Some(ref err) = it.error
+                && my + 22.0 < conflict_top - 10.0
+            {
+                my += 4.0;
+                let err_fit = c.fonts.fit(body(13.0), &format!("Error: {err}"), det_in.w);
+                c.text(det_in.x, my, body(13.0), &err_fit, theme::BAD);
+            }
+        } else {
+            c.text(det_in.x, det_in.y + 8.0, body(14.0), "Select a mod on the left to inspect its blueprints and metadata.", theme::DIM);
+        }
+
+        // Right panel bottom: Conflicts list
+        c.rect(Rect::new(det_in.x, conflict_top - 6.0, det_in.w, 1.0), theme::BORDER);
+        let c_hdr = format!("CONFLICTS ({})", self.mods_conflicts.len());
+        let c_col = if self.mods_conflicts.is_empty() { theme::GOOD } else { theme::BAD };
+        c.text(det_in.x, conflict_top + 2.0, bold(13.5), &c_hdr, c_col);
+        if self.mods_conflicts.is_empty() {
+            c.text(
+                det_in.x,
+                conflict_top + 26.0,
+                body(13.0),
+                "No blueprint or load conflicts among enabled mods.",
+                theme::GOOD,
+            );
+            c.text(
+                det_in.x,
+                conflict_top + 48.0,
+                body(12.5),
+                "Multiplayer peers missing enabled mods receive them automatically with hash verification.",
+                theme::DIM,
+            );
+        } else {
+            let mut cy = conflict_top + 24.0;
+            for conflict in &self.mods_conflicts {
+                if cy + 20.0 > det_in.bottom() - 4.0 {
+                    break;
+                }
+                let line = format!("! {conflict}");
+                let fit = c.fonts.fit(body(12.5), &line, det_in.w);
+                c.text(det_in.x, cy, body(12.5), &fit, theme::BAD);
+                cy += 21.0;
+            }
+        }
+
+        // Interactive widgets
+        for (r, act) in self.mods_widgets(c.w, c.h) {
+            let st = WState { hover: c.is_hover(r), ..Default::default() };
+            match act {
+                Action::SelectMod(idx) => {
+                    let it = &self.mods_items[idx];
+                    let sel = idx == self.mods_selected;
+                    let has_err = self.mod_has_conflict(it);
+                    c.list_row(r, sel, st.hover);
+                    if has_err {
+                        c.outline(r, 1.5, theme::BAD);
+                    }
+                    let tx = r.x + 66.0;
+                    let tw = (r.right() - tx - 8.0).max(60.0);
+                    let (top_l, top_r, mid, bot) = if let Some(ref m) = it.loaded {
+                        let badge = if it.error.is_some() {
+                            "ERROR".to_string()
+                        } else if has_err {
+                            format!("{} bp · CONFLICT", m.files.len())
+                        } else {
+                            format!("{} bp", m.files.len())
+                        };
+                        let author = if m.author.is_empty() { "unknown" } else { &m.author };
+                        (
+                            format!("{} v{}", m.name, m.version),
+                            badge,
+                            format!("uid: {} · by {author}", m.uid),
+                            if m.description.is_empty() { "(no description)".to_string() } else { m.description.clone() },
+                        )
+                    } else {
+                        (
+                            it.spec.clone(),
+                            "LOAD ERROR".to_string(),
+                            it.error.clone().unwrap_or_else(|| "failed to load".into()),
+                            String::new(),
+                        )
+                    };
+                    let badge_w = 108.0;
+                    let fit_top = c.fonts.fit(bold(13.5), &top_l, (tw - badge_w).max(40.0));
+                    c.text(tx, r.y + 4.0, bold(13.5), &fit_top, if sel { theme::TEXT } else { theme::DIM });
+                    c.text_in(
+                        Rect::new(r.right() - badge_w - 6.0, r.y + 4.0, badge_w, 18.0),
+                        bold(11.5),
+                        &top_r,
+                        if has_err { theme::BAD } else { theme::ACCENT },
+                        Align::Right,
+                    );
+                    let fit_mid = c.fonts.fit(body(12.0), &mid, tw);
+                    c.text(tx, r.y + 22.0, body(12.0), &fit_mid, if it.loaded.is_none() { theme::BAD } else { theme::DIM });
+                    if !bot.is_empty() {
+                        let fit_bot = c.fonts.fit(body(11.5), &bot, tw);
+                        c.text(tx, r.y + 38.0, body(11.5), &fit_bot, theme::FAINT);
+                    }
+                }
+                Action::ToggleMod(idx) => {
+                    let on = self.mods_items[idx].enabled;
+                    c.button(
+                        r,
+                        if on { "ON" } else { "OFF" },
+                        WState { primary: on, active: on, ..st },
+                    );
+                }
+                Action::BackToMain => c.button(r, "BACK", st),
+                Action::RefreshMods => c.button(r, "REFRESH", st),
+                Action::DisableAllMods => c.button(r, "DISABLE ALL", st),
+                Action::ToggleSelectedMod => {
+                    let on = self.mods_items.get(self.mods_selected).is_some_and(|m| m.enabled);
+                    c.button(
+                        r,
+                        if on { "DISABLE MOD" } else { "ENABLE MOD" },
+                        WState { primary: !on, active: on, ..st },
+                    );
+                }
                 _ => {}
             }
         }
@@ -2536,6 +3592,12 @@ impl ApplicationHandler for ShellApp {
                                 (self.state.replay_scroll as i64 + d as i64).clamp(0, max as i64) as usize;
                             redraw = true;
                         }
+                        ScreenId::Mods => {
+                            let max = self.state.mods_items.len().saturating_sub(8);
+                            self.state.mods_scroll =
+                                (self.state.mods_scroll as i64 + d as i64).clamp(0, max as i64) as usize;
+                            redraw = true;
+                        }
                         _ => {}
                     }
                 }
@@ -2813,6 +3875,7 @@ mod tests {
         assert_eq!(ScreenId::from_str("multiplayer").unwrap(), ScreenId::Multiplayer);
         assert_eq!(ScreenId::from_str("mp-lobby").unwrap(), ScreenId::MpLobby);
         assert_eq!(ScreenId::from_str("replays").unwrap(), ScreenId::Replays);
+        assert_eq!(ScreenId::from_str("mods").unwrap(), ScreenId::Mods);
         assert_eq!(ScreenId::from_str("options").unwrap(), ScreenId::Options);
         assert_eq!(ScreenId::from_str("keys").unwrap(), ScreenId::Keys);
         assert!(ScreenId::from_str("bogus").is_err());
@@ -2842,12 +3905,27 @@ mod tests {
         ));
         st.start_host_lobby("127.0.0.1:0").unwrap();
 
+        st.mods_items.push(ModListItem {
+            spec: "heavy-tanks-001".into(),
+            loaded: Some(crate::mods::Mod::from_memory(
+                "name = 'Heavy Tanks'\nuid = 'heavy-tanks-001'\nversion = 1\nauthor = 'Test'\ndescription = 'Boosts tanks'\n",
+                vec![("units/UEL0201/UEL0201_unit.bp".into(), "UnitBlueprint { Merge = true, Defense = { MaxHealth = 500 } }".into())],
+                "heavy",
+            )),
+            error: None,
+            dir: Some(PathBuf::from("/tmp/heavy")),
+            blueprint_ids: vec!["UEL0201".into()],
+            enabled: true,
+        });
+        st.recompute_mod_conflicts();
+
         for screen in [
             ScreenId::Main,
             ScreenId::Skirmish,
             ScreenId::Multiplayer,
             ScreenId::MpLobby,
             ScreenId::Replays,
+            ScreenId::Mods,
             ScreenId::Options,
             ScreenId::Keys,
         ] {
@@ -2975,6 +4053,7 @@ mod tests {
                 ScreenId::Multiplayer,
                 ScreenId::MpLobby,
                 ScreenId::Replays,
+                ScreenId::Mods,
                 ScreenId::Options,
                 ScreenId::Keys,
             ] {
@@ -3036,5 +4115,64 @@ mod tests {
         st.click(1280.0, 800.0, clr.0, clr.1);
         assert!(st.replay_search.is_empty());
         assert_eq!(st.replays.len(), 2);
+    }
+
+    #[test]
+    fn mods_screen_toggles_and_detects_conflicts() {
+        let mut st = MenuState::new(Path::new("/nonexistent"), &MenuOptions::default()).unwrap();
+        let mod_a = crate::mods::Mod::from_memory(
+            "name = 'Mod Alpha'\nuid = 'mod-alpha'\nversion = 1\nauthor = 'Alice'\ndescription = 'Overrides Striker'\n",
+            vec![("units/UEL0201/UEL0201_unit.bp".into(), "UnitBlueprint { Merge = true, Defense = { MaxHealth = 500 } }".into())],
+            "alpha",
+        );
+        let mod_b = crate::mods::Mod::from_memory(
+            "name = 'Mod Beta'\nuid = 'mod-beta'\nversion = 2\nauthor = 'Bob'\ndescription = 'Also overrides Striker'\n",
+            vec![("units/UEL0201/UEL0201_unit.bp".into(), "UnitBlueprint { Merge = true, Defense = { MaxHealth = 700 } }".into())],
+            "beta",
+        );
+        st.mods_items = vec![
+            ModListItem {
+                spec: "mod-alpha".into(),
+                loaded: Some(mod_a),
+                error: None,
+                dir: None,
+                blueprint_ids: vec!["UEL0201".into()],
+                enabled: false,
+            },
+            ModListItem {
+                spec: "mod-beta".into(),
+                loaded: Some(mod_b),
+                error: None,
+                dir: None,
+                blueprint_ids: vec!["UEL0201".into()],
+                enabled: false,
+            },
+        ];
+        st.navigate(ScreenId::Mods);
+        assert!(st.mods_conflicts.is_empty());
+
+        // Enable both mods via clicking their toggle buttons -> conflict detected!
+        let ws = st.mods_widgets(1280.0, 800.0);
+        let (ax, ay) = ws.iter().find(|(_, a)| *a == Action::ToggleMod(0)).unwrap().0.center();
+        let (bx, by) = ws.iter().find(|(_, a)| *a == Action::ToggleMod(1)).unwrap().0.center();
+        st.click(1280.0, 800.0, ax, ay);
+        assert_eq!(st.settings.mods, vec!["mod-alpha"]);
+        assert!(st.mods_conflicts.is_empty());
+        st.click(1280.0, 800.0, bx, by);
+        assert_eq!(st.settings.mods, vec!["mod-alpha", "mod-beta"]);
+        assert_eq!(st.mods_conflicts.len(), 1);
+        assert!(st.status_err);
+
+        // Draw with conflict highlighted.
+        let mut c = Canvas::new(1280.0, 800.0, &st.fonts, &st.images, None);
+        st.draw(&mut c);
+        assert!(c.batches.iter().map(|b| b.idx.len()).sum::<usize>() > 100);
+
+        // Disable all clears enabled set and conflicts.
+        let ws2 = st.mods_widgets(1280.0, 800.0);
+        let (dx, dy) = ws2.iter().find(|(_, a)| *a == Action::DisableAllMods).unwrap().0.center();
+        st.click(1280.0, 800.0, dx, dy);
+        assert!(st.settings.mods.is_empty());
+        assert!(st.mods_conflicts.is_empty());
     }
 }

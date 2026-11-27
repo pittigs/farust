@@ -181,6 +181,8 @@ pub struct Settings {
     pub bloom: bool,
     pub aa: AaMode,
     pub gamma_x100: u16,
+    /// Phase 51: persisted enabled blueprint mods (`mods=uid1,uid2`).
+    pub mods: Vec<String>,
     /// Phase 23: remappable key bindings (`key.<action>=Ctrl+Shift+K`).
     pub keys: crate::keymap::KeyMap,
 }
@@ -209,6 +211,7 @@ impl Default for Settings {
             bloom: true,
             aa: AaMode::Msaa4,
             gamma_x100: GAMMA_DEFAULT_X100,
+            mods: Vec::new(),
             keys: crate::keymap::KeyMap::default(),
         }
     }
@@ -216,7 +219,7 @@ impl Default for Settings {
 
 /// Every key written to / understood in `settings.ini`, in file order (followed by one
 /// `key.<action>` line per bindable action, see [`crate::keymap`]).
-pub const KEYS: [&str; 21] = [
+pub const KEYS: [&str; 22] = [
     "resolution",
     "fullscreen",
     "vsync",
@@ -238,6 +241,7 @@ pub const KEYS: [&str; 21] = [
     "colorblind",
     "mouse_swap",
     "subtitles",
+    "mods",
 ];
 
 fn parse_bool(v: &str) -> Result<bool, String> {
@@ -334,6 +338,24 @@ pub fn validate_language(v: &str) -> Result<String, String> {
     Ok(norm)
 }
 
+/// Parses a comma-separated mod spec list (`mods=uid1,uid2`), deduplicating case-insensitively.
+pub fn parse_mod_list(v: &str) -> Result<Vec<String>, String> {
+    let mut out: Vec<String> = Vec::new();
+    for raw in v.split(',') {
+        let item = raw.trim();
+        if item.is_empty() {
+            continue;
+        }
+        if item.bytes().any(|b| b < 0x20 || b == 0x7f || b == b'=') {
+            return Err(format!("invalid mod entry '{item}'"));
+        }
+        if !out.iter().any(|x| x.eq_ignore_ascii_case(item)) {
+            out.push(item.to_string());
+        }
+    }
+    Ok(out)
+}
+
 impl Settings {
     /// Applies one `key=value` pair; returns an error (and leaves the field unchanged)
     /// for unknown keys or invalid values.
@@ -373,6 +395,7 @@ impl Settings {
                     AaMode::parse(v).ok_or_else(|| format!("'{v}' is not off/fxaa/msaa4"))?
             }
             "gamma" => self.gamma_x100 = parse_gamma_x100(v)?,
+            "mods" => self.mods = parse_mod_list(v)?,
             other => match other.strip_prefix("key.") {
                 Some(id) => self.keys.set_from_setting(id, v)?,
                 None => return Err(format!("unknown key '{other}'")),
@@ -406,6 +429,7 @@ impl Settings {
             "bloom" => if self.bloom { "on" } else { "off" }.to_string(),
             "aa" => self.aa.key().to_string(),
             "gamma" => format_gamma_x100(self.gamma_x100),
+            "mods" => self.mods.join(","),
             other => {
                 let id = other.strip_prefix("key.")?;
                 let action = crate::keymap::action_by_id(id)?;
@@ -737,6 +761,7 @@ mod tests {
             bloom: false,
             aa: AaMode::Fxaa,
             gamma_x100: 125,
+            mods: vec!["heavy-tanks-001".into(), "extra-units".into()],
             keys: {
                 let mut k = crate::keymap::KeyMap::default();
                 k.set_from_setting("build_factory", "Ctrl+Shift+K").unwrap();

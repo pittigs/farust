@@ -32,8 +32,8 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::net::{
-    DEFAULT_INPUT_DELAY, Handshake, LockstepClient, LockstepHost, PROTOCOL_VERSION, TURN_TICKS, lobby_read_frame,
-    lobby_try_handshake, lobby_write_frame,
+    DEFAULT_INPUT_DELAY, Handshake, LockstepClient, LockstepHost, PROTOCOL_VERSION, TURN_TICKS,
+    lobby_finish_handshake, lobby_is_handshake, lobby_read_frame, lobby_write_frame,
 };
 use crate::replay::{read_str, read_u8, read_u32, read_u64, write_str};
 use crate::settings::FACTION_KEYS;
@@ -90,6 +90,8 @@ pub struct NetLobbyState {
     pub max_players: u8,
     pub slots: Vec<NetSlot>,
     pub peers: Vec<NetPeer>,
+    /// Phase 51: host-enabled mods advertised in the lobby (auto-synced at match start).
+    pub mods: Vec<crate::mods::ModIdentity>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,6 +110,7 @@ impl NetLobbyState {
             max_players: max_players.clamp(2, MAX_SLOTS as u8),
             slots: Vec::new(),
             peers: vec![NetPeer { id: HOST_ID, name: host_name.to_string(), ready: true }],
+            mods: crate::mods::active_identities(),
         };
         s.resize_slots(spots);
         s.slots[0] = NetSlot { kind: NetSlotKind::Peer(HOST_ID), faction: host_faction % 4, team: 0 };
@@ -307,6 +310,7 @@ impl NetLobbyState {
                 input_delay: DEFAULT_INPUT_DELAY,
                 tick_limit: 0,
                 assigned_army: 0,
+                mods: self.mods.clone(),
             },
             peers,
         ))
@@ -358,6 +362,7 @@ fn encode_state(out: &mut Vec<u8>, s: &NetLobbyState) {
         write_str(out, &p.name);
         out.push(p.ready as u8);
     }
+    crate::mods::encode_identities(out, &s.mods);
 }
 
 fn decode_state(d: &[u8], pos: &mut usize) -> Result<NetLobbyState, String> {
@@ -390,7 +395,8 @@ fn decode_state(d: &[u8], pos: &mut usize) -> Result<NetLobbyState, String> {
         let ready = read_u8(d, pos)? != 0;
         peers.push(NetPeer { id, name, ready });
     }
-    Ok(NetLobbyState { map_id, map_name, seed, max_players, slots, peers })
+    let mods = crate::mods::decode_identities(d, pos)?;
+    Ok(NetLobbyState { map_id, map_name, seed, max_players, slots, peers, mods })
 }
 
 pub fn encode_lobby_msg(m: &LobbyMsg) -> Vec<u8> {
@@ -1152,9 +1158,9 @@ fn run_client_stream(mut stream: TcpStream, name: String, writer: Arc<Mutex<Writ
             _ => false,
         }
     };
-    // CLI host (`farust host`): the handshake comes first, start right away.
-    if let Some(hs) = lobby_try_handshake(&first) {
-        match hs {
+    // CLI host (`farust host`): the handshake comes first, sync mods & start right away.
+    if lobby_is_handshake(&first) {
+        match lobby_finish_handshake(&mut stream, &first) {
             Ok(hs) if install(&stream) => {
                 let _ = tx.send(ClientEvent::Handshake(hs));
             }
@@ -1186,8 +1192,8 @@ fn run_client_stream(mut stream: TcpStream, name: String, writer: Arc<Mutex<Writ
             Ok(r) => r,
             Err(e) => return fail(&tx, format!("connection to host lost: {e}")),
         };
-        if let Some(hs) = lobby_try_handshake(&raw) {
-            match hs {
+        if lobby_is_handshake(&raw) {
+            match lobby_finish_handshake(&mut stream, &raw) {
                 Ok(hs) => {
                     let _ = tx.send(ClientEvent::Handshake(hs));
                 }
@@ -1240,8 +1246,8 @@ pub fn auto_join(stream: &mut TcpStream, first: &[u8]) -> Result<Handshake, Stri
     let _ = stream.set_read_timeout(None);
     loop {
         let raw = lobby_read_frame(stream)?;
-        if let Some(hs) = lobby_try_handshake(&raw) {
-            return hs;
+        if lobby_is_handshake(&raw) {
+            return lobby_finish_handshake(stream, &raw);
         }
         match decode_lobby_msg(&raw)? {
             LobbyMsg::Start => send(stream, &LobbyMsg::StartAck)?,
@@ -1280,7 +1286,7 @@ mod tests {
         ];
         for m in msgs {
             let enc = encode_lobby_msg(&m);
-            assert!(lobby_try_handshake(&enc).is_none());
+            assert!(!lobby_is_handshake(&enc));
             assert_eq!(decode_lobby_msg(&enc).unwrap(), m);
             assert!(decode_lobby_msg(&enc[..enc.len() - 1]).is_err() || enc.len() == 1);
             let mut extra = enc.clone();

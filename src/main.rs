@@ -75,7 +75,7 @@ fn print_usage() {
     eprintln!("  farust maps [GAME_DIR] [--limit N] [--check]      (stock + user maps, with source)");
     eprintln!("  farust roster [GAME_DIR] [--faction F] [--json]   (data-driven unit roster & coverage)");
     eprintln!("  farust loc [--check | <KEY> | --unit <ID>] [--lang CODE] [GAME_DIR] (localization tables)");
-    eprintln!("  farust mods                                       (installed blueprint mods)");
+    eprintln!("  farust mods [enable <SPEC> | disable <SPEC> | conflicts] (installed & persisted blueprint mods)");
     eprintln!("  global: --mod <DIR|NAME> (repeatable) enables a blueprint mod for any subcommand");
     eprintln!("  farust map <NAME> [GAME_DIR]");
     eprintln!("  farust map-roundtrip [--all | <MAP>] [GAME_DIR]   (.scmap v2.60 byte-exact round-trip check)");
@@ -2280,6 +2280,7 @@ fn cmd_host(args: &[String]) -> Result<(), String> {
         tick_limit: if interactive { 0 } else { ticks },
         assigned_army: 0,
         observers: flag_usize(args, "--observers").unwrap_or(0).min(8),
+        mods: catalog.mods.clone(),
     };
 
     let proto_label = match (use_udp, netem_spec) {
