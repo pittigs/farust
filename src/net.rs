@@ -3637,7 +3637,7 @@ mod tests {
             let grid = PathGrid::new(64, 64, 4 * SCALE);
             let mut w = Skirmish::new(cat, grid, (256 * SCALE, 256 * SCALE), vec![], setups, seed).unwrap();
             let u0 = w.spawn_unit(0, "UEL0201", (100 * SCALE, 100 * SCALE)).unwrap();
-            let u1 = w.spawn_unit(1, "URL0107", (124 * SCALE, 100 * SCALE)).unwrap();
+            let u1 = w.spawn_unit(1, "RT", (124 * SCALE, 100 * SCALE)).unwrap();
             w.issue(0, Command::Attack { units: vec![u0], target: u1, queue: false });
             w.issue(1, Command::Attack { units: vec![u1], target: u0, queue: false });
             w
@@ -3714,7 +3714,7 @@ mod tests {
 
         let cache_dir = std::env::temp_dir().join(format!("farust-net-modsync-bad-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&cache_dir);
-        let client_err = LockstepClient::connect_with_mods(&addr, &[], &cache_dir).unwrap_err();
+        let Err(client_err) = LockstepClient::connect_with_mods(&addr, &[], &cache_dir) else { panic!("expected a hash mismatch") };
         assert!(client_err.contains("hash mismatch"), "expected hash mismatch error, got: {client_err}");
         let host_ack = host_t.join().unwrap();
         assert!(host_ack.is_err(), "host should receive mod sync rejection");

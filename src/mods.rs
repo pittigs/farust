@@ -1389,7 +1389,7 @@ mod tests {
             ];
             let mut w = Skirmish::new(cat, grid, (256 * SCALE, 256 * SCALE), vec![], &setups, 42).unwrap();
             let u0 = w.spawn_unit(0, "UEL0201", (100 * SCALE, 100 * SCALE)).unwrap();
-            let u1 = w.spawn_unit(1, "URL0107", (125 * SCALE, 100 * SCALE)).unwrap();
+            let u1 = w.spawn_unit(1, "RT", (125 * SCALE, 100 * SCALE)).unwrap();
             w.issue(0, Command::Attack { units: vec![u0], target: u1, queue: false });
             w.issue(1, Command::Attack { units: vec![u1], target: u0, queue: false });
             w.run(120);
