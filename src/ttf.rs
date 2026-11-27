@@ -536,6 +536,21 @@ impl Font {
 pub const FIRST_CHAR: u8 = 32;
 pub const LAST_CHAR: u8 = 126;
 
+/// Extra Unicode characters baked into the atlas whenever the TrueType font provides a
+/// glyph for them: Latin-1 Supplement (`0xA0..=0xFF`, covering German `äöüÄÖÜß`, French,
+/// Spanish, Italian, etc.), common typographic punctuation, and Cyrillic (`0x0401`,
+/// `0x0410..=0x044F`, `0x0451`).
+fn extra_atlas_chars() -> Vec<char> {
+    let mut chars: Vec<char> = (0x00A0u32..=0x00FFu32).filter_map(char::from_u32).collect();
+    chars.extend(['\u{2013}', '\u{2014}', '\u{2018}', '\u{2019}', '\u{201C}', '\u{201D}', '\u{2022}', '\u{2026}', '\u{20AC}']);
+    chars.push('\u{0401}'); // Ё
+    chars.extend((0x0410u32..=0x044Fu32).filter_map(char::from_u32)); // А..я
+    chars.push('\u{0451}'); // ё
+    chars.sort_unstable();
+    chars.dedup();
+    chars
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AtlasGlyph {
     pub advance: f32,
@@ -552,13 +567,20 @@ pub struct AtlasFace {
     pub ascent: f32,
     pub descent: f32,
     pub glyphs: Vec<AtlasGlyph>,
+    /// Sorted `(codepoint, glyph)` table for non-ASCII characters (Latin-1, punctuation, Cyrillic).
+    pub extra: Vec<(char, AtlasGlyph)>,
 }
 
 impl AtlasFace {
     pub fn glyph(&self, c: char) -> &AtlasGlyph {
         let i = c as u32;
-        let i = if (FIRST_CHAR as u32..=LAST_CHAR as u32).contains(&i) { i } else { b'?' as u32 };
-        &self.glyphs[(i - FIRST_CHAR as u32) as usize]
+        if (FIRST_CHAR as u32..=LAST_CHAR as u32).contains(&i) {
+            return &self.glyphs[(i - FIRST_CHAR as u32) as usize];
+        }
+        if let Ok(idx) = self.extra.binary_search_by_key(&c, |(ch, _)| *ch) {
+            return &self.extra[idx].1;
+        }
+        &self.glyphs[(b'?' - FIRST_CHAR) as usize]
     }
 }
 
@@ -578,39 +600,49 @@ pub fn build_atlas(specs: &[(&Font, f32)], width: u32) -> (RgbaImage, Vec<AtlasF
     }
     let (mut x, mut y, mut shelf) = (6usize, 0usize, 4usize);
     let mut placed: Vec<(usize, usize, GlyphBitmap)> = Vec::new();
+    let mut place_glyph = |g: GlyphBitmap| -> AtlasGlyph {
+        if g.width + 2 > w {
+            return AtlasGlyph { advance: g.advance, ..Default::default() };
+        }
+        if x + g.width + 1 > w {
+            x = 0;
+            y += shelf + 1;
+            shelf = 0;
+        }
+        let idx = placed.len();
+        let ag = AtlasGlyph {
+            advance: g.advance,
+            left: g.left as f32,
+            top: g.top as f32,
+            width: g.width as f32,
+            height: g.height as f32,
+            uv: [idx as f32, 0.0, 0.0, 0.0], // patched below
+        };
+        shelf = shelf.max(g.height);
+        placed.push((x, y, g));
+        x += placed.last().map_or(0, |p| p.2.width) + 1;
+        ag
+    };
+    let extras = extra_atlas_chars();
     let mut faces = Vec::new();
     for (font, px) in specs {
         let scale = px / font.units_per_em;
-        let mut glyphs = Vec::new();
+        let mut glyphs = Vec::with_capacity((LAST_CHAR - FIRST_CHAR + 1) as usize);
         for code in FIRST_CHAR..=LAST_CHAR {
-            let g = font.rasterize(code as char, *px);
-            if g.width + 2 > w {
-                glyphs.push(AtlasGlyph { advance: g.advance, ..Default::default() });
-                continue;
+            glyphs.push(place_glyph(font.rasterize(code as char, *px)));
+        }
+        let mut extra = Vec::new();
+        for &ch in &extras {
+            if font.glyph_index(ch) != 0 {
+                extra.push((ch, place_glyph(font.rasterize(ch, *px))));
             }
-            if x + g.width + 1 > w {
-                x = 0;
-                y += shelf + 1;
-                shelf = 0;
-            }
-            let idx = placed.len();
-            glyphs.push(AtlasGlyph {
-                advance: g.advance,
-                left: g.left as f32,
-                top: g.top as f32,
-                width: g.width as f32,
-                height: g.height as f32,
-                uv: [idx as f32, 0.0, 0.0, 0.0], // patched below
-            });
-            shelf = shelf.max(g.height);
-            placed.push((x, y, g));
-            x += placed.last().map_or(0, |p| p.2.width) + 1;
         }
         faces.push(AtlasFace {
             px: *px,
             ascent: font.ascender * scale,
             descent: -font.descender * scale,
             glyphs,
+            extra,
         });
     }
     let total_h = (y + shelf + 1).max(4).next_power_of_two();
@@ -621,18 +653,24 @@ pub fn build_atlas(specs: &[(&Font, f32)], width: u32) -> (RgbaImage, Vec<AtlasF
             rows[gy + r][*gx..gx + g.width].copy_from_slice(&g.coverage[r * g.width..(r + 1) * g.width]);
         }
     }
+    let patch_uv = |gl: &mut AtlasGlyph| {
+        if gl.width == 0.0 {
+            return;
+        }
+        let (gx, gy, _) = &placed[gl.uv[0] as usize];
+        gl.uv = [
+            *gx as f32 / fw,
+            *gy as f32 / fh,
+            (*gx as f32 + gl.width) / fw,
+            (*gy as f32 + gl.height) / fh,
+        ];
+    };
     for face in &mut faces {
         for gl in &mut face.glyphs {
-            if gl.width == 0.0 {
-                continue;
-            }
-            let (gx, gy, _) = &placed[gl.uv[0] as usize];
-            gl.uv = [
-                *gx as f32 / fw,
-                *gy as f32 / fh,
-                (*gx as f32 + gl.width) / fw,
-                (*gy as f32 + gl.height) / fh,
-            ];
+            patch_uv(gl);
+        }
+        for (_, gl) in &mut face.extra {
+            patch_uv(gl);
         }
     }
     let mut pixels = Vec::with_capacity(w * total_h * 4);
@@ -688,5 +726,16 @@ mod tests {
         assert_eq!(faces[0].glyphs.len(), (LAST_CHAR - FIRST_CHAR + 1) as usize);
         assert!(faces[0].glyph('W').advance > faces[0].glyph('i').advance);
         assert_eq!(img.pixels.len(), (img.width * img.height * 4) as usize);
+        // Phase 37: German umlauts, ß, Latin-1 accents, and Cyrillic rasterize into the atlas.
+        let q_uv = faces[0].glyph('?').uv;
+        for ch in ['ä', 'ö', 'ü', 'Ä', 'Ö', 'Ü', 'ß', 'é', 'ñ', '€', 'Д'] {
+            let ag = faces[0].glyph(ch);
+            assert!(ag.width > 0.0 && ag.height > 0.0, "missing atlas glyph for '{ch}'");
+            assert_ne!(ag.uv, q_uv, "'{ch}' fell back to '?'");
+        }
+        // Composite umlaut 'Ä' must be taller than base 'A' (umlaut dots above cap height).
+        let ga = f.rasterize('A', 32.0);
+        let gae = f.rasterize('Ä', 32.0);
+        assert!(gae.height > ga.height, "Ä ({}) should be taller than A ({})", gae.height, ga.height);
     }
 }

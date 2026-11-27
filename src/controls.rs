@@ -368,10 +368,12 @@ pub fn unit_card_lines(world: &Skirmish, id: UnitId, selection_count: usize) -> 
         return Vec::new();
     };
     let ut = world.catalog().get(&u.type_id);
-    let name = ut
-        .map(|t| t.name.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| u.type_id.clone());
+    let fallback = ut.map(|t| t.name.trim()).unwrap_or("");
+    let role_name = crate::loc::unit_display_name(&u.type_id, fallback);
+    let name = match crate::loc::unit_proper_name(&u.type_id) {
+        Some(proper) if !proper.eq_ignore_ascii_case(&role_name) => format!("{proper} - {role_name}"),
+        _ => role_name,
+    };
     let mut lines = Vec::new();
     let head = if selection_count > 1 {
         format!("{} ({}) X{}", name, u.type_id, selection_count)

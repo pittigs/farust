@@ -20,10 +20,11 @@ pub enum Kind {
     ScMap,
     Dds,
     EffectBp,
+    Loc,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 5] = [Kind::Scm, Kind::Sca, Kind::ScMap, Kind::Dds, Kind::EffectBp];
+    pub const ALL: [Kind; 6] = [Kind::Scm, Kind::Sca, Kind::ScMap, Kind::Dds, Kind::EffectBp, Kind::Loc];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -32,6 +33,7 @@ impl Kind {
             Kind::ScMap => "scmap",
             Kind::Dds => "dds",
             Kind::EffectBp => "effectbp",
+            Kind::Loc => "loc",
         }
     }
 }
@@ -262,6 +264,14 @@ pub fn exercise(kind: Kind, data: &[u8]) -> bool {
                 Ok(_) => true,
                 Err(_) => false,
             }
+        }
+        Kind::Loc => {
+            let ok_db = crate::loc::parse_strings_db(data).is_ok();
+            let _ = crate::loc::parse_strings_db_lossy(data);
+            let ok_tt = crate::loc::parse_tooltips(data).is_ok();
+            let decoded = crate::loc::decode_text_bytes(data);
+            let _ = crate::loc::split_loc_tag(&decoded);
+            ok_db || ok_tt
         }
     }
 }
@@ -584,6 +594,23 @@ pub fn synthetic_effect_bps() -> Vec<(String, Vec<u8>)> {
     ]
 }
 
+/// Minimal valid loc string table + tooltips seed.
+pub fn synthetic_loc() -> Vec<(String, Vec<u8>)> {
+    vec![
+        (
+            "synthetic_strings_db.lua".into(),
+            "\u{FEFF}# synthetic loc\nuel0001_desc=\"Armored Command Unit\"\nuel0201_desc=\"Mittlerer Panzer (äöüß)\"\n['enh_01']=\"Tech-2-Paket\\nZeile 2\"\n"
+                .as_bytes()
+                .to_vec(),
+        ),
+        (
+            "synthetic_tooltips.lua".into(),
+            b"Tooltips = {\n move = { title = \"<LOC tooltipui0000>Move\", description = \"<LOC d>Go\", keyID = \"move\" },\n}\n"
+                .to_vec(),
+        ),
+    ]
+}
+
 /// Synthetic seeds for every parser family.
 pub fn synthetic_seeds() -> Vec<Seed> {
     let mut v = vec![
@@ -596,6 +623,9 @@ pub fn synthetic_seeds() -> Vec<Seed> {
     }
     for (label, bytes) in synthetic_effect_bps() {
         v.push(Seed { kind: Kind::EffectBp, label, bytes });
+    }
+    for (label, bytes) in synthetic_loc() {
+        v.push(Seed { kind: Kind::Loc, label, bytes });
     }
     v
 }

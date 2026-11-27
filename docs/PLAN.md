@@ -346,10 +346,27 @@ bumps `SIM_VERSION`, re-baselines golden hashes deliberately, and keeps
   waypoints, ferry routes for transports, shift-queue visual editing.
 - Exit: a template placed in-game builds identically in a replay.
 
-### Phase 37 — Localization & tooltips (planned)
-- Parse FA `loc` string tables, unit/enhancement descriptions and help text,
-  tooltips on every command-card button, language selection in Options.
-- Exit: switching to German shows localized unit names and tooltips.
+### Phase 37 — Localization & tooltips (done)
+- Never-panic FA `loc` parser (`src/loc.rs`, fuzzed via `Kind::Loc` in `src/fuzz.rs`):
+  loads `gamedata/loc_<LANG>.scd` (`strings_db.lua`/`usdb.lua`), loose `loc/<LANG>/`
+  and `$XDG_DATA_HOME/farust/loc/<LANG>/`, plus `lua.scd` `unitdescription.lua`
+  (448 entries) & `tooltips.lua` (463 entries) and blueprint enhancement metadata
+  (150 entries), with fallback chain active lang → built-in UI/DE fallback → US →
+  inline `<LOC key>Fallback`. CLI: `farust loc --check`, `farust loc <KEY> [--lang]`,
+  `farust loc --unit <ID> [--lang]`.
+- `language=<code>` in `settings.ini` (`src/settings.rs`), `FARUST_LANG` env override,
+  and live-previewing `Language` / `Sprache` selector in Options (`src/menu.rs`).
+- Latin-1 Supplement (`0xA0..=0xFF`, incl. German `äöüÄÖÜß`), typographic punctuation,
+  and Cyrillic (`0x0401`, `0x0410..=0x0451`) glyphs baked into the TrueType atlas
+  (`src/ttf.rs`) and rendered via a dedicated `hud_ttf` pass (`src/viewer.rs`,
+  `src/ui_kit.rs`, `src/hud.rs`) for crisp tooltips and localized unit stats cards
+  (`src/controls.rs`), with tooltips on every command-card slot, tab, category chip,
+  page, queue, upgrade, enhancement, and order button (`src/command_card.rs`).
+- Exit: `farust loc --check` verifies 6,413 `loc_US.scd` entries + German lookups;
+  German Options & in-match tooltip snapshots (`FARUST_LANG=de`) render localized
+  unit names, descriptions, and umlauts cleanly; 273/273 tests pass (incl. `Loc`
+  fuzzing); sim hashes unchanged (`sim-run` `35db8f2bd7a6faf2`, `skirmish SCMP_001`
+  `192e89b083b978cb`). Done.
 
 ### Phase 38 — Observer & caster tools (planned)
 - Live spectator slots in the lobby, observer HUD (all-army economy, army

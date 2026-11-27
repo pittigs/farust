@@ -193,6 +193,7 @@ enum Action {
     ToggleVsync,
     CycleShadow,
     CycleUiTheme,
+    CycleLanguage,
     SliderMaster(u8),
     SliderMusic(u8),
     SliderSfx(u8),
@@ -253,6 +254,9 @@ impl MenuState {
         };
         #[cfg(test)]
         let settings = Settings::default();
+
+        #[cfg(not(test))]
+        crate::loc::init(game_dir);
 
         let fonts = Fonts::load(game_dir);
         let mut images = ImageStore::default();
@@ -490,6 +494,19 @@ impl MenuState {
         }
     }
 
+    fn preview_lang(&self) -> String {
+        if let Ok(v) = std::env::var("FARUST_LANG")
+            && let Ok(code) = settings::validate_language(&v)
+        {
+            return code;
+        }
+        if matches!(self.screen, ScreenId::Options | ScreenId::Keys) {
+            self.draft.language.clone()
+        } else {
+            self.settings.language.clone()
+        }
+    }
+
     fn preview_classic_palette(&self) -> Option<ClassicPalette> {
         let env_theme = std::env::var("FARUST_UI_THEME").ok().and_then(|v| UiTheme::parse(&v));
         let (theme_mode, faction_idx) = if matches!(self.screen, ScreenId::Options | ScreenId::Keys) {
@@ -562,23 +579,31 @@ impl MenuState {
         }
         c.text(bx + 4.0, 148.0, bold(16.0), "FARUST DETERMINISTIC RTS ENGINE", theme::ACCENT);
 
+        let lang = self.preview_lang();
+        let tr = |k: &str, fb: &str| crate::loc::tr_lang(&lang, k, fb);
         let nav_box = Rect::new(bx - 16.0, (h * 0.34).max(190.0) - 18.0, 312.0, 316.0);
         c.panel(nav_box);
-        let labels = ["SKIRMISH", "MULTIPLAYER", "REPLAYS", "OPTIONS", "QUIT TO DESKTOP"];
+        let labels = [
+            tr("ui.skirmish", "SKIRMISH"),
+            tr("ui.multiplayer", "MULTIPLAYER"),
+            tr("ui.replays", "REPLAYS"),
+            tr("ui.options", "OPTIONS"),
+            tr("ui.quit_desktop", "QUIT TO DESKTOP"),
+        ];
         for (i, (r, _)) in self.main_widgets(w, h).into_iter().enumerate() {
             let st = WState {
                 hover: c.is_hover(r),
                 primary: i == 0,
                 ..Default::default()
             };
-            c.button(r, labels[i], st);
+            c.button(r, &labels[i], st);
         }
 
         // Right-hand profile & engine overview card
         let rx = (w - 430.0).max(bx + 340.0);
         if rx + 380.0 <= w - 24.0 {
             let rp = Rect::new(rx, nav_box.y, 380.0, nav_box.h);
-            let inner = c.titled_panel(rp, "COMMANDER PROFILE");
+            let inner = c.titled_panel(rp, &tr("ui.profile", "COMMANDER PROFILE"));
             let mut y = inner.y + 4.0;
             for (k, v) in [
                 ("Commander", self.settings.player_name.clone()),
@@ -1104,6 +1129,7 @@ impl MenuState {
             (Rect::new(lx + 14.0 + lw, y + step * 5.0, ctrl_w, 30.0), Action::SliderMusic(self.draft.music_volume)),
             (Rect::new(lx + 14.0 + lw, y + step * 6.0, ctrl_w, 30.0), Action::SliderSfx(self.draft.sfx_volume)),
             (Rect::new(lx + 14.0 + lw, y + step * 7.0, ctrl_w, 30.0), Action::CycleUiTheme),
+            (Rect::new(lx + 14.0 + lw, y + step * 8.0, ctrl_w, 30.0), Action::CycleLanguage),
         ];
         let _ = &mut y;
         let rctrl_w = (col_w - lw - 28.0).max(160.0);
@@ -1122,18 +1148,20 @@ impl MenuState {
     }
 
     fn draw_options(&self, c: &mut Canvas) {
+        let lang = self.preview_lang();
+        let tr = |k: &str, fb: &str| crate::loc::tr_lang(&lang, k, fb);
         let f = Frame::new(c.w, c.h);
         let path_lbl = settings::settings_path()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "settings.ini".to_string());
-        c.chrome(&f, "OPTIONS", &path_lbl);
+        c.chrome(&f, &tr("ui.options", "OPTIONS"), &path_lbl);
         let cnt = f.content;
         let col_w = ((cnt.w - 24.0) * 0.5).max(320.0);
         let lx = cnt.x;
         let rx = cnt.x + col_w + 24.0;
         let lw = 150.0;
-        c.titled_panel(Rect::new(lx, cnt.y, col_w, cnt.h), "GRAPHICS & AUDIO");
-        c.titled_panel(Rect::new(rx, cnt.y, col_w, cnt.h), "GAMEPLAY & CONTROLS");
+        c.titled_panel(Rect::new(lx, cnt.y, col_w, cnt.h), &tr("ui.graphics_audio", "GRAPHICS & AUDIO"));
+        c.titled_panel(Rect::new(rx, cnt.y, col_w, cnt.h), &tr("ui.gameplay_controls", "GAMEPLAY & CONTROLS"));
 
         for (r, act) in self.options_widgets(c.w, c.h) {
             let st = WState { hover: c.is_hover(r), ..Default::default() };
@@ -1142,59 +1170,64 @@ impl MenuState {
             };
             match act {
                 Action::CycleResolution => {
-                    label("Resolution");
+                    label(&tr("ui.resolution", "Resolution"));
                     c.cycler(r, &format!("{}x{}", self.draft.resolution.0, self.draft.resolution.1), st);
                 }
                 Action::ToggleFullscreen => {
-                    label("Fullscreen");
+                    label(&tr("ui.fullscreen", "Fullscreen"));
                     c.checkbox(r, self.draft.fullscreen, st);
                 }
                 Action::ToggleVsync => {
-                    label("VSync");
+                    label(&tr("ui.vsync", "VSync"));
                     c.checkbox(r, self.draft.vsync, st);
                 }
                 Action::CycleShadow => {
-                    label("Shadows");
+                    label(&tr("ui.shadows", "Shadows"));
                     c.cycler(r, self.draft.shadow_quality.key(), st);
                 }
                 Action::CycleUiTheme => {
-                    label("UI Theme");
+                    label(&tr("ui.ui_theme", "UI Theme"));
                     c.cycler(r, self.draft.ui_theme.label(), st);
                 }
+                Action::CycleLanguage => {
+                    label(&tr("ui.language", "Language"));
+                    let shown = crate::loc::language_display_name(&lang);
+                    c.cycler(r, &shown, st);
+                }
                 Action::SliderMaster(_) => {
-                    label("Master Volume");
+                    label(&tr("ui.master_volume", "Master Volume"));
                     c.slider(r, self.draft.master_volume as f32 / 100.0, &format!("{}%", self.draft.master_volume), st);
                 }
                 Action::SliderMusic(_) => {
-                    label("Music Volume");
+                    label(&tr("ui.music_volume", "Music Volume"));
                     c.slider(r, self.draft.music_volume as f32 / 100.0, &format!("{}%", self.draft.music_volume), st);
                 }
                 Action::SliderSfx(_) => {
-                    label("SFX Volume");
+                    label(&tr("ui.sfx_volume", "SFX Volume"));
                     c.slider(r, self.draft.sfx_volume as f32 / 100.0, &format!("{}%", self.draft.sfx_volume), st);
                 }
                 Action::Focus(FocusField::OptPlayerName) => {
-                    label("Player Name");
+                    label(&tr("ui.player_name", "Player Name"));
                     c.text_field(r, &self.draft.player_name, self.focus == FocusField::OptPlayerName, "Commander", st);
                 }
                 Action::CycleDefaultFaction => {
-                    label("Default Faction");
+                    label(&tr("ui.default_faction", "Default Faction"));
                     c.cycler(r, &faction_label(self.draft.default_faction), st);
                 }
                 Action::ToggleEdgeScroll => {
-                    label("Edge Scroll");
+                    label(&tr("ui.edge_scroll", "Edge Scroll"));
                     c.checkbox(r, self.draft.edge_scroll, st);
                 }
                 Action::Focus(FocusField::OptLastHost) => {
-                    label("Default Host");
+                    label(&tr("ui.default_host", "Default Host"));
                     c.text_field(r, &self.draft.last_host, self.focus == FocusField::OptLastHost, "127.0.0.1:15000", st);
                 }
                 Action::ToggleCardHotkeys => {
-                    label("Card Grid Keys");
+                    label(&tr("ui.card_hotkeys", "Card Grid Keys"));
                     c.checkbox(r, self.draft.card_hotkeys, st);
                 }
                 Action::Go(ScreenId::Keys) => {
-                    label("Key Bindings");
+                    label(&tr("ui.key_bindings", "Key Bindings"));
                     let n = self.draft.keys.conflicts().len();
                     let txt = if n > 0 {
                         format!("EDIT KEYS ({n} CONFLICTS)")
@@ -1205,9 +1238,9 @@ impl MenuState {
                     };
                     c.button(r, &txt, st);
                 }
-                Action::BackToMain => c.button(r, "BACK", st),
-                Action::ResetOptions => c.button(r, "DEFAULTS", st),
-                Action::SaveOptions => c.button(r, "SAVE & APPLY", WState { primary: true, ..st }),
+                Action::BackToMain => c.button(r, &tr("ui.back", "BACK"), st),
+                Action::ResetOptions => c.button(r, &tr("ui.defaults", "DEFAULTS"), st),
+                Action::SaveOptions => c.button(r, &tr("ui.save_apply", "SAVE & APPLY"), WState { primary: true, ..st }),
                 _ => {}
             }
         }
@@ -1436,6 +1469,16 @@ impl MenuState {
                 self.draft.ui_theme = UiTheme::ALL[(i + 1) % UiTheme::ALL.len()];
                 self.set_status(
                     format!("Theme: {} (click SAVE & APPLY to keep)", self.draft.ui_theme.label()),
+                    false,
+                );
+            }
+            Action::CycleLanguage => {
+                let langs = crate::loc::available_languages();
+                let i = langs.iter().position(|(c, _)| c == &self.draft.language).unwrap_or(0);
+                let (next_code, next_name) = &langs[(i + 1) % langs.len()];
+                self.draft.language = next_code.clone();
+                self.set_status(
+                    format!("Language: {next_name} (click SAVE & APPLY to keep)"),
                     false,
                 );
             }
@@ -1677,6 +1720,7 @@ impl MenuState {
         }
         self.settings = self.draft.clone();
         settings::set_active(Some(self.settings.clone()));
+        crate::loc::set_language(&self.settings.language);
         Ok(())
     }
 
@@ -2442,5 +2486,19 @@ mod tests {
             }
         }
         st.close_mp_session();
+    }
+
+    #[test]
+    fn options_language_cycler_switches_and_draws_german() {
+        let mut st = MenuState::new(Path::new("/nonexistent"), &MenuOptions::default()).unwrap();
+        st.navigate(ScreenId::Options);
+        assert_eq!(st.draft.language, "us");
+        let ws = st.options_widgets(1280.0, 800.0);
+        let (cx, cy) = ws.iter().find(|(_, a)| matches!(a, Action::CycleLanguage)).unwrap().0.center();
+        st.click(1280.0, 800.0, cx, cy);
+        assert_eq!(st.draft.language, "de");
+        let mut c = Canvas::new(1280.0, 800.0, &st.fonts, &st.images, None);
+        st.draw(&mut c);
+        assert!(c.batches.iter().map(|b| b.idx.len()).sum::<usize>() > 100);
     }
 }
