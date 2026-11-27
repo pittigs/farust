@@ -1,0 +1,51 @@
+# Phase 57: tests, golden hashes, fuzzers and lints on every push / PR, on all three
+# desktop platforms and both CPU architectures. No Forged Alliance data is needed: tests
+# that need the game skip themselves, everything else uses the built-in test catalog.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  FA_PATH: /nonexistent
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, macos-latest, macos-13]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Unit, loopback-network & golden-hash tests
+        run: cargo test --release --locked
+      - name: Phase 4 synthetic sim golden hash
+        shell: bash
+        run: |
+          hash="$(cargo run --release --locked -- sim-run --ticks 10000 --hash | tail -n1)"
+          echo "sim hash: $hash"
+          test "$hash" = "35db8f2bd7a6faf2"
+      - name: Parser fuzzers (synthetic corpus)
+        run: cargo run --release --locked -- fuzz-parsers --no-real --iters 20000
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy (report only until the backlog is cleared, see docs/RELEASE.md)
+        run: cargo clippy --release --all-targets --locked
+      - name: Cross-target type checks
+        run: |
+          rustup target add x86_64-pc-windows-gnu aarch64-apple-darwin
+          cargo check --release --locked --target x86_64-pc-windows-gnu
+          cargo check --release --locked --target aarch64-apple-darwin

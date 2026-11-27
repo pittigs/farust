@@ -61,6 +61,92 @@ impl ShadowQuality {
     }
 }
 
+/// Phase 42 anti-aliasing mode (`off`, `fxaa`, `msaa4`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AaMode {
+    Off,
+    Fxaa,
+    #[default]
+    Msaa4,
+}
+
+impl AaMode {
+    pub const ALL: [AaMode; 3] = [Self::Off, Self::Fxaa, Self::Msaa4];
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Fxaa => "fxaa",
+            Self::Msaa4 => "msaa4",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::Fxaa => "FXAA",
+            Self::Msaa4 => "MSAA 4x",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "off" | "none" | "0" => Some(Self::Off),
+            "fxaa" => Some(Self::Fxaa),
+            "msaa4" | "msaa" | "msaa4x" | "4x" => Some(Self::Msaa4),
+            _ => None,
+        }
+    }
+
+    /// MSAA sample count for the 3D HDR scene target (`4` for `Msaa4`, `1` otherwise).
+    pub fn sample_count(self) -> u32 {
+        match self {
+            Self::Msaa4 => 4,
+            Self::Off | Self::Fxaa => 1,
+        }
+    }
+}
+
+/// Gamma bounds in hundredths (`80..=140` => `0.80..=1.40`, default `100` => `1.00`).
+pub const GAMMA_MIN_X100: u16 = 80;
+pub const GAMMA_MAX_X100: u16 = 140;
+pub const GAMMA_DEFAULT_X100: u16 = 100;
+
+/// Front-end & in-match HUD visual theme (`modern` = default FARust gunmetal/cyan,
+/// `classic` = old-school Forged Alliance bottom console + faction skins).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UiTheme {
+    #[default]
+    Modern,
+    Classic,
+}
+
+impl UiTheme {
+    pub const ALL: [UiTheme; 2] = [Self::Modern, Self::Classic];
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Modern => "modern",
+            Self::Classic => "classic",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Modern => "Modern",
+            Self::Classic => "Classic (FA)",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "modern" => Some(Self::Modern),
+            "classic" | "fa" | "oldschool" => Some(Self::Classic),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Settings {
     pub resolution: (u32, u32),
@@ -80,6 +166,23 @@ pub struct Settings {
     /// Phase 23: FA grid hotkeys (Q W E R T / A S D F G / Z X C V B) on the command card
     /// while a builder or factory is selected (off = legacy single-key bindings win).
     pub card_hotkeys: bool,
+    /// Phase 27: UI layout & skin theme (`modern` or `classic`).
+    pub ui_theme: UiTheme,
+    /// Phase 37: localization language code (`us`, `de`, `fr`, ...).
+    pub language: String,
+    /// Phase 26: lightweight TCP rendezvous + relay server (`HOST:PORT`).
+    pub rendezvous_server: String,
+    /// Phase 39 accessibility: colour-blind safe army palette, swapped mouse buttons and
+    /// on-screen captions for announcer voice lines.
+    pub colorblind: bool,
+    pub mouse_swap: bool,
+    pub subtitles: bool,
+    /// Phase 42 HDR post-processing: bloom, anti-aliasing (`off|fxaa|msaa4`), gamma (`80..=140` => `0.80..=1.40`).
+    pub bloom: bool,
+    pub aa: AaMode,
+    pub gamma_x100: u16,
+    /// Phase 51: persisted enabled blueprint mods (`mods=uid1,uid2`).
+    pub mods: Vec<String>,
     /// Phase 23: remappable key bindings (`key.<action>=Ctrl+Shift+K`).
     pub keys: crate::keymap::KeyMap,
 }
@@ -99,6 +202,16 @@ impl Default for Settings {
             edge_scroll: true,
             last_host: "127.0.0.1:15000".to_string(),
             card_hotkeys: false,
+            ui_theme: UiTheme::Modern,
+            language: "us".to_string(),
+            rendezvous_server: crate::rendezvous::DEFAULT_ADDR.to_string(),
+            colorblind: false,
+            mouse_swap: false,
+            subtitles: true,
+            bloom: true,
+            aa: AaMode::Msaa4,
+            gamma_x100: GAMMA_DEFAULT_X100,
+            mods: Vec::new(),
             keys: crate::keymap::KeyMap::default(),
         }
     }
@@ -106,11 +219,14 @@ impl Default for Settings {
 
 /// Every key written to / understood in `settings.ini`, in file order (followed by one
 /// `key.<action>` line per bindable action, see [`crate::keymap`]).
-pub const KEYS: [&str; 12] = [
+pub const KEYS: [&str; 22] = [
     "resolution",
     "fullscreen",
     "vsync",
     "shadow_quality",
+    "bloom",
+    "aa",
+    "gamma",
     "master_volume",
     "music_volume",
     "sfx_volume",
@@ -119,6 +235,13 @@ pub const KEYS: [&str; 12] = [
     "edge_scroll",
     "last_host",
     "card_hotkeys",
+    "ui_theme",
+    "language",
+    "rendezvous_server",
+    "colorblind",
+    "mouse_swap",
+    "subtitles",
+    "mods",
 ];
 
 fn parse_bool(v: &str) -> Result<bool, String> {
@@ -127,6 +250,22 @@ fn parse_bool(v: &str) -> Result<bool, String> {
         "0" | "false" | "no" | "off" => Ok(false),
         other => Err(format!("'{other}' is not a boolean (true/false)")),
     }
+}
+
+pub fn parse_gamma_x100(v: &str) -> Result<u16, String> {
+    let f: f32 = v
+        .trim()
+        .parse()
+        .map_err(|_| format!("'{}' is not a gamma number 0.8..1.4", v.trim()))?;
+    if !f.is_finite() || !(0.8..=1.4).contains(&f) {
+        return Err(format!("{f} is out of gamma range 0.8..1.4"));
+    }
+    Ok((f * 100.0).round().clamp(GAMMA_MIN_X100 as f32, GAMMA_MAX_X100 as f32) as u16)
+}
+
+pub fn format_gamma_x100(g: u16) -> String {
+    let clamped = g.clamp(GAMMA_MIN_X100, GAMMA_MAX_X100);
+    format!("{:.2}", clamped as f32 / 100.0)
 }
 
 fn parse_percent(v: &str) -> Result<u8, String> {
@@ -184,6 +323,39 @@ pub fn faction_index(key: &str) -> Option<usize> {
     FACTION_KEYS.iter().position(|k| k.eq_ignore_ascii_case(key.trim()))
 }
 
+/// Validates a localization language code (`us`, `de`, `fr`, `en_US`, ...).
+pub fn validate_language(v: &str) -> Result<String, String> {
+    let t = v.trim();
+    if !(2..=12).contains(&t.len())
+        || !t.bytes().all(|b| b.is_ascii_alphabetic() || b == b'_' || b == b'-')
+    {
+        return Err(format!("'{t}' is not a valid language code (e.g. us, de, fr)"));
+    }
+    let norm = crate::loc::normalize_lang(t);
+    if !(2..=4).contains(&norm.len()) || !norm.bytes().all(|b| b.is_ascii_alphabetic()) {
+        return Err(format!("'{t}' is not a valid language code"));
+    }
+    Ok(norm)
+}
+
+/// Parses a comma-separated mod spec list (`mods=uid1,uid2`), deduplicating case-insensitively.
+pub fn parse_mod_list(v: &str) -> Result<Vec<String>, String> {
+    let mut out: Vec<String> = Vec::new();
+    for raw in v.split(',') {
+        let item = raw.trim();
+        if item.is_empty() {
+            continue;
+        }
+        if item.bytes().any(|b| b < 0x20 || b == 0x7f || b == b'=') {
+            return Err(format!("invalid mod entry '{item}'"));
+        }
+        if !out.iter().any(|x| x.eq_ignore_ascii_case(item)) {
+            out.push(item.to_string());
+        }
+    }
+    Ok(out)
+}
+
 impl Settings {
     /// Applies one `key=value` pair; returns an error (and leaves the field unchanged)
     /// for unknown keys or invalid values.
@@ -208,6 +380,22 @@ impl Settings {
             "edge_scroll" => self.edge_scroll = parse_bool(v)?,
             "last_host" => self.last_host = validate_host_addr(v)?,
             "card_hotkeys" => self.card_hotkeys = parse_bool(v)?,
+            "ui_theme" => {
+                self.ui_theme =
+                    UiTheme::parse(v).ok_or_else(|| format!("'{v}' is not modern/classic"))?
+            }
+            "language" => self.language = validate_language(v)?,
+            "rendezvous_server" => self.rendezvous_server = validate_host_addr(v)?,
+            "colorblind" => self.colorblind = parse_bool(v)?,
+            "mouse_swap" => self.mouse_swap = parse_bool(v)?,
+            "subtitles" => self.subtitles = parse_bool(v)?,
+            "bloom" => self.bloom = parse_bool(v)?,
+            "aa" => {
+                self.aa =
+                    AaMode::parse(v).ok_or_else(|| format!("'{v}' is not off/fxaa/msaa4"))?
+            }
+            "gamma" => self.gamma_x100 = parse_gamma_x100(v)?,
+            "mods" => self.mods = parse_mod_list(v)?,
             other => match other.strip_prefix("key.") {
                 Some(id) => self.keys.set_from_setting(id, v)?,
                 None => return Err(format!("unknown key '{other}'")),
@@ -232,6 +420,16 @@ impl Settings {
             "edge_scroll" => b(self.edge_scroll),
             "last_host" => self.last_host.clone(),
             "card_hotkeys" => b(self.card_hotkeys),
+            "ui_theme" => self.ui_theme.key().to_string(),
+            "language" => self.language.clone(),
+            "rendezvous_server" => self.rendezvous_server.clone(),
+            "colorblind" => b(self.colorblind),
+            "mouse_swap" => b(self.mouse_swap),
+            "subtitles" => b(self.subtitles),
+            "bloom" => if self.bloom { "on" } else { "off" }.to_string(),
+            "aa" => self.aa.key().to_string(),
+            "gamma" => format_gamma_x100(self.gamma_x100),
+            "mods" => self.mods.join(","),
             other => {
                 let id = other.strip_prefix("key.")?;
                 let action = crate::keymap::action_by_id(id)?;
@@ -314,23 +512,16 @@ impl Settings {
     }
 }
 
-fn env_dir(var: &str) -> Option<PathBuf> {
-    std::env::var_os(var).filter(|v| !v.is_empty()).map(PathBuf::from)
-}
-
-/// `$XDG_CONFIG_HOME/farust` or `~/.config/farust`.
+/// `$XDG_CONFIG_HOME/farust` or `~/.config/farust` (Windows `%APPDATA%\farust`, macOS
+/// `~/Library/Application Support/farust`; see [`crate::platform::config_home`]).
 pub fn config_dir() -> Option<PathBuf> {
-    env_dir("XDG_CONFIG_HOME")
-        .or_else(|| env_dir("HOME").map(|h| h.join(".config")))
-        .map(|d| d.join("farust"))
+    crate::platform::config_home().map(|d| d.join("farust"))
 }
 
-/// `$XDG_DATA_HOME/farust` or `~/.local/share/farust`.
+/// `$XDG_DATA_HOME/farust` or `~/.local/share/farust` (per-OS, see [`crate::platform::data_home`]).
 #[allow(dead_code)]
 pub fn data_dir() -> Option<PathBuf> {
-    env_dir("XDG_DATA_HOME")
-        .or_else(|| env_dir("HOME").map(|h| h.join(".local").join("share")))
-        .map(|d| d.join("farust"))
+    Some(crate::platform::data_home().join("farust"))
 }
 
 pub fn settings_path() -> Option<PathBuf> {
@@ -349,6 +540,87 @@ pub fn set_active(s: Option<Settings>) {
     if let Ok(mut g) = ACTIVE.write() {
         *g = s;
     }
+    ACCESS_FLAGS.store(0, std::sync::atomic::Ordering::Relaxed);
+    RENDER_POST_CACHE.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Phase 39: cached accessibility flags (bit 0 = known, 1 = colour-blind, 2 = mouse swap,
+/// 3 = subtitles). Read per unit per frame, so never clone the settings on the hot path.
+static ACCESS_FLAGS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Phase 42: cached HDR post-processing settings (bit 0 = known, bit 1 = bloom,
+/// bits 2..=3 = AaMode, bits 8..=15 = gamma_x100). Read per frame without locking/cloning.
+static RENDER_POST_CACHE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+fn render_post_packed() -> u32 {
+    use std::sync::atomic::Ordering::Relaxed;
+    let p = RENDER_POST_CACHE.load(Relaxed);
+    if p & 1 != 0 {
+        return p;
+    }
+    let s = input_settings();
+    let bloom = std::env::var("FARUST_BLOOM")
+        .ok()
+        .and_then(|v| parse_bool(&v).ok())
+        .unwrap_or(s.bloom);
+    let aa = std::env::var("FARUST_AA")
+        .ok()
+        .and_then(|v| AaMode::parse(&v))
+        .unwrap_or(s.aa);
+    let gamma_x100 = std::env::var("FARUST_GAMMA")
+        .ok()
+        .and_then(|v| parse_gamma_x100(&v).ok())
+        .unwrap_or(s.gamma_x100)
+        .clamp(GAMMA_MIN_X100, GAMMA_MAX_X100);
+    let aa_bits: u32 = match aa {
+        AaMode::Off => 0,
+        AaMode::Fxaa => 1,
+        AaMode::Msaa4 => 2,
+    };
+    let packed = 1 | (u32::from(bloom) << 1) | (aa_bits << 2) | (u32::from(gamma_x100) << 8);
+    RENDER_POST_CACHE.store(packed, Relaxed);
+    packed
+}
+
+/// Phase 42: lock-free cached `(bloom_enabled, aa_mode, gamma)` for the renderer hot path.
+pub fn render_post() -> (bool, AaMode, f32) {
+    let p = render_post_packed();
+    let bloom = (p & 2) != 0;
+    let aa = match (p >> 2) & 3 {
+        0 => AaMode::Off,
+        1 => AaMode::Fxaa,
+        _ => AaMode::Msaa4,
+    };
+    let gamma = ((p >> 8) & 0xFF).clamp(u32::from(GAMMA_MIN_X100), u32::from(GAMMA_MAX_X100)) as f32 / 100.0;
+    (bloom, aa, gamma)
+}
+
+#[allow(dead_code)]
+pub fn bloom_enabled() -> bool {
+    render_post().0
+}
+
+#[allow(dead_code)]
+pub fn aa_mode() -> AaMode {
+    render_post().1
+}
+
+#[allow(dead_code)]
+pub fn gamma() -> f32 {
+    render_post().2
+}
+
+fn access_flags() -> u8 {
+    use std::sync::atomic::Ordering::Relaxed;
+    let f = ACCESS_FLAGS.load(Relaxed);
+    if f & 1 != 0 {
+        return f;
+    }
+    let s = input_settings();
+    let cb = s.colorblind || std::env::var("FARUST_COLORBLIND").is_ok_and(|v| v == "1");
+    let f = 1 | u8::from(cb) << 1 | u8::from(s.mouse_swap) << 2 | u8::from(s.subtitles) << 3;
+    ACCESS_FLAGS.store(f, Relaxed);
+    f
 }
 
 pub fn active() -> Option<Settings> {
@@ -406,6 +678,54 @@ pub fn card_hotkeys_enabled() -> bool {
     input_settings().card_hotkeys || std::env::var("FARUST_CARD_HOTKEYS").is_ok_and(|v| v == "1")
 }
 
+/// Phase 39: colour-blind safe army colours (`FARUST_COLORBLIND=1` overrides).
+pub fn colorblind() -> bool {
+    access_flags() & 2 != 0
+}
+
+/// Phase 39: left / right mouse buttons swapped in matches.
+pub fn mouse_swap() -> bool {
+    access_flags() & 4 != 0
+}
+
+/// Phase 39: captions for announcer voice lines.
+pub fn subtitles() -> bool {
+    access_flags() & 8 != 0
+}
+
+/// Active UI visual theme (`FARUST_UI_THEME` env var overrides `settings.ini`, default `Modern`).
+pub fn ui_theme() -> UiTheme {
+    if let Ok(v) = std::env::var("FARUST_UI_THEME")
+        && let Some(t) = UiTheme::parse(&v)
+    {
+        return t;
+    }
+    input_settings().ui_theme
+}
+
+/// Active localization language (`FARUST_LANG` env var overrides `settings.ini`, default `"us"`).
+pub fn language() -> String {
+    if let Ok(v) = std::env::var("FARUST_LANG")
+        && let Ok(code) = validate_language(&v)
+    {
+        return code;
+    }
+    input_settings().language
+}
+
+/// Active rendezvous server address (`FARUST_RENDEZVOUS` env var overrides `settings.ini`).
+pub fn effective_rendezvous(override_s: Option<&Settings>) -> String {
+    if let Ok(v) = std::env::var("FARUST_RENDEZVOUS") {
+        let t = v.trim();
+        if !t.is_empty() {
+            return t.to_string();
+        }
+    }
+    override_s
+        .map(|s| s.rendezvous_server.clone())
+        .unwrap_or_else(|| input_settings().rendezvous_server)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -425,6 +745,16 @@ mod tests {
             edge_scroll: false,
             last_host: "192.168.1.20:15400".into(),
             card_hotkeys: true,
+            ui_theme: UiTheme::Classic,
+            language: "de".into(),
+            rendezvous_server: "relay.example.org:15050".into(),
+            colorblind: true,
+            mouse_swap: true,
+            subtitles: false,
+            bloom: false,
+            aa: AaMode::Fxaa,
+            gamma_x100: 125,
+            mods: vec!["heavy-tanks-001".into(), "extra-units".into()],
             keys: {
                 let mut k = crate::keymap::KeyMap::default();
                 k.set_from_setting("build_factory", "Ctrl+Shift+K").unwrap();
@@ -528,5 +858,75 @@ mod tests {
         let (d, w) = Settings::load_from(&dir.join("missing.ini"));
         assert_eq!(d, Settings::default());
         assert!(w.is_empty());
+    }
+
+    #[test]
+    fn ui_theme_and_rendezvous_round_trip_and_defaults() {
+        assert_eq!(UiTheme::parse("CLASSIC"), Some(UiTheme::Classic));
+        assert_eq!(UiTheme::parse("fa"), Some(UiTheme::Classic));
+        assert_eq!(UiTheme::parse("modern"), Some(UiTheme::Modern));
+        assert_eq!(UiTheme::parse("unknown"), None);
+
+        let (s, w) = Settings::parse("ui_theme=retro\nrendezvous_server=badaddr\n");
+        assert_eq!(s.ui_theme, UiTheme::Modern);
+        assert_eq!(s.rendezvous_server, crate::rendezvous::DEFAULT_ADDR);
+        assert_eq!(w.len(), 2, "{w:?}");
+
+        let (c, cw) = Settings::parse("ui_theme=classic\nlanguage=DE\nrendezvous_server=10.0.0.5:15050\n");
+        assert!(cw.is_empty(), "{cw:?}");
+        assert_eq!(c.ui_theme, UiTheme::Classic);
+        assert_eq!(c.language, "de");
+        assert_eq!(c.rendezvous_server, "10.0.0.5:15050");
+        assert_eq!(c.get("ui_theme").as_deref(), Some("classic"));
+        assert_eq!(c.get("language").as_deref(), Some("de"));
+        assert_eq!(c.get("rendezvous_server").as_deref(), Some("10.0.0.5:15050"));
+
+        let (bad, bw) = Settings::parse("language=123!!\n");
+        assert_eq!(bad.language, "us");
+        assert_eq!(bw.len(), 1, "{bw:?}");
+        assert_eq!(validate_language("en_US").as_deref(), Ok("us"));
+        assert_eq!(validate_language("de-DE").as_deref(), Ok("de"));
+        assert_eq!(validate_language("fr").as_deref(), Ok("fr"));
+    }
+
+    #[test]
+    fn phase42_hdr_post_settings_round_trip_and_cache() {
+        assert_eq!(AaMode::parse("OFF"), Some(AaMode::Off));
+        assert_eq!(AaMode::parse("fxaa"), Some(AaMode::Fxaa));
+        assert_eq!(AaMode::parse("MSAA4"), Some(AaMode::Msaa4));
+        assert_eq!(AaMode::parse("taa"), None);
+        assert_eq!(AaMode::Off.sample_count(), 1);
+        assert_eq!(AaMode::Fxaa.sample_count(), 1);
+        assert_eq!(AaMode::Msaa4.sample_count(), 4);
+
+        assert_eq!(parse_gamma_x100("0.8"), Ok(80));
+        assert_eq!(parse_gamma_x100("1.00"), Ok(100));
+        assert_eq!(parse_gamma_x100("1.4"), Ok(140));
+        assert!(parse_gamma_x100("0.79").is_err());
+        assert!(parse_gamma_x100("1.41").is_err());
+        assert!(parse_gamma_x100("nan").is_err());
+
+        let (s, w) = Settings::parse("bloom=off\naa=fxaa\ngamma=1.15\n");
+        assert!(w.is_empty(), "{w:?}");
+        assert!(!s.bloom);
+        assert_eq!(s.aa, AaMode::Fxaa);
+        assert_eq!(s.gamma_x100, 115);
+        assert_eq!(s.get("bloom").as_deref(), Some("off"));
+        assert_eq!(s.get("aa").as_deref(), Some("fxaa"));
+        assert_eq!(s.get("gamma").as_deref(), Some("1.15"));
+
+        let (bad, bw) = Settings::parse("bloom=maybe\naa=ssaa\ngamma=2.5\n");
+        assert_eq!(bw.len(), 3, "{bw:?}");
+        assert!(bad.bloom);
+        assert_eq!(bad.aa, AaMode::Msaa4);
+        assert_eq!(bad.gamma_x100, GAMMA_DEFAULT_X100);
+
+        let prev = active();
+        set_active(Some(s));
+        let (bl, aa, gam) = render_post();
+        assert!(!bl);
+        assert_eq!(aa, AaMode::Fxaa);
+        assert!((gam - 1.15).abs() < 1e-5);
+        set_active(prev);
     }
 }

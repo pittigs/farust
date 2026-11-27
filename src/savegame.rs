@@ -55,12 +55,7 @@ pub fn data_dir(kind: &str) -> PathBuf {
     if local.is_dir() {
         return local.join(kind);
     }
-    let base = std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
-        .unwrap_or_else(|| PathBuf::from("."));
-    base.join("farust").join(kind)
+    crate::platform::data_home().join("farust").join(kind)
 }
 
 /// `--no-record` on the command line (or `FARUST_NO_RECORD` in the environment) disables
@@ -122,6 +117,7 @@ pub fn origin_world(catalog: Catalog, map: &MapContext, replay: &Replay) -> Resu
         ));
     }
     crate::mods::check_match(&replay.header.mods, &catalog.mods, "this save")?;
+    replay.header.check_rules("this save")?;
     let mut world = Skirmish::new(
         catalog,
         map.grid.clone(),
@@ -130,11 +126,9 @@ pub fn origin_world(catalog: Catalog, map: &MapContext, replay: &Replay) -> Resu
         &replay.header.setups,
         replay.header.seed,
     )?;
-    world.set_domain_grids(
-        map.naval_grid.clone(),
-        map.amphib_grid.clone(),
-        map.hydro_points.clone(),
-    );
+    world.attach_map(map);
+    world.set_options(replay.header.options);
+    replay.header.apply_mission(&mut world, map)?;
     Ok(world)
 }
 
@@ -186,6 +180,7 @@ impl MatchRecorder {
     /// Replay of the match up to the current state of `world` (generic `replay.rs` codec).
     pub fn to_replay(&self, map_id: &str, world: &Skirmish) -> Replay {
         let mut rec = ReplayRecorder::new(map_id, world.seed(), setups_of(world));
+        rec.set_mission(world.mission_source());
         let now = world.tick();
         for (tick, army, cmd) in self.commands.iter().filter(|c| c.0 < now) {
             rec.record(*tick, *army, cmd);

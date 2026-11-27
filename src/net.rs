@@ -52,13 +52,36 @@ use crate::replay::{
 };
 use crate::skirmish::{ArmyId, ArmySetup, Command, Skirmish};
 use crate::skirmish_ai::ScriptedAi;
+use crate::udp_transport::{NetemConfig, NetemStats, ROLE_HOST, UdpChannel, UdpMux};
 
 pub const TURN_TICKS: u64 = 3;
 /// Turns between collecting a command and executing it (latency hiding).
 pub const DEFAULT_INPUT_DELAY: u64 = 2;
+pub const MIN_INPUT_DELAY: u64 = 1;
+pub const MAX_INPUT_DELAY: u64 = 8;
+pub const ADAPTIVE_MIN_DELAY: u64 = 2;
+pub const ADAPTIVE_MAX_DELAY: u64 = 8;
+const ADAPTIVE_EVAL_INTERVAL: u64 = 8;
+const ADAPTIVE_DOWN_HYSTERESIS: u8 = 2;
 /// v3: menu-hosted lobbies greet with `Welcome` (`net_lobby.rs`); in-game turns carry [`NetControl`]s.
 /// v4 (Phase 24): handshake carries the enabled mods' identities.
-pub const PROTOCOL_VERSION: u32 = 4;
+/// v5 (Phase 28): wall sections are buildable and block pathing (older peers would reject
+/// wall `Build` commands and desync), so mixed v4/v5 games are refused at the handshake.
+/// v6 (Phase 29): sim rules v2 (ballistics, turrets, structure footprints).
+/// v7 (Phase 30): sim rules v3 (air fuel & staging).
+/// v8 (Phase 31): sim rules v4 (engineering stations & pod drones).
+/// v9 (Phase 32): sim rules v5 (mobile factories & staging, hatching eggs).
+/// v10 (Phase 33): sim rules v6 (Novax, EMP stun, death weapons, kamikaze).
+/// v11 (Phase 34): sim rules v7 (prop & live-unit reclaim).
+/// v12 (Phase 35): sim rules v8 (fire states, ground fire, guard, build pause).
+/// v13 (Phase 36): sim rules v9 (waypoint moves, ferries).
+/// v14 (Phase 44): reliable UDP lockstep transport & synchronized adaptive input delay (`NetControl::InputDelay`).
+/// v15 (Phase 53): sim rules v10 (pings as commands).
+/// v16 (Phase 45): rejoin & late join (`MSG_REJOIN`, handshake `join_turn`, turn history
+/// transfer, `NetControl::Rejoined`).
+/// v16 (Phase 51): automatic lobby/handshake mod sync with hash verification.
+/// v17: both of the above (Phase 45 rejoin + Phase 51 mod sync).
+pub const PROTOCOL_VERSION: u32 = 17;
 /// The host's army (star-topology relay); only it may change the game speed.
 pub const HOST_ARMY: ArmyId = 0;
 /// Sender id of host-generated control messages (`Dropped`).
@@ -69,11 +92,24 @@ pub const MAX_PAUSES_PER_PLAYER: u8 = 3;
 const DESYNC_EXTRA_TURNS: u64 = 3;
 const MAX_CONTROLS: usize = 1024;
 const MAX_FRAME_BYTES: usize = 2 * 1024 * 1024;
+const MOD_CHUNK_BYTES: usize = 512 * 1024;
 const NET_TIMEOUT: Duration = Duration::from_secs(60);
 const HISTORY_TURNS: usize = 4;
 const MSG_HANDSHAKE: u8 = 1;
 const MSG_TURN: u8 = 2;
 const MSG_TURN_BUNDLE: u8 = 3;
+const MSG_MOD_SYNC_REQ: u8 = 4;
+const MSG_MOD_CHUNK: u8 = 5;
+const MSG_MOD_SYNC_ACK: u8 = 6;
+/// Phase 45: first frame of a peer that rejoins a running match (`[7, version u32, army u8]`,
+/// army [`REJOIN_OBSERVER`] = join as a new live observer).
+const MSG_REJOIN: u8 = 7;
+/// Phase 45: precedes the turn history sent to a rejoining peer (`[8, count u64]`).
+const MSG_HISTORY: u8 = 8;
+/// Phase 45: `--rejoin observer` request byte.
+pub const REJOIN_OBSERVER: ArmyId = 255;
+/// Most turn bundles a rejoining peer accepts as history (~10 h at 3-tick turns).
+const MAX_HISTORY_TURNS: u64 = 120_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Handshake {
@@ -87,6 +123,28 @@ pub struct Handshake {
     /// Host-authoritative tick limit for headless matches (0 = unlimited).
     pub tick_limit: u64,
     pub assigned_army: ArmyId,
+    /// Phase 38: live observers the host accepts after the players (host-side only; each
+    /// gets `assigned_army` ≥ [`OBSERVER_ARMY_BASE`], which no army uses).
+    pub observers: usize,
+    /// Phase 45: first turn this peer sends packets for (0 = from the start). A rejoining
+    /// peer re-simulates the history before it and only listens for those turns.
+    pub join_turn: u64,
+    /// Phase 24/51: host-authoritative enabled mod identities (synced automatically in v16).
+    pub mods: Vec<crate::mods::ModIdentity>,
+}
+
+/// Phase 38: first army id given to live observers (they send empty turns, so their
+/// hashes are still desync-checked but they never affect the sim).
+pub const OBSERVER_ARMY_BASE: ArmyId = 200;
+
+/// Phase 38: army id of accept slot `slot` with `players` players (then observers).
+fn slot_army(slot: usize, players: usize) -> ArmyId {
+    if slot < players { slot as ArmyId } else { OBSERVER_ARMY_BASE + (slot - players) as ArmyId }
+}
+
+/// Phase 38: whether `army` belongs to a live observer.
+pub fn is_observer(army: ArmyId) -> bool {
+    army >= OBSERVER_ARMY_BASE
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,12 +180,17 @@ pub enum NetControl {
     Dropped(ArmyId),
     /// Post-desync diagnostics: the sender's state summary at the desync turn.
     DesyncSummary { turn: u64, tick: u64, hash: u64, text: String },
+    /// Host-generated ([`SYSTEM_SENDER`]): all peers switch `input_delay` at this turn boundary.
+    InputDelay(u8),
+    /// Phase 45, host-generated ([`SYSTEM_SENDER`]): the dropped `army`'s player rejoined; the
+    /// takeover AI hands control back at the start of `turn` (its packets count from then).
+    Rejoined { army: ArmyId, turn: u64 },
 }
 
 impl NetControl {
     /// Controls a peer may put in its own packet (the host strips everything else).
     pub fn peer_may_send(&self) -> bool {
-        !matches!(self, NetControl::Dropped(_))
+        !matches!(self, NetControl::Dropped(_) | NetControl::InputDelay(_) | NetControl::Rejoined { .. })
     }
 }
 
@@ -157,6 +220,15 @@ fn encode_control(out: &mut Vec<u8>, c: &NetControl) {
             let t: String = text.chars().take(4000).collect();
             write_str(out, &t);
         }
+        NetControl::InputDelay(d) => {
+            out.push(6);
+            out.push(*d);
+        }
+        NetControl::Rejoined { army, turn } => {
+            out.push(7);
+            out.push(*army);
+            out.extend_from_slice(&turn.to_le_bytes());
+        }
     }
 }
 
@@ -179,6 +251,8 @@ fn decode_control(data: &[u8], pos: &mut usize) -> Result<NetControl, String> {
             hash: read_u64(data, pos)?,
             text: read_str(data, pos)?,
         }),
+        6 => Ok(NetControl::InputDelay(read_u8(data, pos)?)),
+        7 => Ok(NetControl::Rejoined { army: read_u8(data, pos)?, turn: read_u64(data, pos)? }),
         t => Err(format!("unknown net control tag {t}")),
     }
 }
@@ -239,8 +313,10 @@ fn encode_handshake(h: &Handshake) -> Vec<u8> {
         out.extend_from_slice(&s.start.1.to_le_bytes());
         out.push(s.team);
     }
-    // Protocol v4 (Phase 24): enabled mod identities; peers must match exactly.
-    crate::mods::encode_identities(&mut out, &crate::mods::active_identities());
+    // Protocol v4/v16 (Phase 24/51): host-authoritative mod identities (synced on mismatch).
+    crate::mods::encode_identities(&mut out, &h.mods);
+    // Protocol v17 (Phase 45): first turn the receiver submits packets for.
+    out.extend_from_slice(&h.join_turn.to_le_bytes());
     out
 }
 
@@ -280,8 +356,8 @@ fn decode_handshake(data: &[u8]) -> Result<Handshake, String> {
             team,
         });
     }
-    let host_mods = crate::mods::decode_identities(data, &mut pos)?;
-    crate::mods::check_match(&host_mods, &crate::mods::active_identities(), "the host")?;
+    let mods = crate::mods::decode_identities(data, &mut pos)?;
+    let join_turn = read_u64(data, &mut pos)?;
     if player_count < 2 || player_count > setups.len() {
         return Err(format!(
             "handshake player_count {player_count} invalid for {} armies",
@@ -289,6 +365,8 @@ fn decode_handshake(data: &[u8]) -> Result<Handshake, String> {
         ));
     }
     Ok(Handshake {
+        observers: 0,
+        join_turn,
         map_id,
         seed,
         setups,
@@ -297,7 +375,238 @@ fn decode_handshake(data: &[u8]) -> Result<Handshake, String> {
         input_delay,
         tick_limit,
         assigned_army,
+        mods,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Phase 51: Handshake mod sync wire codecs & transfer
+// ---------------------------------------------------------------------------
+
+fn encode_mod_sync_req(indices: &[u32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(5 + indices.len() * 4);
+    out.push(MSG_MOD_SYNC_REQ);
+    out.extend_from_slice(&(indices.len() as u32).to_le_bytes());
+    for &i in indices {
+        out.extend_from_slice(&i.to_le_bytes());
+    }
+    out
+}
+
+fn decode_mod_sync_req(data: &[u8]) -> Result<Vec<u32>, String> {
+    let mut pos = 0;
+    if read_u8(data, &mut pos)? != MSG_MOD_SYNC_REQ {
+        return Err("expected mod sync request message".to_string());
+    }
+    let n = read_u32(data, &mut pos)? as usize;
+    if n > 256 {
+        return Err(format!("mod sync request lists {n} mods (max 256)"));
+    }
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        out.push(read_u32(data, &mut pos)?);
+    }
+    if pos != data.len() {
+        return Err(format!("mod sync request has {} trailing bytes", data.len() - pos));
+    }
+    Ok(out)
+}
+
+fn encode_mod_chunk(mod_idx: u32, total_len: u32, offset: u32, chunk: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(13 + chunk.len());
+    out.push(MSG_MOD_CHUNK);
+    out.extend_from_slice(&mod_idx.to_le_bytes());
+    out.extend_from_slice(&total_len.to_le_bytes());
+    out.extend_from_slice(&offset.to_le_bytes());
+    out.extend_from_slice(chunk);
+    out
+}
+
+fn decode_mod_chunk(data: &[u8]) -> Result<(u32, u32, u32, &[u8]), String> {
+    let mut pos = 0;
+    if read_u8(data, &mut pos)? != MSG_MOD_CHUNK {
+        return Err("expected mod bundle chunk message".to_string());
+    }
+    let mod_idx = read_u32(data, &mut pos)?;
+    let total_len = read_u32(data, &mut pos)?;
+    let offset = read_u32(data, &mut pos)?;
+    Ok((mod_idx, total_len, offset, &data[pos..]))
+}
+
+fn encode_mod_sync_ack(ok: bool, err: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(6 + err.len());
+    out.push(MSG_MOD_SYNC_ACK);
+    out.push(u8::from(ok));
+    write_str(&mut out, err);
+    out
+}
+
+fn decode_mod_sync_ack(data: &[u8]) -> Result<Result<(), String>, String> {
+    let mut pos = 0;
+    if read_u8(data, &mut pos)? != MSG_MOD_SYNC_ACK {
+        return Err("expected mod sync ack message".to_string());
+    }
+    let ok = read_u8(data, &mut pos)? != 0;
+    let err = read_str(data, &mut pos)?;
+    if pos != data.len() {
+        return Err(format!("mod sync ack has {} trailing bytes", data.len() - pos));
+    }
+    if ok { Ok(Ok(())) } else { Ok(Err(err)) }
+}
+
+/// Host side of the v16 handshake: sends `Handshake` (carrying `host_mods` identities),
+/// reads the peer's missing-mod request, streams each requested bundle in 512 KiB chunks,
+/// and waits for the peer's verified acknowledgement.
+fn host_send_handshake_and_sync(
+    stream: &mut PeerStream,
+    hs: &Handshake,
+    host_mods: &[crate::mods::Mod],
+) -> Result<(), String> {
+    let mut client_hs = hs.clone();
+    client_hs.mods = host_mods.iter().map(crate::mods::Mod::identity).collect();
+    stream.write_frame(&encode_handshake(&client_hs))?;
+    let req_raw = stream.read_frame().map_err(|e| format!("mod sync request read failed: {e}"))?;
+    let missing = decode_mod_sync_req(&req_raw)?;
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let mut sent = vec![false; host_mods.len()];
+    for idx in missing {
+        let i = idx as usize;
+        if i >= host_mods.len() {
+            return Err(format!("peer requested invalid mod index {i} (host has {})", host_mods.len()));
+        }
+        if sent[i] {
+            return Err(format!("peer requested duplicate mod index {i}"));
+        }
+        sent[i] = true;
+        let bundle = crate::mods::encode_mod_bundle(&host_mods[i])?;
+        let total = u32::try_from(bundle.len()).map_err(|_| "mod bundle exceeds u32 length".to_string())?;
+        let mut offset = 0usize;
+        while offset < bundle.len() {
+            let end = (offset + MOD_CHUNK_BYTES).min(bundle.len());
+            stream.write_frame(&encode_mod_chunk(idx, total, offset as u32, &bundle[offset..end]))?;
+            offset = end;
+        }
+    }
+    let ack_raw = stream.read_frame().map_err(|e| format!("mod sync ack read failed: {e}"))?;
+    match decode_mod_sync_ack(&ack_raw)? {
+        Ok(()) => Ok(()),
+        Err(reason) => Err(format!("peer rejected mod sync: {reason}")),
+    }
+}
+
+/// Client side of the v16 handshake: given the already-read `MSG_HANDSHAKE` frame, requests
+/// any missing host mods, verifies their content hashes against `hs.mods`, installs them into
+/// `cache_dir`, and returns `(Handshake, synced_mods, downloaded_count)`.
+fn client_finish_handshake_and_sync(
+    stream: &mut PeerStream,
+    first_frame: &[u8],
+    local_mods: &[crate::mods::Mod],
+    cache_dir: &Path,
+    search_mods_dir: bool,
+) -> Result<(Handshake, Vec<crate::mods::Mod>, usize), String> {
+    let hs = decode_handshake(first_frame)?;
+    let mut resolved: Vec<Option<crate::mods::Mod>> = vec![None; hs.mods.len()];
+    let mut missing: Vec<u32> = Vec::new();
+    for (i, want) in hs.mods.iter().enumerate() {
+        if let Some(found) = crate::mods::find_local_mod(want, local_mods, cache_dir, search_mods_dir) {
+            resolved[i] = Some(found);
+        } else {
+            missing.push(i as u32);
+        }
+    }
+    stream.write_frame(&encode_mod_sync_req(&missing))?;
+    let downloaded = missing.len();
+    if !missing.is_empty() {
+        for idx in missing {
+            let i = idx as usize;
+            let expected = &hs.mods[i];
+            let mut buf: Vec<u8> = Vec::new();
+            let mut expected_total: Option<usize> = None;
+            loop {
+                let raw = match stream.read_frame() {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let msg = format!("mod '{}' download failed: {e}", expected.name);
+                        let _ = stream.write_frame(&encode_mod_sync_ack(false, &msg));
+                        return Err(msg);
+                    }
+                };
+                let (c_idx, total_len, offset, payload) = match decode_mod_chunk(&raw) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let _ = stream.write_frame(&encode_mod_sync_ack(false, &e));
+                        return Err(e);
+                    }
+                };
+                if c_idx != idx {
+                    let msg = format!("unexpected mod chunk index {c_idx} (expected {idx})");
+                    let _ = stream.write_frame(&encode_mod_sync_ack(false, &msg));
+                    return Err(msg);
+                }
+                let total = total_len as usize;
+                if total == 0 || total > crate::mods::MAX_MOD_BUNDLE_BYTES {
+                    let msg = format!(
+                        "mod '{}' size {total} exceeds {} MiB limit",
+                        expected.name,
+                        crate::mods::MAX_MOD_BUNDLE_BYTES / (1024 * 1024)
+                    );
+                    let _ = stream.write_frame(&encode_mod_sync_ack(false, &msg));
+                    return Err(msg);
+                }
+                if let Some(prev) = expected_total {
+                    if prev != total {
+                        let msg = format!("mod '{}' inconsistent bundle size {total} != {prev}", expected.name);
+                        let _ = stream.write_frame(&encode_mod_sync_ack(false, &msg));
+                        return Err(msg);
+                    }
+                } else {
+                    expected_total = Some(total);
+                    buf.reserve(total.min(1024 * 1024));
+                }
+                if offset as usize != buf.len() || buf.len() + payload.len() > total {
+                    let msg = format!("mod '{}' invalid chunk offset {offset} / len {}", expected.name, payload.len());
+                    let _ = stream.write_frame(&encode_mod_sync_ack(false, &msg));
+                    return Err(msg);
+                }
+                buf.extend_from_slice(payload);
+                if buf.len() == total {
+                    break;
+                }
+            }
+            let mut decoded = match crate::mods::decode_mod_bundle(&buf, expected) {
+                Ok(m) => m,
+                Err(e) => {
+                    let _ = stream.write_frame(&encode_mod_sync_ack(false, &e));
+                    return Err(e);
+                }
+            };
+            match crate::mods::install_cached_mod(&decoded, cache_dir) {
+                Ok(dir) => {
+                    decoded.dir = Some(dir);
+                    resolved[i] = Some(decoded);
+                }
+                Err(e) => {
+                    let _ = stream.write_frame(&encode_mod_sync_ack(false, &e));
+                    return Err(e);
+                }
+            }
+        }
+        stream.write_frame(&encode_mod_sync_ack(true, ""))?;
+    }
+    let synced: Vec<crate::mods::Mod> = resolved.into_iter().flatten().collect();
+    Ok((hs, synced, downloaded))
+}
+
+fn activate_synced_mods(hs: &Handshake, synced: Vec<crate::mods::Mod>, downloaded: usize) {
+    if downloaded > 0 {
+        let names: Vec<String> = synced.iter().map(|m| m.identity().to_string()).collect();
+        println!("synced {downloaded} mod(s) from host: {}", names.join(", "));
+    }
+    if !hs.mods.is_empty() || crate::mods::active_identities() != hs.mods {
+        crate::mods::set_active_mods(synced);
+    }
 }
 
 fn encode_turn(p: &TurnPacket) -> Vec<u8> {
@@ -446,7 +755,7 @@ pub fn issue_bundle(world: &mut Skirmish, bundle: &TurnBundle) {
 }
 
 // ---------------------------------------------------------------------------
-// Transports: star-topology host & client
+// Transports: star-topology host & client (TCP + reliable-ordered UDP)
 // ---------------------------------------------------------------------------
 
 /// Blocking per-turn exchange: submit the local packet, get the canonical bundle back.
@@ -454,13 +763,223 @@ pub trait TurnTransport: Send {
     fn exchange(&mut self, pkt: TurnPacket) -> Result<TurnBundle, String>;
 }
 
+/// Transport abstraction so the lockstep core runs identically over TCP or reliable-ordered UDP.
+pub enum PeerStream {
+    Tcp(TcpStream),
+    Udp(UdpChannel),
+}
+
+impl PeerStream {
+    pub fn write_frame(&mut self, payload: &[u8]) -> Result<(), String> {
+        match self {
+            PeerStream::Tcp(s) => write_frame(s, payload),
+            PeerStream::Udp(c) => c.write_frame(payload),
+        }
+    }
+
+    pub fn read_frame(&mut self) -> Result<Vec<u8>, String> {
+        match self {
+            PeerStream::Tcp(s) => read_frame(s),
+            PeerStream::Udp(c) => c.read_frame(),
+        }
+    }
+
+    pub fn set_read_timeout(&mut self, timeout: Option<Duration>) {
+        match self {
+            PeerStream::Tcp(s) => {
+                let _ = s.set_read_timeout(timeout);
+            }
+            PeerStream::Udp(c) => c.set_read_timeout(timeout),
+        }
+    }
+
+    pub fn shutdown(&self) {
+        match self {
+            PeerStream::Tcp(s) => {
+                let _ = s.shutdown(Shutdown::Both);
+            }
+            PeerStream::Udp(c) => c.shutdown(),
+        }
+    }
+
+    pub fn rtt_stats(&self) -> Option<(f64, f64)> {
+        match self {
+            PeerStream::Tcp(_) => None,
+            PeerStream::Udp(c) => c.rtt_stats(),
+        }
+    }
+
+    pub fn netem_stats(&self) -> Option<NetemStats> {
+        match self {
+            PeerStream::Tcp(_) => None,
+            PeerStream::Udp(c) => Some(c.netem_stats()),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn is_udp(&self) -> bool {
+        matches!(self, PeerStream::Udp(_))
+    }
+}
+
+/// Computes the target lockstep `input_delay` (in turns) from measured `(srtt_ms, rttvar_ms)`.
+///
+/// Uses `srtt + 2 * rttvar` against half a nominal turn (`turn_ticks * 50 ms`, i.e. 150 ms for
+/// `TURN_TICKS = 3`), clamped to `[ADAPTIVE_MIN_DELAY, ADAPTIVE_MAX_DELAY]` (`2..=8`).
+/// Local/LAN/lossy-loopback links stay at `2` turns (`DEFAULT_INPUT_DELAY`); high-RTT links
+/// automatically scale up to prevent stalls.
+pub fn compute_adaptive_delay(srtt_ms: f64, rttvar_ms: f64, turn_ticks: u64) -> u64 {
+    let effective_ms = srtt_ms.max(0.0) + 2.0 * rttvar_ms.max(0.0);
+    let half_turn_ms = (turn_ticks.max(1) as f64) * 50.0;
+    let raw = (effective_ms / half_turn_ms).ceil() as u64 + 1;
+    raw.clamp(ADAPTIVE_MIN_DELAY, ADAPTIVE_MAX_DELAY)
+}
+
+/// Host-side adaptive input-delay controller with hysteresis to prevent oscillation.
+#[derive(Debug, Clone)]
+pub struct AdaptiveDelayController {
+    pub enabled: bool,
+    pub current_delay: u64,
+    pub turn_ticks: u64,
+    last_eval_turn: u64,
+    low_streak: u8,
+}
+
+impl AdaptiveDelayController {
+    pub fn new(enabled: bool, initial_delay: u64, turn_ticks: u64) -> Self {
+        Self {
+            enabled,
+            current_delay: initial_delay.clamp(MIN_INPUT_DELAY, MAX_INPUT_DELAY),
+            turn_ticks: turn_ticks.max(1),
+            last_eval_turn: 0,
+            low_streak: 0,
+        }
+    }
+
+    /// Evaluates worst-peer `(srtt_ms, rttvar_ms)` at `turn`; returns `Some(new_delay)` only
+    /// when a synchronized delay change should be emitted in this turn's bundle.
+    pub fn maybe_adjust(&mut self, turn: u64, worst_srtt_ms: f64, worst_rttvar_ms: f64) -> Option<u64> {
+        if !self.enabled || turn < 4 || turn.saturating_sub(self.last_eval_turn) < ADAPTIVE_EVAL_INTERVAL {
+            return None;
+        }
+        self.last_eval_turn = turn;
+        let desired = compute_adaptive_delay(worst_srtt_ms, worst_rttvar_ms, self.turn_ticks);
+        if desired > self.current_delay {
+            self.low_streak = 0;
+            self.current_delay = desired;
+            return Some(desired);
+        }
+        if desired < self.current_delay {
+            let effective_ms = worst_srtt_ms.max(0.0) + 2.0 * worst_rttvar_ms.max(0.0);
+            let half_turn_ms = (self.turn_ticks as f64) * 50.0;
+            let down_threshold = ((self.current_delay.saturating_sub(2)) as f64) * half_turn_ms;
+            if effective_ms + 30.0 <= down_threshold.max(half_turn_ms) {
+                self.low_streak = self.low_streak.saturating_add(1);
+                if self.low_streak >= ADAPTIVE_DOWN_HYSTERESIS {
+                    self.low_streak = 0;
+                    self.current_delay = self.current_delay.saturating_sub(1).max(ADAPTIVE_MIN_DELAY);
+                    return Some(self.current_delay);
+                }
+            } else {
+                self.low_streak = 0;
+            }
+        } else {
+            self.low_streak = 0;
+        }
+        None
+    }
+}
+
 pub struct LockstepHost {
-    clients: Vec<(ArmyId, TcpStream)>,
+    clients: Vec<(ArmyId, PeerStream)>,
     pub local_army: ArmyId,
     next_turn: u64,
+    adaptive: AdaptiveDelayController,
+    /// Phase 45 reconnect / late-join state (TCP direct hosts, see [`LockstepHost::enable_rejoin`]).
+    rejoin: RejoinState,
+}
+
+/// Phase 45: host-side reconnect & late-join bookkeeping.
+#[derive(Default)]
+struct RejoinState {
+    /// Spare clone of the accept listener (TCP direct hosts) until rejoin is enabled.
+    spare: Option<TcpListener>,
+    hs: Option<Handshake>,
+    /// `(stream, requested army)` from the rejoin accept thread.
+    rx: Option<Receiver<(TcpStream, ArmyId)>>,
+    stop: Option<Arc<std::sync::atomic::AtomicBool>>,
+    thread: Option<JoinHandle<()>>,
+    /// How long a turn is held for a dropped player to reconnect before the AI takes over.
+    grace: Duration,
+    /// Every broadcast bundle (encoded), turn 0 onwards: the history a rejoiner re-simulates.
+    log: Vec<Vec<u8>>,
+    /// First turn the host reads packets from a late joiner.
+    listen_from: BTreeMap<ArmyId, u64>,
+    /// Dropped player armies currently run by the takeover AI.
+    ai_armies: Vec<ArmyId>,
+    next_observer: ArmyId,
+    deferred: Vec<(TcpStream, ArmyId)>,
+    /// `(turn, army)` of peers that reconnected (in the grace window or later).
+    rejoins: Vec<(u64, ArmyId)>,
+}
+
+impl Drop for RejoinState {
+    fn drop(&mut self) {
+        if let Some(stop) = &self.stop {
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+fn encode_rejoin(army: ArmyId) -> Vec<u8> {
+    let mut out = vec![MSG_REJOIN];
+    out.extend_from_slice(&PROTOCOL_VERSION.to_le_bytes());
+    out.push(army);
+    out
+}
+
+fn decode_rejoin(data: &[u8]) -> Result<ArmyId, String> {
+    let mut pos = 0;
+    if read_u8(data, &mut pos)? != MSG_REJOIN {
+        return Err("expected rejoin request".to_string());
+    }
+    let v = read_u32(data, &mut pos)?;
+    if v != PROTOCOL_VERSION {
+        return Err(format!("rejoin protocol mismatch: peer v{v}, host v{PROTOCOL_VERSION}"));
+    }
+    read_u8(data, &mut pos)
 }
 
 impl LockstepHost {
+    /// Enables or disables host-driven adaptive `input_delay` announcements.
+    #[allow(dead_code)]
+    pub fn set_adaptive_delay(&mut self, enabled: bool) {
+        self.adaptive.enabled = enabled;
+    }
+
+    /// Returns the worst-peer `(srtt_ms, rttvar_ms)` across UDP peers, if available.
+    #[allow(dead_code)]
+    pub fn worst_rtt_stats(&self) -> Option<(f64, f64)> {
+        let mut worst: Option<(f64, f64)> = None;
+        for (_, stream) in &self.clients {
+            if let Some((srtt, var)) = stream.rtt_stats() {
+                let score = srtt + 2.0 * var;
+                if worst.is_none_or(|(ws, wv)| score > ws + 2.0 * wv) {
+                    worst = Some((srtt, var));
+                }
+            }
+        }
+        worst
+    }
+
+    /// Returns Netem impairment counters from the host's UDP mux, if running over UDP.
+    pub fn netem_stats(&self) -> Option<NetemStats> {
+        self.clients.iter().find_map(|(_, s)| s.netem_stats())
+    }
+
     /// Binds `addr`, accepts `hs.player_count - 1` remote clients (`2..=8` players) and
     /// sends each its [`Handshake`] (with `assigned_army` filled in). `on_join` is called
     /// after every accepted client with `(army, peer_addr)`.
@@ -474,11 +993,183 @@ impl LockstepHost {
         let local_addr = listener
             .local_addr()
             .map_err(|e| format!("local_addr failed: {e}"))?;
-        Self::accept_players(listener, hs, &mut on_join).map(|h| (h, local_addr))
+        let spare = listener.try_clone().ok();
+        let mut host = Self::accept_players(listener, hs, &mut on_join)?;
+        host.rejoin.spare = spare;
+        Ok((host, local_addr))
     }
 
-    pub fn accept_players(
-        listener: TcpListener,
+    /// Phase 45: keeps accepting on `listener` (or the listener [`Self::bind_players`] bound)
+    /// for the rest of the match. A peer sending `MSG_REJOIN` gets the handshake plus every
+    /// turn so far, re-simulates them and continues:
+    /// - a player that dropped reconnects within `grace` → the turn is held for it and the
+    ///   match continues exactly as if it never left (same hashes as an uninterrupted run);
+    /// - a player whose army the AI already took over → control is handed back at a
+    ///   synchronized turn ([`NetControl::Rejoined`]);
+    /// - `REJOIN_OBSERVER` → a new live observer joins the running match.
+    ///
+    /// Must be called before the first turn (the history starts at turn 0).
+    pub fn enable_rejoin(&mut self, listener: Option<TcpListener>, hs: &Handshake, grace: Duration) -> Result<(), String> {
+        if self.next_turn != 0 {
+            return Err("rejoin must be enabled before the first turn".to_string());
+        }
+        let listener = listener
+            .or_else(|| self.rejoin.spare.take())
+            .ok_or_else(|| "rejoin needs a direct TCP host listener".to_string())?;
+        listener.set_nonblocking(true).map_err(|e| format!("set_nonblocking failed: {e}"))?;
+        let (tx, rx) = mpsc::channel::<(TcpStream, ArmyId)>();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let astop = stop.clone();
+        let thread = std::thread::spawn(move || {
+            while !astop.load(std::sync::atomic::Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut s, _)) => {
+                        let tx = tx.clone();
+                        // Read the request off-thread: a silent connection must not block others.
+                        std::thread::spawn(move || {
+                            let _ = s.set_nonblocking(false);
+                            let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
+                            match read_frame(&mut s).and_then(|raw| decode_rejoin(&raw)) {
+                                Ok(army) => {
+                                    let _ = tx.send((s, army));
+                                }
+                                Err(e) => eprintln!("lockstep host: ignored connection ({e})"),
+                            }
+                        });
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+        self.rejoin.hs = Some(hs.clone());
+        self.rejoin.rx = Some(rx);
+        self.rejoin.stop = Some(stop);
+        self.rejoin.thread = Some(thread);
+        // Other peers time out after NET_TIMEOUT while a turn is held.
+        self.rejoin.grace = grace.min(NET_TIMEOUT / 2);
+        self.rejoin.next_observer = OBSERVER_ARMY_BASE + hs.observers as ArmyId;
+        Ok(())
+    }
+
+    /// Phase 45: `(turn, army)` of every peer that reconnected so far.
+    #[allow(dead_code)]
+    pub fn rejoins(&self) -> &[(u64, ArmyId)] {
+        &self.rejoin.rejoins
+    }
+
+    /// Sends a rejoining peer its handshake (`join_turn`) and the full turn history.
+    fn send_rejoin_state(&self, mut stream: TcpStream, army: ArmyId, join_turn: u64) -> Result<PeerStream, String> {
+        let hs = self.rejoin.hs.as_ref().ok_or("rejoin disabled")?;
+        let mut h = hs.clone();
+        h.assigned_army = army;
+        h.join_turn = join_turn;
+        let _ = stream.set_nodelay(true);
+        let _ = stream.set_read_timeout(Some(NET_TIMEOUT));
+        write_frame(&mut stream, &encode_handshake(&h))?;
+        let mut hdr = vec![MSG_HISTORY];
+        hdr.extend_from_slice(&(self.rejoin.log.len() as u64).to_le_bytes());
+        write_frame(&mut stream, &hdr)?;
+        for f in &self.rejoin.log {
+            write_frame(&mut stream, f)?;
+        }
+        Ok(PeerStream::Tcp(stream))
+    }
+
+    /// Phase 45: adopts queued late joiners at the start of `turn` (AI hand-back / observers).
+    fn adopt_late_joiners(&mut self, turn: u64, controls: &mut Vec<(ArmyId, NetControl)>) {
+        let Some(rx) = &self.rejoin.rx else {
+            return;
+        };
+        let mut reqs = std::mem::take(&mut self.rejoin.deferred);
+        reqs.extend(rx.try_iter());
+        for (stream, want) in reqs {
+            let join = turn + self.adaptive.current_delay + 1;
+            let army = if want == REJOIN_OBSERVER {
+                if self.rejoin.next_observer >= REJOIN_OBSERVER - 1 {
+                    continue;
+                }
+                self.rejoin.next_observer += 1;
+                self.rejoin.next_observer - 1
+            } else if self.rejoin.ai_armies.contains(&want) && !self.clients.iter().any(|(a, _)| *a == want) {
+                want
+            } else {
+                eprintln!("lockstep host: rejected rejoin request for army {want} (not a dropped player)");
+                continue;
+            };
+            match self.send_rejoin_state(stream, army, join) {
+                Ok(ps) => {
+                    self.clients.push((army, ps));
+                    self.rejoin.listen_from.insert(army, join);
+                    if is_observer(army) {
+                        eprintln!("lockstep host: observer {army} joined the running match at turn {turn}");
+                    } else {
+                        self.rejoin.ai_armies.retain(|a| *a != army);
+                        self.rejoin.rejoins.push((turn, army));
+                        controls.push((SYSTEM_SENDER, NetControl::Rejoined { army, turn: join }));
+                        eprintln!("lockstep host: army {army} rejoined; the AI hands back control at turn {join}");
+                    }
+                }
+                Err(e) => eprintln!("lockstep host: rejoin of army {want} failed: {e}"),
+            }
+        }
+    }
+
+    /// Phase 45: holds `turn` for up to the grace period while the lost player `army`
+    /// reconnects; returns its new stream and its packet for `turn`.
+    fn await_rejoin(&mut self, army: ArmyId, turn: u64) -> Option<(PeerStream, TurnPacket)> {
+        if self.rejoin.rx.is_none() || self.rejoin.grace.is_zero() || is_observer(army) {
+            return None;
+        }
+        let grace = self.rejoin.grace;
+        eprintln!("lockstep host: army {army} lost at turn {turn}; holding the match up to {}s for it to rejoin", grace.as_secs());
+        let deadline = Instant::now() + grace;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return None;
+            }
+            let req = self.rejoin.rx.as_ref()?.recv_timeout(left.min(Duration::from_millis(250)));
+            match req {
+                Ok((stream, want)) if want == army => {
+                    let Ok(mut ps) = self.send_rejoin_state(stream, army, turn) else {
+                        continue;
+                    };
+                    match ps.read_frame().and_then(|raw| decode_turn(&raw)) {
+                        Ok(p) if p.turn == turn => {
+                            eprintln!("lockstep host: army {army} rejoined at turn {turn}; match resumes");
+                            self.rejoin.rejoins.push((turn, army));
+                            return Some((ps, p));
+                        }
+                        Ok(p) => eprintln!("lockstep host: rejoining army {army} sent turn {} (want {turn})", p.turn),
+                        Err(e) => eprintln!("lockstep host: rejoining army {army} failed: {e}"),
+                    }
+                }
+                Ok(other) => self.rejoin.deferred.push(other),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => return None,
+            }
+        }
+    }
+
+    /// Binds a UDP socket on `addr` (with optional `netem`), accepts `hs.player_count - 1`
+    /// reliable-ordered UDP clients, and sends each its [`Handshake`].
+    pub fn bind_players_udp(
+        addr: &str,
+        hs: &Handshake,
+        netem: NetemConfig,
+        mut on_join: impl FnMut(ArmyId, SocketAddr),
+    ) -> Result<(Self, SocketAddr), String> {
+        let mux = UdpMux::bind(addr, netem)?;
+        let local_addr = mux.local_addr();
+        Self::accept_players_udp(mux, hs, &mut on_join).map(|h| (h, local_addr))
+    }
+
+    /// Accepts `hs.player_count - 1` reliable-ordered UDP clients on an already-bound [`UdpMux`].
+    pub fn accept_players_udp(
+        mux: Arc<UdpMux>,
         hs: &Handshake,
         on_join: &mut dyn FnMut(ArmyId, SocketAddr),
     ) -> Result<Self, String> {
@@ -492,24 +1183,329 @@ impl LockstepHost {
                 hs.setups.len()
             ));
         }
-        let mut clients = Vec::with_capacity(n - 1);
-        for slot in 1..n {
-            let (mut stream, peer) = listener
+        let host_mods = crate::mods::active()?;
+        mux.set_accepting(true);
+        let mut clients = Vec::with_capacity(n - 1 + hs.observers);
+        for slot in 1..n + hs.observers {
+            let mut ch = mux
+                .accept(None)
+                .map_err(|e| format!("udp accept slot {slot} failed: {e}"))?;
+            let peer = ch.peer_addr();
+            ch.set_read_timeout(Some(NET_TIMEOUT));
+            let army = slot_army(slot, n);
+            let mut client_hs = hs.clone();
+            client_hs.assigned_army = army;
+            let mut ps = PeerStream::Udp(ch);
+            host_send_handshake_and_sync(&mut ps, &client_hs, &host_mods)?;
+            on_join(army, peer);
+            clients.push((army, ps));
+        }
+        mux.set_accepting(false);
+        Ok(Self {
+            clients,
+            local_army: 0,
+            next_turn: 0,
+            adaptive: AdaptiveDelayController::new(true, hs.input_delay, hs.turn_ticks),
+            rejoin: RejoinState::default(),
+        })
+    }
+
+    /// Binds BOTH UDP (reliable-ordered + NAT hole punching) and TCP (direct + relay fallback)
+    /// and registers an invite code on `rendezvous_addr`. Each client connects over punched UDP
+    /// when possible, or falls back transparently to TCP direct / TCP relay.
+    pub fn bind_players_udp_with_code(
+        addr: &str,
+        rendezvous_addr: &str,
+        hs: &Handshake,
+        netem: NetemConfig,
+        mut on_join: impl FnMut(ArmyId, SocketAddr, crate::rendezvous::ConnectVia),
+    ) -> Result<(Self, SocketAddr, String), String> {
+        let n = hs.player_count;
+        if !(2..=8).contains(&n) {
+            return Err(format!("player count {n} out of range 2..=8"));
+        }
+        if hs.setups.len() < n {
+            return Err(format!("{n} players need at least {n} armies, got {}", hs.setups.len()));
+        }
+        let listener =
+            TcpListener::bind(addr).map_err(|e| format!("failed to bind {addr}: {e}"))?;
+        let local_addr = listener
+            .local_addr()
+            .map_err(|e| format!("local_addr failed: {e}"))?;
+        listener
+            .set_nonblocking(true)
+            .map_err(|e| format!("set_nonblocking failed: {e}"))?;
+
+        let udp_mux = match UdpMux::bind(&local_addr.to_string(), netem.clone()) {
+            Ok(m) => m,
+            Err(_) => {
+                let fallback = if local_addr.is_ipv4() {
+                    if local_addr.ip().is_loopback() { "127.0.0.1:0" } else { "0.0.0.0:0" }
+                } else if local_addr.ip().is_loopback() {
+                    "[::1]:0"
+                } else {
+                    "[::]:0"
+                };
+                UdpMux::bind(fallback, netem)?
+            }
+        };
+        udp_mux.set_accepting(true);
+
+        let (tx, rx) = mpsc::channel::<(PeerStream, SocketAddr, crate::rendezvous::ConnectVia)>();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let (atx, astop) = (tx.clone(), stop.clone());
+        let tcp_thread = std::thread::spawn(move || {
+            while !astop.load(std::sync::atomic::Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((s, p)) => {
+                        let _ = s.set_nonblocking(false);
+                        if atx
+                            .send((PeerStream::Tcp(s), p, crate::rendezvous::ConnectVia::Direct(p)))
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+
+        let (utx, ustop, umux) = (tx.clone(), stop.clone(), udp_mux.clone());
+        let udp_thread = std::thread::spawn(move || {
+            while !ustop.load(std::sync::atomic::Ordering::Relaxed) {
+                if let Ok(ch) = umux.accept(Some(Duration::from_millis(50))) {
+                    let p = ch.peer_addr();
+                    if utx
+                        .send((PeerStream::Udp(ch), p, crate::rendezvous::ConnectVia::UdpPunched(p)))
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            }
+        });
+
+        let rtx = tx.clone();
+        let punch_mux = udp_mux.clone();
+        let reg = crate::rendezvous::HostRegistration::register_with_udp(
+            rendezvous_addr,
+            local_addr,
+            udp_mux.clone(),
+            "Host",
+            &hs.map_id,
+            Duration::from_secs(4),
+            Box::new(move |s, p| {
+                let _ = rtx.send((PeerStream::Tcp(s), p, crate::rendezvous::ConnectVia::Relayed(p)));
+            }),
+            Box::new(move |token, targets| {
+                let _ = punch_mux.start_punch(token, ROLE_HOST, targets, Duration::from_secs(3));
+            }),
+        );
+        let mut reg = match reg {
+            Ok(r) => r,
+            Err(e) => {
+                stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                udp_mux.set_accepting(false);
+                let _ = tcp_thread.join();
+                let _ = udp_thread.join();
+                return Err(e);
+            }
+        };
+        let code = reg.code.clone();
+        println!("Invite code: {code} (rendezvous {rendezvous_addr}, UDP punch + TCP relay)");
+
+        let host_mods = crate::mods::active()?;
+        let mut clients = Vec::with_capacity(n - 1 + hs.observers);
+        for slot in 1..n + hs.observers {
+            let (mut stream, peer, via) = rx
+                .recv()
+                .map_err(|_| format!("accept slot {slot} failed: listener closed"))?;
+            if let PeerStream::Tcp(s) = &stream {
+                let _ = s.set_nodelay(true);
+                let _ = s.set_write_timeout(Some(NET_TIMEOUT));
+            }
+            stream.set_read_timeout(Some(NET_TIMEOUT));
+            let army = slot_army(slot, n);
+            let mut client_hs = hs.clone();
+            client_hs.assigned_army = army;
+            host_send_handshake_and_sync(&mut stream, &client_hs, &host_mods)?;
+            on_join(army, peer, via);
+            clients.push((army, stream));
+        }
+
+        reg.close();
+        udp_mux.set_accepting(false);
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = tcp_thread.join();
+        let _ = udp_thread.join();
+
+        let has_udp = clients.iter().any(|(_, s)| s.is_udp());
+        Ok((
+            Self {
+                clients,
+                local_army: 0,
+                next_turn: 0,
+                adaptive: AdaptiveDelayController::new(has_udp, hs.input_delay, hs.turn_ticks),
+                rejoin: RejoinState::default(),
+            },
+            local_addr,
+            code,
+        ))
+    }
+
+    /// Binds `addr` AND registers an invite code on `rendezvous_addr`, accepting `hs.player_count - 1`
+    /// players from either direct TCP or relayed tunnels. `on_join(army, peer_addr, relayed)`.
+    pub fn bind_players_with_code(
+        addr: &str,
+        rendezvous_addr: &str,
+        hs: &Handshake,
+        mut on_join: impl FnMut(ArmyId, SocketAddr, bool),
+    ) -> Result<(Self, SocketAddr, String), String> {
+        let n = hs.player_count;
+        if !(2..=8).contains(&n) {
+            return Err(format!("player count {n} out of range 2..=8"));
+        }
+        if hs.setups.len() < n {
+            return Err(format!("{n} players need at least {n} armies, got {}", hs.setups.len()));
+        }
+        let listener =
+            TcpListener::bind(addr).map_err(|e| format!("failed to bind {addr}: {e}"))?;
+        let local_addr = listener
+            .local_addr()
+            .map_err(|e| format!("local_addr failed: {e}"))?;
+        listener
+            .set_nonblocking(true)
+            .map_err(|e| format!("set_nonblocking failed: {e}"))?;
+
+        let (tx, rx) = mpsc::channel::<(TcpStream, SocketAddr, bool)>();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (atx, astop) = (tx.clone(), stop.clone());
+        let accept_thread = std::thread::spawn(move || {
+            while !astop.load(std::sync::atomic::Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((s, p)) => {
+                        let _ = s.set_nonblocking(false);
+                        if atx.send((s, p, false)).is_err() {
+                            return;
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+
+        let rtx = tx.clone();
+        let reg = crate::rendezvous::HostRegistration::register(
+            rendezvous_addr,
+            local_addr,
+            "Host",
+            &hs.map_id,
+            Duration::from_secs(4),
+            Box::new(move |s, p| {
+                let _ = rtx.send((s, p, true));
+            }),
+        );
+        let mut reg = match reg {
+            Ok(r) => r,
+            Err(e) => {
+                stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                let _ = accept_thread.join();
+                return Err(e);
+            }
+        };
+        let code = reg.code.clone();
+        println!("Invite code: {code} (rendezvous {rendezvous_addr})");
+
+        let host_mods = crate::mods::active()?;
+        let mut clients = Vec::with_capacity(n - 1 + hs.observers);
+        for slot in 1..n + hs.observers {
+            let (stream, peer, relayed) = rx
+                .recv()
+                .map_err(|_| format!("accept slot {slot} failed: listener closed"))?;
+            let _ = stream.set_nodelay(true);
+            let _ = stream.set_read_timeout(Some(NET_TIMEOUT));
+            let _ = stream.set_write_timeout(Some(NET_TIMEOUT));
+            let army = slot_army(slot, n);
+            let mut client_hs = hs.clone();
+            client_hs.assigned_army = army;
+            let mut ps = PeerStream::Tcp(stream);
+            host_send_handshake_and_sync(&mut ps, &client_hs, &host_mods)?;
+            on_join(army, peer, relayed);
+            clients.push((army, ps));
+        }
+
+        reg.close();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = accept_thread.join();
+
+        Ok((
+            Self {
+                clients,
+                local_army: 0,
+                next_turn: 0,
+                adaptive: AdaptiveDelayController::new(false, hs.input_delay, hs.turn_ticks),
+                rejoin: RejoinState::default(),
+            },
+            local_addr,
+            code,
+        ))
+    }
+
+    pub fn accept_players(
+        listener: TcpListener,
+        hs: &Handshake,
+        on_join: &mut dyn FnMut(ArmyId, SocketAddr),
+    ) -> Result<Self, String> {
+        let host_mods = crate::mods::active()?;
+        Self::accept_players_with_mods(listener, hs, &host_mods, on_join)
+    }
+
+    pub fn accept_players_with_mods(
+        listener: TcpListener,
+        hs: &Handshake,
+        host_mods: &[crate::mods::Mod],
+        on_join: &mut dyn FnMut(ArmyId, SocketAddr),
+    ) -> Result<Self, String> {
+        let n = hs.player_count;
+        if !(2..=8).contains(&n) {
+            return Err(format!("player count {n} out of range 2..=8"));
+        }
+        if hs.setups.len() < n {
+            return Err(format!(
+                "{n} players need at least {n} armies, got {}",
+                hs.setups.len()
+            ));
+        }
+        let mut clients = Vec::with_capacity(n - 1 + hs.observers);
+        for slot in 1..n + hs.observers {
+            let (stream, peer) = listener
                 .accept()
                 .map_err(|e| format!("accept slot {slot} failed: {e}"))?;
             let _ = stream.set_nodelay(true);
             let _ = stream.set_read_timeout(Some(NET_TIMEOUT));
-            let army = slot as ArmyId;
+            let _ = stream.set_write_timeout(Some(NET_TIMEOUT));
+            let army = slot_army(slot, n);
             let mut client_hs = hs.clone();
             client_hs.assigned_army = army;
-            write_frame(&mut stream, &encode_handshake(&client_hs))?;
+            let mut ps = PeerStream::Tcp(stream);
+            host_send_handshake_and_sync(&mut ps, &client_hs, host_mods)?;
             on_join(army, peer);
-            clients.push((army, stream));
+            clients.push((army, ps));
         }
         Ok(Self {
             clients,
             local_army: 0,
             next_turn: 0,
+            adaptive: AdaptiveDelayController::new(false, hs.input_delay, hs.turn_ticks),
+            rejoin: RejoinState::default(),
         })
     }
 }
@@ -527,31 +1523,56 @@ impl TurnTransport for LockstepHost {
         batches.push((self.local_army, pkt.commands));
         let local = self.local_army;
         controls.extend(pkt.controls.into_iter().filter(NetControl::peer_may_send).map(|c| (local, c)));
+        // Phase 45: peers reconnecting after an AI takeover, and late observers.
+        self.adopt_late_joiners(turn, &mut controls);
         // Phase 21: a client that fails (EOF, socket error, read timeout, garbage, wrong
-        // turn) is dropped instead of ending the match; the bundle announces it.
+        // turn) is dropped instead of ending the match; the bundle announces it. Phase 45:
+        // with rejoin enabled the turn is first held for the player to reconnect.
         let mut dropped: Vec<ArmyId> = Vec::new();
-        for (army, stream) in &mut self.clients {
-            let p = match read_frame(stream).and_then(|raw| decode_turn(&raw)) {
+        for idx in 0..self.clients.len() {
+            let army = self.clients[idx].0;
+            if self.rejoin.listen_from.get(&army).is_some_and(|&j| turn < j) {
+                continue;
+            }
+            let p = match self.clients[idx].1.read_frame().and_then(|raw| decode_turn(&raw)) {
                 Ok(p) if p.turn == turn => p,
-                Ok(p) => {
-                    eprintln!("lockstep host: army {army} sent turn {} at turn {turn}; dropping it", p.turn);
-                    dropped.push(*army);
-                    continue;
-                }
-                Err(e) => {
-                    eprintln!("lockstep host: army {army} disconnected at turn {turn} ({e}); AI takes over");
-                    dropped.push(*army);
-                    continue;
+                other => {
+                    let why = match other {
+                        Ok(p) => format!("sent turn {} at turn {turn}", p.turn),
+                        Err(e) => e,
+                    };
+                    match self.await_rejoin(army, turn) {
+                        Some((stream, p)) => {
+                            self.clients[idx].1 = stream;
+                            p
+                        }
+                        None => {
+                            eprintln!("lockstep host: army {army} disconnected at turn {turn} ({why}); AI takes over");
+                            dropped.push(army);
+                            continue;
+                        }
+                    }
                 }
             };
-            hashes.push((*army, p.hash));
-            batches.push((*army, p.commands));
-            let a = *army;
-            controls.extend(p.controls.into_iter().filter(NetControl::peer_may_send).map(|c| (a, c)));
+            hashes.push((army, p.hash));
+            batches.push((army, p.commands));
+            controls.extend(p.controls.into_iter().filter(NetControl::peer_may_send).map(|c| (army, c)));
         }
         if !dropped.is_empty() {
             self.clients.retain(|(a, _)| !dropped.contains(a));
+            for &a in &dropped {
+                self.rejoin.listen_from.remove(&a);
+                if !is_observer(a) && !self.rejoin.ai_armies.contains(&a) {
+                    self.rejoin.ai_armies.push(a);
+                }
+            }
             controls.extend(dropped.iter().map(|&a| (SYSTEM_SENDER, NetControl::Dropped(a))));
+        }
+        // Phase 44: adaptive input delay announced at agreed turn boundary from measured RTT + jitter.
+        if let Some((srtt, rttvar)) = self.worst_rtt_stats()
+            && let Some(new_delay) = self.adaptive.maybe_adjust(turn, srtt, rttvar)
+        {
+            controls.push((SYSTEM_SENDER, NetControl::InputDelay(new_delay as u8)));
         }
         let bundle = canonicalize_bundle(TurnBundle {
             turn,
@@ -560,11 +1581,14 @@ impl TurnTransport for LockstepHost {
             controls,
         });
         let encoded = encode_turn_bundle(&bundle);
+        if self.rejoin.rx.is_some() {
+            self.rejoin.log.push(encoded.clone());
+        }
         for (army, stream) in &mut self.clients {
-            if let Err(e) = write_frame(stream, &encoded) {
+            if let Err(e) = stream.write_frame(&encoded) {
                 // The next read fails too, so the drop is announced in the next bundle.
                 eprintln!("lockstep host: send to army {army} failed: {e}");
-                let _ = stream.shutdown(Shutdown::Both);
+                stream.shutdown();
             }
         }
         self.next_turn += 1;
@@ -573,35 +1597,230 @@ impl TurnTransport for LockstepHost {
 }
 
 pub struct LockstepClient {
-    stream: TcpStream,
+    stream: PeerStream,
     pub local_army: ArmyId,
     next_turn: u64,
+    /// Phase 45: packets of turns before this are re-simulated locally, never sent.
+    silent_until: u64,
+    /// Phase 45: turn history received on rejoin, consumed before the live stream.
+    backlog: VecDeque<Vec<u8>>,
 }
 
 impl LockstepClient {
-    pub fn connect(addr: &str) -> Result<(Self, Handshake), String> {
-        let mut stream =
-            TcpStream::connect(addr).map_err(|e| format!("failed to connect {addr}: {e}"))?;
+    pub fn from_stream(mut stream: TcpStream) -> Result<(Self, Handshake), String> {
         let _ = stream.set_nodelay(true);
         let _ = stream.set_read_timeout(Some(NET_TIMEOUT));
+        let _ = stream.set_write_timeout(Some(NET_TIMEOUT));
         let raw = read_frame(&mut stream)?;
-        let hs = if raw.first() == Some(&MSG_HANDSHAKE) {
-            decode_handshake(&raw)?
+        let (stream, hs) = if raw.first() == Some(&MSG_HANDSHAKE) {
+            let local_mods = crate::mods::active().unwrap_or_default();
+            let cache_dir = crate::mods::downloaded_mods_dir();
+            let mut ps = PeerStream::Tcp(stream);
+            let (hs, synced, dl) =
+                client_finish_handshake_and_sync(&mut ps, &raw, &local_mods, &cache_dir, true)?;
+            activate_synced_mods(&hs, synced, dl);
+            (ps, hs)
         } else {
             // Phase 20: a menu-hosted lobby greets first; join it as an auto-ready peer.
             let hs = crate::net_lobby::auto_join(&mut stream, &raw)?;
             let _ = stream.set_read_timeout(Some(NET_TIMEOUT));
-            hs
+            let _ = stream.set_write_timeout(Some(NET_TIMEOUT));
+            (PeerStream::Tcp(stream), hs)
         };
         let client = Self {
             stream,
             local_army: hs.assigned_army,
             next_turn: 0,
+            silent_until: 0,
+            backlog: VecDeque::new(),
         };
         Ok((client, hs))
     }
 
+    /// Connects to `addr` using explicit `local_mods` and `cache_dir` (isolated from global mod
+    /// state; used for tests and custom mod sandboxes).
+    #[allow(dead_code)]
+    pub fn connect_with_mods(
+        addr: &str,
+        local_mods: &[crate::mods::Mod],
+        cache_dir: &Path,
+    ) -> Result<(Self, Handshake, Vec<crate::mods::Mod>), String> {
+        let mut stream =
+            TcpStream::connect(addr).map_err(|e| format!("failed to connect {addr}: {e}"))?;
+        let _ = stream.set_nodelay(true);
+        let _ = stream.set_read_timeout(Some(NET_TIMEOUT));
+        let _ = stream.set_write_timeout(Some(NET_TIMEOUT));
+        let raw = read_frame(&mut stream)?;
+        let mut ps = PeerStream::Tcp(stream);
+        let (hs, synced, _) =
+            client_finish_handshake_and_sync(&mut ps, &raw, local_mods, cache_dir, false)?;
+        let client = Self {
+            stream: ps,
+            local_army: hs.assigned_army,
+            next_turn: 0,
+            silent_until: 0,
+            backlog: VecDeque::new(),
+        };
+        Ok((client, hs, synced))
+    }
+
+    pub fn from_udp(mut channel: UdpChannel) -> Result<(Self, Handshake), String> {
+        channel.set_read_timeout(Some(NET_TIMEOUT));
+        let raw = channel.read_frame()?;
+        let local_mods = crate::mods::active().unwrap_or_default();
+        let cache_dir = crate::mods::downloaded_mods_dir();
+        let mut ps = PeerStream::Udp(channel);
+        let (hs, synced, dl) =
+            client_finish_handshake_and_sync(&mut ps, &raw, &local_mods, &cache_dir, true)?;
+        activate_synced_mods(&hs, synced, dl);
+        let client = Self {
+            stream: ps,
+            local_army: hs.assigned_army,
+            next_turn: 0,
+            silent_until: 0,
+            backlog: VecDeque::new(),
+        };
+        Ok((client, hs))
+    }
+
+    pub fn connect(addr: &str) -> Result<(Self, Handshake), String> {
+        let stream =
+            TcpStream::connect(addr).map_err(|e| format!("failed to connect {addr}: {e}"))?;
+        Self::from_stream(stream)
+    }
+
+    pub fn connect_udp(addr: &str, netem: NetemConfig, timeout: Duration) -> Result<(Self, Handshake), String> {
+        let channel = UdpChannel::connect(addr, netem, timeout)?;
+        Self::from_udp(channel)
+    }
+
+    pub fn connect_udp_retry(
+        addr: &str,
+        netem: NetemConfig,
+        timeout: Duration,
+    ) -> Result<(Self, Handshake), String> {
+        let t0 = Instant::now();
+        loop {
+            let left = timeout.saturating_sub(t0.elapsed()).max(Duration::from_millis(200));
+            match Self::connect_udp(addr, netem.clone(), left.min(Duration::from_secs(2))) {
+                Ok(c) => return Ok(c),
+                Err(e) if t0.elapsed() >= timeout => return Err(e),
+                Err(_) => std::thread::sleep(Duration::from_millis(50)),
+            }
+        }
+    }
+
+    /// Connects via invite code trying UDP NAT hole punching first, then TCP direct / TCP relay.
+    pub fn connect_code_udp_retry(
+        rendezvous_addr: &str,
+        code: &str,
+        force_relay: bool,
+        netem: NetemConfig,
+        timeout: Duration,
+    ) -> Result<(Self, Handshake, crate::rendezvous::ConnectVia), String> {
+        let t0 = Instant::now();
+        loop {
+            match crate::rendezvous::connect_via_code_udp(
+                rendezvous_addr,
+                code,
+                force_relay,
+                netem.clone(),
+                Duration::from_secs(3),
+                Duration::from_millis(800),
+            ) {
+                Ok((crate::rendezvous::RendezvousStream::Udp(ch), via)) => match Self::from_udp(ch) {
+                    Ok((c, hs)) => return Ok((c, hs, via)),
+                    Err(e) if t0.elapsed() >= timeout => return Err(e),
+                    Err(_) => std::thread::sleep(Duration::from_millis(80)),
+                },
+                Ok((crate::rendezvous::RendezvousStream::Tcp(s), via)) => match Self::from_stream(s) {
+                    Ok((c, hs)) => return Ok((c, hs, via)),
+                    Err(e) if t0.elapsed() >= timeout => return Err(e),
+                    Err(_) => std::thread::sleep(Duration::from_millis(80)),
+                },
+                Err(e) if e.contains("invalid invite code") || t0.elapsed() >= timeout => {
+                    return Err(e);
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(100)),
+            }
+        }
+    }
+
+    /// Connects to a host via `XXXX-XXXX` invite code (direct TCP first, automatic TCP relay fallback).
+    pub fn connect_code_retry(
+        rendezvous_addr: &str,
+        code: &str,
+        force_relay: bool,
+        timeout: Duration,
+    ) -> Result<(Self, Handshake, crate::rendezvous::ConnectVia), String> {
+        let t0 = Instant::now();
+        loop {
+            match crate::rendezvous::connect_via_code(
+                rendezvous_addr,
+                code,
+                force_relay,
+                Duration::from_millis(800),
+            ) {
+                Ok((stream, via)) => match Self::from_stream(stream) {
+                    Ok((c, hs)) => return Ok((c, hs, via)),
+                    Err(e) if t0.elapsed() >= timeout => return Err(e),
+                    Err(_) => std::thread::sleep(Duration::from_millis(80)),
+                },
+                Err(e) if e.contains("invalid invite code") || t0.elapsed() >= timeout => {
+                    return Err(e);
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(100)),
+            }
+        }
+    }
+
     /// Retries `connect` until it succeeds or `timeout` elapses (host may start later).
+    /// Phase 45: reconnects to a running match on `addr` as `army` (or [`REJOIN_OBSERVER`]).
+    /// Receives the handshake and the turn history; the caller re-simulates the history by
+    /// running its lockstep loop as usual (packets before `hs.join_turn` are not sent).
+    pub fn connect_rejoin(addr: &str, army: ArmyId) -> Result<(Self, Handshake), String> {
+        let mut stream = TcpStream::connect(addr).map_err(|e| format!("failed to connect {addr}: {e}"))?;
+        let _ = stream.set_nodelay(true);
+        let _ = stream.set_read_timeout(Some(NET_TIMEOUT));
+        write_frame(&mut stream, &encode_rejoin(army))?;
+        let hs = decode_handshake(&read_frame(&mut stream).map_err(|e| format!("rejoin refused by host: {e}"))?)?;
+        // A rejoining peer must already have the host's mods (it played this match before).
+        crate::mods::check_match(&hs.mods, &crate::mods::active_identities(), "the host")?;
+        let raw = read_frame(&mut stream)?;
+        let mut pos = 0;
+        if read_u8(&raw, &mut pos)? != MSG_HISTORY {
+            return Err("expected turn history after the rejoin handshake".to_string());
+        }
+        let count = read_u64(&raw, &mut pos)?;
+        if count > hs.join_turn || count > MAX_HISTORY_TURNS {
+            return Err(format!("invalid turn history length {count} (join turn {})", hs.join_turn));
+        }
+        let mut backlog = VecDeque::with_capacity(count as usize);
+        for _ in 0..count {
+            backlog.push_back(read_frame(&mut stream)?);
+        }
+        let client = Self {
+            stream: PeerStream::Tcp(stream),
+            local_army: hs.assigned_army,
+            next_turn: 0,
+            silent_until: hs.join_turn,
+            backlog,
+        };
+        Ok((client, hs))
+    }
+
+    /// [`Self::connect_rejoin`] retried until `timeout` (the host may still be busy).
+    pub fn connect_rejoin_retry(addr: &str, army: ArmyId, timeout: Duration) -> Result<(Self, Handshake), String> {
+        let t0 = Instant::now();
+        loop {
+            match Self::connect_rejoin(addr, army) {
+                Ok(c) => return Ok(c),
+                Err(e) if t0.elapsed() >= timeout || e.contains("mismatch") => return Err(e),
+                Err(_) => std::thread::sleep(Duration::from_millis(100)),
+            }
+        }
+    }
+
     pub fn connect_retry(addr: &str, timeout: Duration) -> Result<(Self, Handshake), String> {
         let t0 = Instant::now();
         loop {
@@ -612,6 +1831,15 @@ impl LockstepClient {
             }
         }
     }
+
+    #[allow(dead_code)]
+    pub fn rtt_stats(&self) -> Option<(f64, f64)> {
+        self.stream.rtt_stats()
+    }
+
+    pub fn netem_stats(&self) -> Option<NetemStats> {
+        self.stream.netem_stats()
+    }
 }
 
 impl TurnTransport for LockstepClient {
@@ -620,8 +1848,13 @@ impl TurnTransport for LockstepClient {
         if pkt.turn != turn {
             return Err(format!("client submitted turn {} but expected {turn}", pkt.turn));
         }
-        write_frame(&mut self.stream, &encode_turn(&pkt))?;
-        let raw = read_frame(&mut self.stream).map_err(|e| format!("host disconnected: {e}"))?;
+        if pkt.turn >= self.silent_until {
+            self.stream.write_frame(&encode_turn(&pkt))?;
+        }
+        let raw = match self.backlog.pop_front() {
+            Some(raw) => raw,
+            None => self.stream.read_frame().map_err(|e| format!("host disconnected: {e}"))?,
+        };
         let bundle = decode_turn_bundle(&raw)?;
         if bundle.turn != turn {
             return Err(format!(
@@ -646,33 +1879,54 @@ pub(crate) fn lobby_read_frame(stream: &mut TcpStream) -> Result<Vec<u8>, String
     read_frame(stream)
 }
 
-/// Decodes a frame if it is a lockstep [`Handshake`] (`None` for any other message).
-pub(crate) fn lobby_try_handshake(data: &[u8]) -> Option<Result<Handshake, String>> {
-    (data.first() == Some(&MSG_HANDSHAKE)).then(|| decode_handshake(data))
+/// Whether `data` is a lockstep [`Handshake`] frame.
+pub(crate) fn lobby_is_handshake(data: &[u8]) -> bool {
+    data.first() == Some(&MSG_HANDSHAKE)
+}
+
+/// Finishes a lockstep [`Handshake`] on an already-open lobby TCP stream, performing v16
+/// automatic mod sync (downloading, hash-verifying, caching and activating any missing host mods).
+pub(crate) fn lobby_finish_handshake(stream: &mut TcpStream, first_frame: &[u8]) -> Result<Handshake, String> {
+    let _ = stream.set_read_timeout(Some(NET_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(NET_TIMEOUT));
+    let cloned = stream.try_clone().map_err(|e| format!("socket clone failed: {e}"))?;
+    let local_mods = crate::mods::active().unwrap_or_default();
+    let cache_dir = crate::mods::downloaded_mods_dir();
+    let mut ps = PeerStream::Tcp(cloned);
+    let (hs, synced, dl) =
+        client_finish_handshake_and_sync(&mut ps, first_frame, &local_mods, &cache_dir, true)?;
+    activate_synced_mods(&hs, synced, dl);
+    Ok(hs)
 }
 
 impl LockstepHost {
     /// Hands lobby connections over to lockstep: sends every peer its [`Handshake`]
-    /// (`assigned_army` filled in) on the already-open stream.
+    /// (`assigned_army` filled in) and streams any missing host mods on the already-open stream.
     pub fn from_lobby(peers: Vec<(ArmyId, TcpStream)>, hs: &Handshake) -> Result<Self, String> {
         let n = hs.player_count;
         if !(2..=8).contains(&n) || peers.len() + 1 != n {
             return Err(format!("lobby start with {} peers for {n} players", peers.len()));
         }
+        let host_mods = crate::mods::active()?;
         let mut clients = Vec::with_capacity(peers.len());
-        for (army, mut stream) in peers {
+        for (army, stream) in peers {
             let _ = stream.set_nodelay(true);
             let _ = stream.set_read_timeout(Some(NET_TIMEOUT));
+            let _ = stream.set_write_timeout(Some(NET_TIMEOUT));
             let mut client_hs = hs.clone();
             client_hs.assigned_army = army;
-            write_frame(&mut stream, &encode_handshake(&client_hs)).map_err(|e| format!("army {army}: {e}"))?;
-            clients.push((army, stream));
+            let mut ps = PeerStream::Tcp(stream);
+            host_send_handshake_and_sync(&mut ps, &client_hs, &host_mods)
+                .map_err(|e| format!("army {army}: {e}"))?;
+            clients.push((army, ps));
         }
         clients.sort_by_key(|(a, _)| *a);
         Ok(Self {
             clients,
             local_army: 0,
             next_turn: 0,
+            adaptive: AdaptiveDelayController::new(false, hs.input_delay, hs.turn_ticks),
+            rejoin: RejoinState::default(),
         })
     }
 }
@@ -683,9 +1937,11 @@ impl LockstepClient {
         let _ = stream.set_nodelay(true);
         let _ = stream.set_read_timeout(Some(NET_TIMEOUT));
         Self {
-            stream,
+            stream: PeerStream::Tcp(stream),
             local_army: hs.assigned_army,
             next_turn: 0,
+            silent_until: 0,
+            backlog: VecDeque::new(),
         }
     }
 }
@@ -741,11 +1997,12 @@ impl fmt::Display for DesyncReport {
 pub enum TickOutcome {
     /// The next turn's bundle has not arrived; the sim did not advance.
     Stalled,
-    /// One tick ran; `Some(packet)` when a turn completed and its packet must be sent.
-    Stepped(Option<TurnPacket>),
+    /// One tick ran; contains 0, 1, or more turn packets when a turn completed (0 when shrinking
+    /// adaptive `input_delay`, >1 when growing `input_delay`).
+    Stepped(Vec<TurnPacket>),
     /// A synchronized pause is active: the turn advanced (null turn) but the simulation did
-    /// not step; `Some(packet)` exactly like [`TickOutcome::Stepped`].
-    Paused(Option<TurnPacket>),
+    /// not step; emitted packets follow the same rules as [`TickOutcome::Stepped`].
+    Paused(Vec<TurnPacket>),
 }
 
 /// Session events for the UI ([`LockstepCore::drain_events`]).
@@ -757,6 +2014,9 @@ pub enum NetEvent {
     Speed { by: ArmyId, speed: u32 },
     SpeedDenied { by: ArmyId },
     Dropped { army: ArmyId, tick: u64 },
+    /// Phase 45: a dropped player reconnected; the takeover AI handed control back.
+    Rejoined { army: ArmyId, tick: u64 },
+    InputDelay { turn: u64, delay: u64 },
 }
 
 /// A pause/speed/drop control as applied at a turn start — identical on every peer.
@@ -795,6 +2055,12 @@ pub struct LockstepCore {
     events: Vec<NetEvent>,
     applied: Vec<AppliedControl>,
     takeovers: Vec<(u64, ArmyId)>,
+    /// Phase 45: announced AI hand-backs `(turn, army)` not yet due.
+    pending_handbacks: Vec<(u64, ArmyId)>,
+    /// Phase 45: `(tick, army)` hand-backs from the takeover AI to a rejoined player.
+    handbacks: Vec<(u64, ArmyId)>,
+    /// Synchronized `(turn, new_input_delay)` transitions applied at turn boundaries.
+    delay_changes: Vec<(u64, u64)>,
     /// Every command applied to the local world `(tick, army, command)` (all sources).
     recorded: Vec<(u64, ArmyId, Command)>,
     checkpoints: Vec<(u64, u64)>,
@@ -842,6 +2108,9 @@ impl LockstepCore {
             events: Vec::new(),
             applied: Vec::new(),
             takeovers: Vec::new(),
+            pending_handbacks: Vec::new(),
+            handbacks: Vec::new(),
+            delay_changes: Vec::new(),
             recorded: Vec::new(),
             checkpoints: Vec::new(),
             map_id: String::from("UNKNOWN"),
@@ -945,6 +2214,18 @@ impl LockstepCore {
     #[allow(dead_code)]
     pub fn takeovers(&self) -> &[(u64, ArmyId)] {
         &self.takeovers
+    }
+
+    /// Phase 45: `(tick, army)` hand-backs from the takeover AI to a rejoined player.
+    #[allow(dead_code)]
+    pub fn handbacks(&self) -> &[(u64, ArmyId)] {
+        &self.handbacks
+    }
+
+    /// Synchronized `(turn, new_input_delay)` transitions applied identically on all peers.
+    #[allow(dead_code)]
+    pub fn delay_changes(&self) -> &[(u64, u64)] {
+        &self.delay_changes
     }
 
     /// Applied pause/speed/drop controls in execution order.
@@ -1072,6 +2353,21 @@ impl LockstepCore {
     /// Applies a bundle's pause / speed / disconnect controls at its turn start.
     fn apply_controls(&mut self, bundle: &TurnBundle, world: &Skirmish) {
         let tick = world.tick();
+        // Phase 45: hand-backs due at this turn (announced `input_delay + 1` turns earlier,
+        // so the rejoined peer's packets are part of this very bundle).
+        let due: Vec<ArmyId> = self
+            .pending_handbacks
+            .iter()
+            .filter(|(t, _)| *t <= bundle.turn)
+            .map(|(_, a)| *a)
+            .collect();
+        self.pending_handbacks.retain(|(t, _)| *t > bundle.turn);
+        for a in due {
+            self.shared_ais.retain(|x| x.army != a);
+            self.dropped.retain(|x| *x != a);
+            self.handbacks.push((tick, a));
+            self.events.push(NetEvent::Rejoined { army: a, tick });
+        }
         for (from, c) in &bundle.controls {
             let from = *from;
             let accepted = match c {
@@ -1121,6 +2417,25 @@ impl LockstepCore {
                     self.events.push(NetEvent::Dropped { army: a, tick });
                     fresh
                 }
+                NetControl::Rejoined { army, turn } if from == SYSTEM_SENDER => {
+                    let ok = *turn > bundle.turn && self.dropped.contains(army);
+                    if ok {
+                        self.pending_handbacks.push((*turn, *army));
+                    }
+                    ok
+                }
+                NetControl::InputDelay(d) if from == SYSTEM_SENDER => {
+                    let clamped = u64::from(*d).clamp(MIN_INPUT_DELAY, MAX_INPUT_DELAY);
+                    if clamped != self.input_delay {
+                        self.input_delay = clamped;
+                        self.delay_changes.push((bundle.turn, clamped));
+                        self.events.push(NetEvent::InputDelay {
+                            turn: bundle.turn,
+                            delay: clamped,
+                        });
+                    }
+                    continue;
+                }
                 _ => continue,
             };
             self.applied.push(AppliedControl {
@@ -1166,17 +2481,22 @@ impl LockstepCore {
             }
         }
         self.tick_in_turn += 1;
-        let pkt = if self.tick_in_turn >= self.turn_ticks {
+        let pkts = if self.tick_in_turn >= self.turn_ticks {
             self.tick_in_turn = 0;
             self.next_exec += 1;
-            Some(self.make_packet(world))
+            let target_submit = self.next_exec + self.input_delay;
+            let mut out = Vec::new();
+            while self.next_submit < target_submit {
+                out.push(self.make_packet(world));
+            }
+            out
         } else {
-            None
+            Vec::new()
         };
         if self.turn_paused {
-            TickOutcome::Paused(pkt)
+            TickOutcome::Paused(pkts)
         } else {
-            TickOutcome::Stepped(pkt)
+            TickOutcome::Stepped(pkts)
         }
     }
 
@@ -1334,17 +2654,51 @@ pub fn run_headless_with(
             TickOutcome::Stalled => {
                 return Err(format!("headless lockstep stalled at tick {}", world.tick()));
             }
-            TickOutcome::Stepped(Some(pkt)) | TickOutcome::Paused(Some(pkt)) => {
-                if world.tick() >= limit || world.result().is_some() {
-                    break;
+            TickOutcome::Stepped(pkts) | TickOutcome::Paused(pkts) => {
+                if !pkts.is_empty() {
+                    if world.tick() >= limit || world.result().is_some() {
+                        break;
+                    }
+                    let mut pending: VecDeque<TurnPacket> = pkts.into();
+                    while let Some(pkt) = pending.pop_front() {
+                        let b = transport.exchange(pkt)?;
+                        receive_or_dump(transport, core, world, b, &mut pending)?;
+                    }
                 }
-                let b = transport.exchange(pkt)?;
-                receive_or_dump(transport, core, world, b, &mut VecDeque::new())?;
             }
-            TickOutcome::Stepped(None) | TickOutcome::Paused(None) => {}
         }
     }
     Ok(world.state_hash())
+}
+
+/// Phase 45: re-simulates a rejoined peer's history up to `join_turn` without local input
+/// (every turn is verified against the recorded hashes). Returns the first packets that must
+/// go over the wire (turns `>= join_turn`).
+pub fn catch_up(
+    transport: &mut dyn TurnTransport,
+    core: &mut LockstepCore,
+    world: &mut Skirmish,
+    join_turn: u64,
+) -> Result<Vec<TurnPacket>, String> {
+    let mut live = Vec::new();
+    let mut pending: VecDeque<TurnPacket> = core.prime(world).into();
+    loop {
+        while let Some(pkt) = pending.pop_front() {
+            if pkt.turn >= join_turn {
+                live.push(pkt);
+                continue;
+            }
+            let b = transport.exchange(pkt)?;
+            receive_or_dump(transport, core, world, b, &mut pending)?;
+        }
+        if !live.is_empty() {
+            return Ok(live);
+        }
+        match core.tick(world) {
+            TickOutcome::Stalled => return Err(format!("rejoin catch-up stalled at tick {}", world.tick())),
+            TickOutcome::Stepped(p) | TickOutcome::Paused(p) => pending.extend(p),
+        }
+    }
 }
 
 /// Verifies `bundle`; on a desync exchanges summaries (after sending any still `unsent`
@@ -1506,6 +2860,29 @@ impl NetHandle {
         }))))
     }
 
+    /// Phase 45: like [`Self::start`] for a peer that rejoined a running match
+    /// ([`LockstepClient::connect_rejoin`]): re-simulates the turn history synchronously
+    /// (at full speed) before the window opens, then continues live from `hs.join_turn`.
+    pub fn start_rejoined(world: &mut Skirmish, hs: &Handshake, mut transport: Box<dyn TurnTransport>) -> Result<Self, String> {
+        let mut core = LockstepCore::from_handshake(world, hs);
+        let live = catch_up(transport.as_mut(), &mut core, world, hs.join_turn)?;
+        let bridge = AsyncLockstepBridge::spawn(transport);
+        for pkt in live {
+            bridge.submit(pkt)?;
+        }
+        Ok(Self(Arc::new(Mutex::new(NetPlay {
+            core,
+            bridge,
+            failure: None,
+            rtt_ms: 0.0,
+            stall_ticks: 0,
+            stalled_now: false,
+            desync: None,
+            recorded_seen: 0,
+            assist_tick: None,
+        }))))
+    }
+
     /// Turns a fresh single-player session into a networked one for `hs.assigned_army`.
     pub fn attach(self, session: &mut PlaySession) {
         let (army, shared) = self
@@ -1514,7 +2891,8 @@ impl NetHandle {
             .map(|n| (n.core.local_army, n.core.shared_ai_armies()))
             .unwrap_or((0, Vec::new()));
         session.human_army = army;
-        session.spectate = false;
+        // Phase 38: live observers stay in spectate mode (observer HUD, no local commands).
+        session.spectate = is_observer(army);
         session.ais.clear();
         session.speed = 1;
         session.paused = false;
@@ -1610,10 +2988,10 @@ impl NetHandle {
                 n.stalled_now = true;
                 n.stall_ticks += 1;
             }
-            TickOutcome::Stepped(pkt) | TickOutcome::Paused(pkt) => {
+            TickOutcome::Stepped(pkts) | TickOutcome::Paused(pkts) => {
                 n.stalled_now = false;
                 s.selected.retain(|id| s.world.unit(*id).is_some());
-                if let Some(pkt) = pkt {
+                for pkt in pkts {
                     if pkt.turn % 100 == 0 && std::env::var_os("FARUST_NET_LOG").is_some() {
                         println!(
                             "[net] army {} tick {} hash {:016x} | {}",
@@ -1625,6 +3003,7 @@ impl NetHandle {
                     }
                     if let Err(e) = n.bridge.submit(pkt) {
                         n.failure = Some(format!("NET ERROR: {e}"));
+                        break;
                     }
                 }
             }
@@ -1755,6 +3134,17 @@ fn flush_events(n: &mut NetPlay, s: &mut PlaySession) {
                     rec.ai_event(tick, army, true);
                 }
             }
+            NetEvent::Rejoined { army, tick } => {
+                let who = army_label(&s.world, army);
+                s.chat.system(&format!("{who} RECONNECTED - TAKES BACK CONTROL"));
+                s.status_banner = format!("{who} RECONNECTED");
+                if let Some(rec) = s.recorder.as_mut() {
+                    rec.ai_event(tick, army, false);
+                }
+            }
+            NetEvent::InputDelay { turn: _, delay } => {
+                s.chat.system(&format!("ADAPTIVE INPUT DELAY SET TO {delay} TURNS"));
+            }
         }
     }
 }
@@ -1843,11 +3233,7 @@ pub fn world_from_handshake(
         &hs.setups,
         hs.seed,
     )?;
-    world.set_domain_grids(
-        map.naval_grid.clone(),
-        map.amphib_grid.clone(),
-        map.hydro_points.clone(),
-    );
+    world.attach_map(map);
     Ok(world)
 }
 
@@ -1889,6 +3275,8 @@ mod tests {
 
     fn handshake(players: usize, armies: usize, seed: u64, ticks: u64) -> Handshake {
         Handshake {
+            observers: 0,
+            join_turn: 0,
             map_id: "LOOP".into(),
             seed,
             setups: setups(armies),
@@ -1897,6 +3285,7 @@ mod tests {
             input_delay: DEFAULT_INPUT_DELAY,
             tick_limit: ticks,
             assigned_army: 0,
+            mods: Vec::new(),
         }
     }
 
@@ -1987,7 +3376,7 @@ mod tests {
         let mut pkt = None;
         while pkt.is_none() {
             match core.tick(&mut w) {
-                TickOutcome::Stepped(p) => pkt = p,
+                TickOutcome::Stepped(mut pkts) => pkt = pkts.pop(),
                 TickOutcome::Stalled | TickOutcome::Paused(_) => panic!("bundle was buffered"),
             }
         }
@@ -2016,7 +3405,12 @@ mod tests {
 
     /// Runs host + clients as threads over 127.0.0.1 and returns every final hash.
     fn run_loopback(players: usize, armies: usize, ticks: u64) -> Vec<u64> {
-        let hs = handshake(players, armies, 4242, ticks);
+        run_loopback_obs(players, armies, ticks, 0)
+    }
+
+    fn run_loopback_obs(players: usize, armies: usize, ticks: u64, observers: usize) -> Vec<u64> {
+        let mut hs = handshake(players, armies, 4242, ticks);
+        hs.observers = observers;
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         let hs_host = hs.clone();
@@ -2027,7 +3421,7 @@ mod tests {
             assert_eq!(core.shared_ai_armies().len(), armies - players);
             run_headless(&mut t, &mut core, &mut w, hs_host.tick_limit).unwrap()
         });
-        let clients: Vec<_> = (1..players)
+        let clients: Vec<_> = (1..players + observers)
             .map(|_| {
                 let addr = addr.clone();
                 std::thread::spawn(move || {
@@ -2048,8 +3442,163 @@ mod tests {
             out.push(h);
         }
         seen.sort();
-        assert_eq!(seen, (1..players as ArmyId).collect::<Vec<_>>());
+        let mut want: Vec<ArmyId> = (1..players as ArmyId).collect();
+        want.extend((0..observers as ArmyId).map(|i| OBSERVER_ARMY_BASE + i));
+        assert_eq!(seen, want);
         out
+    }
+
+    #[test]
+    fn live_observer_follows_a_2_player_match_without_desync_or_influence() {
+        let with_obs = run_loopback_obs(2, 2, 300, 1);
+        assert_eq!(with_obs.len(), 3);
+        assert!(with_obs.iter().all(|h| *h == with_obs[0]), "{with_obs:x?}");
+        let without = run_loopback(2, 2, 300);
+        assert_eq!(without[0], with_obs[0], "an observer never changes the match");
+        assert!(is_observer(OBSERVER_ARMY_BASE) && !is_observer(7));
+    }
+
+    /// Phase 45 harness: host (rejoin enabled with `grace`) + `players - 1` clients; client
+    /// `leaver` quits at tick `leave_at`, then reconnects as `rejoin_as` (and optionally a
+    /// late observer joins). The host holds at tick `host_wait_at` until the rejoiner has
+    /// asked (so late adoption happens mid-match). Returns `(army, final hash, end tick)`
+    /// for host, staying clients and rejoiners, plus the host core's hand-backs.
+    #[allow(clippy::type_complexity)]
+    fn run_rejoin(
+        players: usize,
+        ticks: u64,
+        grace: Duration,
+        leave_at: u64,
+        host_wait_at: Option<u64>,
+        late_observer: bool,
+    ) -> (Vec<(ArmyId, u64, u64)>, Vec<(u64, ArmyId)>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let hs = handshake(players, players, 4242, ticks);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let spare = listener.try_clone().unwrap();
+        let asked = Arc::new(AtomicUsize::new(0));
+        let want_asks = 1 + usize::from(late_observer);
+        let hs_host = hs.clone();
+        let host_asked = asked.clone();
+        let host = std::thread::spawn(move || {
+            let mut t = LockstepHost::accept_players(listener, &hs_host, &mut |_, _| {}).unwrap();
+            t.enable_rejoin(Some(spare), &hs_host, grace).unwrap();
+            let mut w = world(&hs_host.setups, hs_host.seed);
+            let mut core = LockstepCore::from_handshake(&w, &hs_host);
+            let mut waited = false;
+            let h = run_headless_with(&mut t, &mut core, &mut w, hs_host.tick_limit, &mut |_, w| {
+                if !waited && host_wait_at.is_some_and(|at| w.tick() >= at) {
+                    waited = true;
+                    let t0 = Instant::now();
+                    while host_asked.load(Ordering::SeqCst) < want_asks && t0.elapsed() < Duration::from_secs(20) {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    // The request is read by the accept thread after the connect.
+                    std::thread::sleep(Duration::from_millis(300));
+                }
+                true
+            })
+            .unwrap();
+            (h, w.tick(), core.handbacks().to_vec())
+        });
+        let leaver = (players - 1) as ArmyId;
+        let mut handles = Vec::new();
+        for _ in 1..players {
+            let addr = addr.clone();
+            let asked = asked.clone();
+            handles.push(std::thread::spawn(move || {
+                let (mut c, hs) = LockstepClient::connect_retry(&addr, Duration::from_secs(10)).unwrap();
+                let mut w = world(&hs.setups, hs.seed);
+                let mut core = LockstepCore::from_handshake(&w, &hs);
+                if hs.assigned_army != leaver {
+                    let h = run_headless(&mut c, &mut core, &mut w, hs.tick_limit).unwrap();
+                    return vec![(hs.assigned_army, h, w.tick())];
+                }
+                // Leave mid-match: dropping the transport disconnects ("process killed").
+                run_headless_with(&mut c, &mut core, &mut w, hs.tick_limit, &mut |_, w| w.tick() < leave_at).unwrap();
+                drop(c);
+                let mut out = Vec::new();
+                let mut joins = vec![leaver];
+                if late_observer {
+                    joins.push(REJOIN_OBSERVER);
+                }
+                let rejoiners: Vec<_> = joins
+                    .into_iter()
+                    .map(|want| {
+                        let addr = addr.clone();
+                        let asked = asked.clone();
+                        std::thread::spawn(move || {
+                            asked.fetch_add(1, Ordering::SeqCst);
+                            let (mut c, hs) = LockstepClient::connect_rejoin_retry(&addr, want, Duration::from_secs(10)).unwrap();
+                            assert!(hs.join_turn > 0);
+                            let mut w = world(&hs.setups, hs.seed);
+                            let mut core = LockstepCore::from_handshake(&w, &hs);
+                            let h = run_headless(&mut c, &mut core, &mut w, hs.tick_limit).unwrap();
+                            (hs.assigned_army, h, w.tick())
+                        })
+                    })
+                    .collect();
+                for r in rejoiners {
+                    out.push(r.join().unwrap());
+                }
+                out
+            }));
+        }
+        let (h, tick, handbacks) = host.join().unwrap();
+        let mut out = vec![(0, h, tick)];
+        for c in handles {
+            out.extend(c.join().unwrap());
+        }
+        (out, handbacks)
+    }
+
+    #[test]
+    fn killed_peer_rejoins_within_grace_and_ends_on_the_uninterrupted_hash() {
+        let ticks = 900;
+        let uninterrupted = run_loopback(2, 2, ticks);
+        let (peers, handbacks) = run_rejoin(2, ticks, Duration::from_secs(20), 240, None, false);
+        let limit = ticks.div_ceil(TURN_TICKS) * TURN_TICKS;
+        assert_eq!(peers.len(), 2, "{peers:?}");
+        for &(army, h, tick) in &peers {
+            assert_eq!(tick, limit, "army {army} played to the end");
+            assert_eq!(h, uninterrupted[0], "army {army}: {h:016x} vs uninterrupted {:016x}", uninterrupted[0]);
+        }
+        assert!(handbacks.is_empty(), "the AI never took over");
+    }
+
+    #[test]
+    fn late_rejoin_takes_control_back_from_the_ai_and_a_late_observer_follows() {
+        let ticks = 1200;
+        let (peers, handbacks) = run_rejoin(3, ticks, Duration::ZERO, 150, Some(450), true);
+        let limit = ticks.div_ceil(TURN_TICKS) * TURN_TICKS;
+        // host, staying client 1, rejoined army 2, late observer.
+        let mut armies: Vec<ArmyId> = peers.iter().map(|p| p.0).collect();
+        armies.sort();
+        assert_eq!(armies, vec![0, 1, 2, OBSERVER_ARMY_BASE], "{peers:?}");
+        for &(army, h, tick) in &peers {
+            assert_eq!(tick, limit, "army {army} played to the end");
+            assert_eq!(h, peers[0].1, "army {army} agrees with the host");
+        }
+        assert_eq!(handbacks.len(), 1, "{handbacks:?}");
+        assert_eq!(handbacks[0].1, 2);
+        assert!(handbacks[0].0 >= 450 && handbacks[0].0 < limit, "{handbacks:?}");
+    }
+
+    #[test]
+    fn rejoin_codecs_round_trip_and_reject_other_versions() {
+        assert_eq!(decode_rejoin(&encode_rejoin(3)).unwrap(), 3);
+        let mut bad = encode_rejoin(3);
+        bad[1] ^= 0xff;
+        assert!(decode_rejoin(&bad).unwrap_err().contains("mismatch"));
+        let mut out = Vec::new();
+        let c = NetControl::Rejoined { army: 2, turn: 77 };
+        encode_control(&mut out, &c);
+        assert_eq!(decode_control(&out, &mut 0).unwrap(), c);
+        assert!(!c.peer_may_send(), "only the host announces hand-backs");
+        let mut hs = handshake(2, 2, 1, 0);
+        hs.join_turn = 123;
+        assert_eq!(decode_handshake(&encode_handshake(&hs)).unwrap().join_turn, 123);
     }
 
     #[test]
@@ -2102,8 +3651,8 @@ mod tests {
                                 .expect("ok");
                             core.receive(bundle).unwrap();
                         }
-                        TickOutcome::Stepped(p) | TickOutcome::Paused(p) => {
-                            if let Some(p) = p {
+                        TickOutcome::Stepped(pkts) | TickOutcome::Paused(pkts) => {
+                            for p in pkts {
                                 b.submit(p).unwrap();
                             }
                             break;
@@ -2358,7 +3907,392 @@ mod tests {
         let w = world(&s, 1);
         let mut core = LockstepCore::new(&w, 1, 2, TURN_TICKS, 1);
         core.queue_control(NetControl::Dropped(0));
+        core.queue_control(NetControl::InputDelay(5));
         core.queue_control(NetControl::Pause(true));
         assert_eq!(core.prime(&w)[0].controls, vec![NetControl::Pause(true)]);
+    }
+
+    // ----- Phase 44: UDP lockstep, lossy netem, adaptive input delay & hole punching ----
+
+    struct UdpLoopbackRun {
+        hashes: Vec<u64>,
+        host_netem: NetemStats,
+        client_netem: Vec<NetemStats>,
+        delay_changes: Vec<Vec<(u64, u64)>>,
+    }
+
+    fn run_udp_loopback(
+        players: usize,
+        armies: usize,
+        ticks: u64,
+        host_netem: NetemConfig,
+        client_netem_base: NetemConfig,
+    ) -> UdpLoopbackRun {
+        let hs = handshake(players, armies, 4242, ticks);
+        let mux = UdpMux::bind("127.0.0.1:0", host_netem).unwrap();
+        let addr = mux.local_addr().to_string();
+        let hs_host = hs.clone();
+        let host = std::thread::spawn(move || {
+            let mut t = LockstepHost::accept_players_udp(mux, &hs_host, &mut |_, _| {}).unwrap();
+            let mut w = world(&hs_host.setups, hs_host.seed);
+            let mut core = LockstepCore::from_handshake(&w, &hs_host);
+            let h = run_headless(&mut t, &mut core, &mut w, hs_host.tick_limit).unwrap();
+            let st = t.netem_stats().unwrap_or_default();
+            (h, st, core.delay_changes().to_vec())
+        });
+        let clients: Vec<_> = (1..players)
+            .map(|idx| {
+                let addr = addr.clone();
+                let mut cn = client_netem_base.clone();
+                cn.seed = cn.seed.wrapping_add((idx as u64) * 7919);
+                std::thread::spawn(move || {
+                    let (mut c, hs) =
+                        LockstepClient::connect_udp_retry(&addr, cn, Duration::from_secs(15)).unwrap();
+                    let mut w = world(&hs.setups, hs.seed);
+                    let mut core = LockstepCore::from_handshake(&w, &hs);
+                    let h = run_headless(&mut c, &mut core, &mut w, hs.tick_limit).unwrap();
+                    let st = c.netem_stats().unwrap_or_default();
+                    (hs.assigned_army, h, w.tick(), st, core.delay_changes().to_vec())
+                })
+            })
+            .collect();
+        let (h_host, host_st, host_dc) = host.join().unwrap();
+        let mut hashes = vec![h_host];
+        let mut client_sts = Vec::new();
+        let mut dcs = vec![host_dc];
+        let mut seen = Vec::new();
+        for c in clients {
+            let (army, h, tick, st, dc) = c.join().unwrap();
+            assert_eq!(tick, ticks.div_ceil(TURN_TICKS) * TURN_TICKS);
+            seen.push(army);
+            hashes.push(h);
+            client_sts.push(st);
+            dcs.push(dc);
+        }
+        seen.sort();
+        assert_eq!(seen, (1..players as ArmyId).collect::<Vec<_>>());
+        UdpLoopbackRun {
+            hashes,
+            host_netem: host_st,
+            client_netem: client_sts,
+            delay_changes: dcs,
+        }
+    }
+
+    #[test]
+    fn udp_lossy_netem_2_and_3_peer_matches_tcp_hash() {
+        let lossy = NetemConfig {
+            loss_pct: 5.0,
+            dup_pct: 2.0,
+            reorder_window: 3,
+            delay_ms: 0,
+            jitter_ms: 0,
+            seed: 44_001,
+        };
+        for (players, armies, ticks) in [(2, 2, 240u64), (3, 4, 240u64)] {
+            let tcp_hashes = run_loopback(players, armies, ticks);
+            assert!(tcp_hashes.iter().all(|h| *h == tcp_hashes[0]));
+            let expected = tcp_hashes[0];
+
+            let clean = run_udp_loopback(players, armies, ticks, NetemConfig::default(), NetemConfig::default());
+            assert!(
+                clean.hashes.iter().all(|h| *h == expected),
+                "clean UDP ({players}p) mismatch: {:x?} vs tcp {expected:x}",
+                clean.hashes
+            );
+
+            let lossy_run = run_udp_loopback(players, armies, ticks, lossy.clone(), lossy.clone());
+            assert!(
+                lossy_run.hashes.iter().all(|h| *h == expected),
+                "lossy UDP ({players}p) mismatch: {:x?} vs tcp {expected:x}",
+                lossy_run.hashes
+            );
+            let total_dropped: u64 =
+                lossy_run.host_netem.dropped + lossy_run.client_netem.iter().map(|s| s.dropped).sum::<u64>();
+            let total_duped: u64 = lossy_run.host_netem.duplicated
+                + lossy_run.client_netem.iter().map(|s| s.duplicated).sum::<u64>();
+            let total_reordered: u64 = lossy_run.host_netem.reordered
+                + lossy_run.client_netem.iter().map(|s| s.reordered).sum::<u64>();
+            assert!(total_dropped > 0, "expected simulated drops ({players}p)");
+            assert!(total_duped > 0, "expected simulated duplicates ({players}p)");
+            assert!(total_reordered > 0, "expected simulated reorders ({players}p)");
+        }
+    }
+
+    #[test]
+    fn adaptive_input_delay_curve_core_sync_and_high_rtt_udp() {
+        // 1. Curve & clamping checks.
+        assert_eq!(compute_adaptive_delay(1.0, 0.5, TURN_TICKS), 2);
+        assert_eq!(compute_adaptive_delay(120.0, 10.0, TURN_TICKS), 2);
+        assert_eq!(compute_adaptive_delay(160.0, 20.0, TURN_TICKS), 3);
+        assert_eq!(compute_adaptive_delay(320.0, 40.0, TURN_TICKS), 4);
+        assert_eq!(compute_adaptive_delay(2000.0, 500.0, TURN_TICKS), ADAPTIVE_MAX_DELAY);
+
+        // 2. Controller step-up and hysteresis step-down.
+        let mut ctrl = AdaptiveDelayController::new(true, DEFAULT_INPUT_DELAY, TURN_TICKS);
+        assert_eq!(ctrl.maybe_adjust(2, 400.0, 50.0), None, "wait until turn 4");
+        assert_eq!(ctrl.maybe_adjust(8, 350.0, 50.0), Some(4));
+        assert_eq!(ctrl.maybe_adjust(16, 10.0, 2.0), None, "first low window builds hysteresis");
+        assert_eq!(ctrl.maybe_adjust(24, 10.0, 2.0), Some(3), "steps down by 1 after hysteresis");
+        assert_eq!(ctrl.maybe_adjust(32, 10.0, 2.0), None);
+        assert_eq!(ctrl.maybe_adjust(40, 10.0, 2.0), Some(2));
+        assert_eq!(ctrl.maybe_adjust(48, 10.0, 2.0), None, "clamped at ADAPTIVE_MIN_DELAY");
+
+        // 3. Synchronized delay increase (2 -> 4) AND decrease (4 -> 2) across two cores.
+        let s = setups(2);
+        let mut w0 = world(&s, 101);
+        let mut w1 = world(&s, 101);
+        let mut c0 = LockstepCore::new(&w0, 0, 2, TURN_TICKS, 2);
+        let mut c1 = LockstepCore::new(&w1, 1, 2, TURN_TICKS, 2);
+        let mut q0: VecDeque<TurnPacket> = c0.prime(&w0).into();
+        let mut q1: VecDeque<TurnPacket> = c1.prime(&w1).into();
+        let exchange_pair = |c0: &mut LockstepCore, c1: &mut LockstepCore, p0: TurnPacket, p1: TurnPacket| {
+            assert_eq!(p0.turn, p1.turn);
+            let turn = p0.turn;
+            let mut controls = Vec::new();
+            if turn == 5 {
+                controls.push((SYSTEM_SENDER, NetControl::InputDelay(4)));
+            } else if turn == 14 {
+                controls.push((SYSTEM_SENDER, NetControl::InputDelay(2)));
+            }
+            let b = canonicalize_bundle(TurnBundle {
+                turn,
+                hashes: vec![(0, p0.hash), (1, p1.hash)],
+                batches: vec![(0, p0.commands), (1, p1.commands)],
+                controls,
+            });
+            c0.receive(b.clone()).unwrap();
+            c1.receive(b).unwrap();
+        };
+        while let (Some(p0), Some(p1)) = (q0.pop_front(), q1.pop_front()) {
+            exchange_pair(&mut c0, &mut c1, p0, p1);
+        }
+        for _ in 0..90 {
+            let o0 = c0.tick(&mut w0);
+            let o1 = c1.tick(&mut w1);
+            let (TickOutcome::Stepped(pkts0), TickOutcome::Stepped(pkts1)) = (o0, o1) else {
+                panic!("expected both cores to step cleanly without stalling");
+            };
+            assert_eq!(pkts0.len(), pkts1.len());
+            for (p0, p1) in pkts0.into_iter().zip(pkts1) {
+                exchange_pair(&mut c0, &mut c1, p0, p1);
+            }
+        }
+        assert_eq!(w0.state_hash(), w1.state_hash());
+        assert_eq!(c0.delay_changes(), &[(5, 4), (14, 2)]);
+        assert_eq!(c1.delay_changes(), &[(5, 4), (14, 2)]);
+        assert_eq!(c0.input_delay, 2);
+        assert_eq!(c1.input_delay, 2);
+
+        // 4. Live high-RTT UDP loopback triggers host-driven adaptive delay and stays in sync.
+        let high_rtt = NetemConfig {
+            loss_pct: 2.0,
+            dup_pct: 1.0,
+            reorder_window: 0,
+            delay_ms: 95,
+            jitter_ms: 15,
+            seed: 44_999,
+        };
+        let run = run_udp_loopback(2, 2, 48, high_rtt.clone(), high_rtt);
+        assert_eq!(run.hashes[0], run.hashes[1], "high-RTT UDP peers desynced");
+        assert!(
+            !run.delay_changes[0].is_empty(),
+            "expected host to increase input_delay under ~200ms RTT"
+        );
+        assert_eq!(
+            run.delay_changes[0], run.delay_changes[1],
+            "all peers must apply identical delay changes on the same turns"
+        );
+        assert!(
+            run.delay_changes[0][0].1 > DEFAULT_INPUT_DELAY,
+            "expected delay > 2, got {:?}",
+            run.delay_changes[0]
+        );
+    }
+
+    #[test]
+    fn udp_rendezvous_hole_punch_lockstep_match() {
+        let rv = crate::rendezvous::RendezvousServer::bind("127.0.0.1:0").unwrap();
+        let rv_addr = rv.local_addr().to_string();
+        let hs = handshake(2, 2, 7744, 150);
+        let lossy = NetemConfig {
+            loss_pct: 5.0,
+            dup_pct: 2.0,
+            reorder_window: 3,
+            delay_ms: 0,
+            jitter_ms: 0,
+            seed: 44_777,
+        };
+        let (code_tx, code_rx) = mpsc::channel();
+        let hs_host = hs.clone();
+        let rv_h = rv_addr.clone();
+        let netem_h = lossy.clone();
+        let host_t = std::thread::spawn(move || {
+            // Register via code with UDP hole punching enabled; send invite code once bound.
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let tcp_addr = listener.local_addr().unwrap();
+            let udp_mux = UdpMux::bind("127.0.0.1:0", netem_h).unwrap();
+            udp_mux.set_accepting(true);
+            let punch_mux = udp_mux.clone();
+            let mut reg = crate::rendezvous::HostRegistration::register_with_udp(
+                &rv_h,
+                tcp_addr,
+                udp_mux.clone(),
+                "Host",
+                &hs_host.map_id,
+                Duration::from_secs(3),
+                Box::new(|_, _| {}),
+                Box::new(move |tok, targets| {
+                    let _ = punch_mux.start_punch(tok, ROLE_HOST, targets, Duration::from_secs(3));
+                }),
+            )
+            .unwrap();
+            let _ = code_tx.send(reg.code.clone());
+            let mut t = LockstepHost::accept_players_udp(udp_mux, &hs_host, &mut |_, _| {}).unwrap();
+            reg.close();
+            let mut w = world(&hs_host.setups, hs_host.seed);
+            let mut core = LockstepCore::from_handshake(&w, &hs_host);
+            run_headless(&mut t, &mut core, &mut w, hs_host.tick_limit).unwrap()
+        });
+
+        let code = code_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (mut client, c_hs, via) = LockstepClient::connect_code_udp_retry(
+            &rv_addr,
+            &code,
+            false,
+            lossy,
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        assert!(via.is_udp(), "expected punched UDP connection, got {via:?}");
+        let mut w_c = world(&c_hs.setups, c_hs.seed);
+        let mut core_c = LockstepCore::from_handshake(&w_c, &c_hs);
+        let h_client = run_headless(&mut client, &mut core_c, &mut w_c, c_hs.tick_limit).unwrap();
+        let h_host = host_t.join().unwrap();
+        assert_eq!(h_host, h_client, "punched UDP lockstep hashes must match");
+    }
+
+    #[test]
+    fn loopback_mod_sync_transfers_mod_and_matches_sim_hash() {
+        use crate::blueprint;
+        use crate::mods::{Mod, apply};
+        use crate::skirmish::{Role, UnitType};
+
+        let mod_info = "name = 'Sync Heavy Tank'\nuid = 'sync-heavy-tank-v1'\nversion = 1\nauthor = 'Test'\ndescription = 'Boosts UEL0201 gun'\n";
+        let mod_bp = r#"UnitBlueprint {
+            Merge = true,
+            Defense = { MaxHealth = 500 },
+            Weapon = { { Damage = 85, MaxRadius = 32, RateOfFire = 2.0, MuzzleVelocity = 48, DamageRadius = 2.5 } },
+        }"#;
+        let host_mod = Mod::from_memory(
+            mod_info,
+            vec![("units/UEL0201/UEL0201_unit.bp".into(), mod_bp.into())],
+            "sync-heavy",
+        );
+        let expected_id = host_mod.identity();
+
+        let base_bp = r#"UnitBlueprint {
+            Description = 'Light Tank',
+            Categories = {'UEF','MOBILE','LAND','TECH1','DIRECTFIRE'},
+            Defense = { MaxHealth = 250 },
+            Economy = { BuildCostMass = 50, BuildCostEnergy = 250, BuildTime = 200 },
+            Intel = { VisionRadius = 20 },
+            Physics = { MaxSpeed = 3.5, MotionType = 'RULEUMT_Land' },
+            Weapon = { { Label = 'Gun', Damage = 15, MaxRadius = 18, RateOfFire = 0.5, MuzzleVelocity = 25 } },
+        }"#;
+
+        let build_modded_world = |setups: &[ArmySetup], seed: u64, applied: &[Mod]| {
+            let mut cat = test_catalog();
+            let mut roots = BTreeMap::new();
+            roots.insert("UEL0201".into(), blueprint::parse_blueprint(base_bp).unwrap());
+            apply(&mut roots, applied).unwrap();
+            cat.types.insert("UEL0201".into(), UnitType::from_blueprint("UEL0201", Role::Mobile, &roots["UEL0201"]));
+            cat.mods = applied.iter().map(Mod::identity).collect();
+            let grid = PathGrid::new(64, 64, 4 * SCALE);
+            let mut w = Skirmish::new(cat, grid, (256 * SCALE, 256 * SCALE), vec![], setups, seed).unwrap();
+            let u0 = w.spawn_unit(0, "UEL0201", (100 * SCALE, 100 * SCALE)).unwrap();
+            let u1 = w.spawn_unit(1, "RT", (124 * SCALE, 100 * SCALE)).unwrap();
+            w.issue(0, Command::Attack { units: vec![u0], target: u1, queue: false });
+            w.issue(1, Command::Attack { units: vec![u1], target: u0, queue: false });
+            w
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let mut hs_host = handshake(2, 2, 777, 90);
+        hs_host.mods = vec![expected_id.clone()];
+        let host_mod_clone = host_mod.clone();
+        let hs_for_host = hs_host.clone();
+
+        let host_thread = std::thread::spawn(move || {
+            let mut t = LockstepHost::accept_players_with_mods(
+                listener,
+                &hs_for_host,
+                std::slice::from_ref(&host_mod_clone),
+                &mut |_, _| {},
+            )
+            .unwrap();
+            let mut w = build_modded_world(&hs_for_host.setups, hs_for_host.seed, std::slice::from_ref(&host_mod_clone));
+            let mut core = LockstepCore::from_handshake(&w, &hs_for_host);
+            run_headless(&mut t, &mut core, &mut w, hs_for_host.tick_limit).unwrap()
+        });
+
+        let cache_dir = std::env::temp_dir().join(format!("farust-net-modsync-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&cache_dir);
+        let (mut client, hs_client, synced) = LockstepClient::connect_with_mods(&addr, &[], &cache_dir).unwrap();
+        assert_eq!(hs_client.mods, vec![expected_id.clone()]);
+        assert_eq!(synced.len(), 1);
+        assert_eq!(synced[0].identity(), expected_id);
+        assert!(synced[0].dir.as_ref().is_some_and(|d| d.starts_with(&cache_dir)));
+
+        let mut w_client = build_modded_world(&hs_client.setups, hs_client.seed, &synced);
+        let mut core_client = LockstepCore::from_handshake(&w_client, &hs_client);
+        let h_client = run_headless(&mut client, &mut core_client, &mut w_client, hs_client.tick_limit).unwrap();
+        let h_host = host_thread.join().unwrap();
+        assert_eq!(h_host, h_client, "host and synced client must finish with identical sim hash");
+
+        // Verify the synced mod actually changed the sim hash relative to unmodded stock.
+        let mut w_stock = build_modded_world(&hs_host.setups, hs_host.seed, &[]);
+        w_stock.run(hs_host.tick_limit);
+        assert_ne!(h_host, w_stock.state_hash(), "mod must alter sim outcome");
+        let _ = std::fs::remove_dir_all(&cache_dir);
+    }
+
+    #[test]
+    fn mod_sync_hash_mismatch_aborts_cleanly() {
+        use crate::mods::{Mod, encode_mod_bundle};
+
+        let host_mod = Mod::from_memory(
+            "name = 'Tamper Test'\nuid = 'tamper-test-v1'\nversion = 1\n",
+            vec![("units/UEL0201/UEL0201_unit.bp".into(), "UnitBlueprint { Merge = true, Defense = { MaxHealth = 500 } }".into())],
+            "tamper",
+        );
+        let mut bad_bundle = encode_mod_bundle(&host_mod).unwrap();
+        let last = bad_bundle.len() - 2;
+        bad_bundle[last] ^= 0x01; // Corrupt blueprint byte -> hash mismatch!
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let mut hs_host = handshake(2, 2, 123, 30);
+        hs_host.mods = vec![host_mod.identity()];
+
+        let host_t = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut ps = PeerStream::Tcp(stream);
+            ps.write_frame(&encode_handshake(&hs_host)).unwrap();
+            let req = decode_mod_sync_req(&ps.read_frame().unwrap()).unwrap();
+            assert_eq!(req, vec![0]);
+            ps.write_frame(&encode_mod_chunk(0, bad_bundle.len() as u32, 0, &bad_bundle)).unwrap();
+            decode_mod_sync_ack(&ps.read_frame().unwrap()).unwrap()
+        });
+
+        let cache_dir = std::env::temp_dir().join(format!("farust-net-modsync-bad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&cache_dir);
+        let Err(client_err) = LockstepClient::connect_with_mods(&addr, &[], &cache_dir) else { panic!("expected a hash mismatch") };
+        assert!(client_err.contains("hash mismatch"), "expected hash mismatch error, got: {client_err}");
+        let host_ack = host_t.join().unwrap();
+        assert!(host_ack.is_err(), "host should receive mod sync rejection");
+        assert!(!cache_dir.exists() || std::fs::read_dir(&cache_dir).unwrap().count() == 0);
+        let _ = std::fs::remove_dir_all(&cache_dir);
     }
 }

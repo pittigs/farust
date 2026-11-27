@@ -1,0 +1,180 @@
+# Forged Alliance Campaign Operation 1 — Operation: Black Day (X1CA_001)
+# Reimplemented in FARust's deterministic mission language (Phase 49) from X1CA_001 map data,
+# named markers & areas, objectives, and X01_VO dialogue cues.
+#
+# Headless:  farust mission missions/x1ca_001.farust-mission --human-ai hard
+# Play:      farust play --mission missions/x1ca_001.farust-mission   (or Main Menu -> CAMPAIGN)
+
+mission "Operation: Black Day"
+map X1CA_001
+victory sandbox
+
+# Coalition (Team 0): Player LZ in the southwest, Brigadier Fletcher at Fort Clarke & Seabring
+army 0 faction uef team 0 human at CDRWarp
+army 1 faction uef team 0 ai none at PlayerBaseArea_Landing_1 no_acu
+
+# Invaders (Team 1): staged Order & Seraphim commands across Griffin IV
+army 2 faction aeon team 1 ai none at 355.5,735.5 no_acu
+army 3 faction aeon team 1 ai none at Order_M1_West_Base_Marker no_acu
+army 4 faction aeon team 1 ai none at 315.5,410.5 no_acu
+army 5 faction aeon team 1 ai none at 673.5,392.5
+army 6 faction seraphim team 1 ai none at 944.5,87.5
+
+# --- Primary & Secondary Objectives ---
+objective m1_bases     primary   "Destroy the two Order forward bases north of the channel"
+objective m2_seabring  primary   "Defend Seabring and destroy the Order assault base"
+objective m2_gari      primary   "Defeat Order Commander Gari"
+objective m3_clarke    primary   "Protect Fort Clarke and Brigadier Fletcher"
+objective m3_exp       primary   "Destroy the Seraphim Ythotha experimental"
+objective m3_seraphim  primary   "Defeat Seraphim Commander Shun-Ullevash"
+objective m1_artillery secondary "Clear the Order coastal artillery positions"
+objective m1_subs      secondary "Destroy the Order submarine patrol in the channel"
+
+# --- Player Starting Base (southwest LZ, from X1CA_001 Starting_Base) ---
+start 0 UEB1302 x1 at 48.5,964.5
+start 0 UEB1302 x1 at 69.5,974.5
+start 0 UEB1302 x1 at 38.5,949.5
+start 0 UEB1302 x1 at 101.5,942.5
+start 0 UEB1303 x1 at 52.5,944.5
+start 0 UEB1303 x1 at 64.5,944.5
+start 0 UEB1106 x1 at 60.5,946.5
+start 0 UEB1106 x1 at 50.5,940.5
+start 0 UEB0301 x1 at 99.5,967.5
+# T3 power for the LZ's mass fabricators (each UEB1303 drains 3500 E/s)
+start 0 UEB1301 x4 at 76.5,926.5
+start 0 UEB0202 x1 at 53.5,957.5
+start 0 UEB4301 x1 at 114.5,958.5 hp 75%
+start 0 UEB2204 x1 at 80.5,946.5
+start 0 UEB2101 x1 at 128.5,962.5
+start 0 UEL0309 x2 at 88.5,955.5
+start 0 XEL0305 x6 at 95.5,932.5
+start 0 UES0201 x2 at 100.0,883.0
+
+# --- Coalition Garrison: Fort Clarke (northwest) & Seabring Civilians (west-central) ---
+start 1 XEC1301 x1 at 132.5,111.5
+start 1 UEL0001 x1 at 140.5,115.5
+start 1 UEB4301 x1 at 132.5,101.5
+start 1 UEB4301 x1 at 122.5,111.5
+start 1 UEB1303 x2 at 166.5,49.5
+start 1 UEB1301 x3 at 150.5,62.5
+start 1 UEB2301 x3 at 160.5,82.5
+start 1 UEB2304 x2 at 112.5,72.5
+start 1 UEL0303 x5 at 153.5,98.5
+
+# Seabring town (6 civilian residential structures + local militia)
+start 1 UEC1101 x1 at 194.5,375.5
+start 1 UEC1101 x1 at 189.5,375.5
+start 1 UEC1101 x1 at 199.5,363.5
+start 1 UEC1101 x1 at 210.5,359.5
+start 1 UEC1101 x1 at 180.5,402.5
+start 1 UEC1101 x1 at 169.5,386.5
+start 1 UEB4202 x1 at 182.5,375.5
+start 1 UEB1201 x2 at 191.5,402.5
+start 1 UEB2301 x3 at 203.5,383.5
+start 1 UEB2204 x2 at 214.5,379.5
+
+# --- Act 1: Order Forward Bases, Coastal Artillery & Channel Submarines ---
+# East/South forward base (M1_South_Base_Area)
+start 2 UAB0201 x1 at 348.5,759.5
+start 2 UAB0202 x1 at 360.5,745.5
+start 2 UAB1201 x2 at 340.5,742.5
+start 2 UAB1302 x1 at 361.5,730.5
+start 2 UAB1302 x1 at 383.5,708.5
+start 2 UAB2101 x2 at 352.5,722.5
+start 2 UAB2204 x1 at 355.5,735.5
+start 2 UAL0202 x3 at 345.5,748.5
+# Coastal artillery line (M1_Artillery_Area_1..4) & channel submarine patrol
+start 2 UAB2303 x1 at 162.5,633.5
+start 2 UAB2303 x1 at 218.5,698.5
+start 2 UAB2303 x1 at 298.5,770.5
+start 2 UAB2303 x1 at 352.5,812.5
+start 2 UAS0203 x3 at 243.5,849.5 patrol 198.5,729.5
+
+# West/North forward base (M1_North_Base_Area)
+start 3 UAB0201 x1 at 247.5,634.5
+start 3 UAB0202 x1 at 236.5,642.5
+start 3 UAB1201 x2 at 255.5,645.5
+start 3 UAB1302 x1 at 251.5,630.5
+start 3 UAB1302 x1 at 219.5,632.5
+start 3 UAB2101 x2 at 227.5,654.5
+start 3 UAB2204 x1 at 242.5,625.5
+start 3 UAL0301 x1 at 266.5,657.5
+start 3 UAL0202 x3 at 240.5,648.5
+
+# --- Act 2: Order Seabring Assault Base (M2_OrderBase_Area) & Commander Gari ---
+start 4 UAB0301 x1 at 327.5,406.5
+start 4 UAB0201 x1 at 340.5,400.5
+start 4 UAB1301 x1 at 320.5,418.5
+start 4 UAB4202 x1 at 315.5,405.5
+start 4 UAB2301 x2 at 305.5,395.5
+start 4 UAB2204 x2 at 325.5,395.5
+start 4 UAL0202 x4 at 310.5,400.5
+
+# Order Commander Gari's Main Base (M3_Order_Base_Area)
+start 5 UAB0301 x1 at 605.5,422.5
+start 5 UAB0302 x1 at 644.5,373.5
+start 5 UAB1301 x1 at 623.5,360.5
+start 5 UAB4301 x1 at 637.5,374.5
+start 5 UAB2301 x2 at 624.5,412.5
+start 5 UAB2304 x2 at 665.5,392.5
+start 5 UAL0303 x3 at 660.5,400.5
+
+# --- Act 3: Seraphim Main Base & Shun-Ullevash ---
+start 6 XSB0301 x1 at 882.5,76.5
+start 6 XSB0302 x1 at 939.5,81.5
+start 6 XSB1301 x1 at 902.5,44.5
+start 6 XSB4301 x1 at 938.5,74.5
+start 6 XSB2301 x2 at 885.5,105.5
+start 6 XSB2304 x2 at 925.5,95.5
+start 6 XSL0303 x3 at 915.5,95.5
+
+# ==============================================================================
+# Mission Triggers
+# ==============================================================================
+
+# --- Opening Briefing & Act 1 Dialogue ---
+when at 0:00 do say "[HQ]: Like Hall said, your first objective is to assault and destroy the two Order bases located to your north. HQ out." voice X01_HQ_M01_02881; camera CDRWarp zoom 85
+when at 0:10 do say "[Fletcher]: You just gated into a hell of a mess, Colonel, but I'm glad you're here." voice X01_Fletcher_M01_03419
+when at 0:20 do say "[HQ]: We're uploading the Percival schematic to your ACU; it's a siege assault bot modified to cross water. HQ out." voice X01_HQ_M01_04230
+when at 0:32 do say "[HQ]: There's a line of enemy artillery protecting the bases, plus subs in the channel. Clear them out if you can." voice X01_HQ_M01_04847
+when at 0:45 do say "[Gari]: On this day, the Coalition will fall. No one will escape our wrath." voice X01_Gari_M01_04005
+
+# Act 1 Order air & hover-tank raids against the Player LZ (until the respective forward base falls)
+when every 1:10 from 0:50 until 15:00 do spawn 2 UAA0203 x3 at 355.5,735.5 attack CDRWarp; spawn 2 XAL0203 x3 at 355.5,735.5 attack CDRWarp
+when every 1:25 from 1:15 until 15:00 do spawn 3 UAA0203 x3 at Order_M1_West_Base_Marker attack CDRWarp; spawn 3 UAL0201 x4 at Order_M1_West_Base_Marker attack CDRWarp
+
+# Act 1 Secondary Objectives
+when count 2 UAB2303 == 0 do objective m1_artillery complete; say "[HQ]: That's the last of them -- all the artillery positions are down. HQ out." voice X01_HQ_M01_03631
+when count 2 UAS0203 == 0 do objective m1_subs complete; say "[HQ]: Good job. With those subs out of the way, the channel is secure. HQ out." voice X01_HQ_M01_05101
+
+# Act 1 Primary Progress: East & West Order Bases
+when count 2 structures in area M1_South_Base_Area == 0 do say "[HQ]: Scratch one of the Order forward bases. HQ out." voice X01_HQ_M01_03624; defeat 2
+when count 3 structures in area M1_North_Base_Area == 0 do defeat 3
+
+# --- Transition to Act 2: Relieve Seabring & Defeat Order Commander Gari ---
+when count 2 structures in area M1_South_Base_Area == 0 and count 3 structures in area M1_North_Base_Area == 0 do objective m1_bases complete; say "[HQ]: That's both of them. Proceed inland -- Constable Graham is on the horn!" voice X01_HQ_M01_03625; say "[Graham]: Commander, Order units are overwhelming Seabring's defenses! We need your help!" voice X01_Graham_M02_04003; say "[Hall]: Change in plans, Commander. Defend the civilians at Seabring and eradicate Gari's forces." voice X01_Hall_M02_04004; spawn 0 XEL0305 x5 at 250.5,635.5 attack 315.5,410.5
+
+# Act 2 Order attacks against Seabring once M1 bases fall
+when objective m1_bases complete and every 1:30 from 0:00 until 45:00 do spawn 4 UAL0202 x3 at 315.5,410.5 attack 194.5,375.5
+
+# Act 2 Seabring Assault Base destroyed -> Seabring saved, push east against Gari!
+when objective m1_bases complete and count 4 structures in area M2_OrderBase_Area == 0 do objective m2_seabring complete; defeat 4; say "[Graham]: The civilians are safe. I am forever in your debt, Commander." voice X01_Graham_M02_04236; say "[Hall]: That Order commander has caused us enough grief -- assault her position and take her out." voice X01_Hall_M02_04248; say "[HQ]: Gari is moving sniper bots and heavy assault forces to intercept you. Watch your flanks!" voice X01_HQ_M02_04246; spawn 5 XAL0305 x3 at 580.5,410.5 attack 315.5,410.5; spawn 0 XEL0305 x6 at 300.5,405.5 attack 673.5,392.5
+
+# Act 2 Order Commander Gari defeated -> Transition to Act 3!
+when dead commander 5 do objective m2_gari complete; defeat 5; say "[Gari]: The Seraphim will never be defeated!" voice X01_Gari_T01_04530; say "[HQ]: That sure was a pretty sight. Fort Clarke is to the northwest, and the Seraphim commander is to the northeast. HQ out." voice X01_HQ_M02_03675; say "[Fletcher]: That alien freak is due east of my location, and it's got an experimental stomping around! Assault from the south and I'll push in from the west!" voice X01_Fletcher_M03_04694; say "[HQ]: Fletcher, a Seraphim Ythotha experimental is approaching Fort Clarke! Intercept it!" voice X01_HQ_M03_03715; spawn 6 XSL0401 x1 at 820.5,120.5 attack 140.5,115.5; spawn 1 UEL0303 x8 at 195.5,110.5 attack 880.5,95.5; spawn 0 XEL0305 x8 at 660.5,360.5 attack 944.5,87.5; spawn 0 UEL0401 x1 at 650.5,370.5 attack 944.5,87.5
+
+# Act 3 ongoing Fletcher pushes from Fort Clarke & Seraphim counter-raids
+when objective m2_gari complete and every 1:45 from 0:30 until 45:00 do spawn 1 UEL0303 x4 at 195.5,110.5 attack 944.5,87.5
+when objective m2_gari complete and every 2:00 from 1:00 until 45:00 do spawn 6 XSL0202 x3 at 860.5,110.5 attack 140.5,115.5
+
+# Act 3 Primary Objectives: Destroy Ythotha Experimental & Defeat Shun-Ullevash
+when objective m2_gari complete and count 6 XSL0401 == 0 do objective m3_exp complete; say "[HQ]: The Seraphim experimental is down! Maybe they'll think twice before attacking like that again. HQ out." voice X01_HQ_M03_04255
+when dead commander 6 do objective m3_seraphim complete; defeat 6; say "[Shun-Ullevash]: [Language Not Recognized]" voice X01_Shun-Ullevash-M03-4257
+when objective m1_bases complete and objective m2_seabring complete and objective m2_gari complete and objective m3_exp complete and objective m3_seraphim complete do objective m3_clarke complete
+when all primary complete do say "[Hall]: All enemy forces have been defeated and Fort Clarke is safe. Well done, Commander. This is an important victory for us." voice X01_Hall_M03_04258; win 0
+
+# --- Defeat Conditions ---
+when dead commander 0 do say "[Kael]: Fort Clarke has fallen and the Coalition is no more!" voice X01_Kael_DB01_04259; lose 0
+when count 1 UEC1101 in 192.0,378.0 r55 < 3 do objective m2_seabring fail; say "[Graham]: Oh no ... they've wiped out the entire town. All those civilians ... dead." voice X01_Graham_M02_03643; lose 0
+when count 1 XEC1301 == 0 do objective m3_clarke fail; say "[Fletcher]: Fort Clarke has fallen!" voice X01_Fletcher_T01_04535; lose 0
+when dead commander 1 do objective m3_clarke fail; say "[Fletcher]: You've got to be kidding!" voice X01_Fletcher_T01_04535; lose 0

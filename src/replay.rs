@@ -13,15 +13,19 @@ use std::path::Path;
 
 use crate::mods::ModIdentity;
 use crate::skirmish::{
-    ArmyId, ArmySetup, Catalog, Command, GameOptions, MapContext, Skirmish, UnitId, VictoryCondition,
+    ArmyId, ArmySetup, Catalog, Command, GameOptions, MapContext, RULES_VERSION, Skirmish, UnitId, VictoryCondition,
 };
 
 pub const REPLAY_MAGIC: &[u8; 8] = b"FARPL1\0\0";
 pub const REPLAY_VERSION_V1: u32 = 1;
 pub const REPLAY_VERSION_V2: u32 = 2;
 pub const REPLAY_VERSION_V3: u32 = 3;
-/// Phase 24: header carries the enabled mods' identities.
-pub const REPLAY_VERSION: u32 = 4;
+pub const REPLAY_VERSION_V4: u32 = 4;
+/// Phase 24: header carries the enabled mods' identities (v4).
+/// Phase 29: header carries the sim [`RULES_VERSION`] (v5; older files are rules 1).
+pub const REPLAY_VERSION_V5: u32 = 5;
+/// Phase 48: header carries the mission script text, if any (v6).
+pub const REPLAY_VERSION: u32 = 6;
 pub const CHECKPOINT_INTERVAL: u64 = 300;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,6 +37,32 @@ pub struct ReplayHeader {
     pub options: GameOptions,
     /// Phase 24: mods the match was played with (empty = stock content).
     pub mods: Vec<ModIdentity>,
+    /// Phase 29: sim rules generation the match was recorded under.
+    pub rules: u32,
+    /// Phase 48: mission script the match ran (re-parsed on playback).
+    pub mission: Option<String>,
+}
+
+impl ReplayHeader {
+    /// Phase 29: re-simulating under different sim rules would silently diverge.
+    pub fn check_rules(&self, what: &str) -> Result<(), String> {
+        if self.rules == RULES_VERSION {
+            Ok(())
+        } else {
+            Err(format!(
+                "{what} was recorded with sim rules v{} but this build simulates rules v{RULES_VERSION}",
+                self.rules
+            ))
+        }
+    }
+
+    /// Phase 48/49: installs the recorded mission script (if any) into a fresh world.
+    pub fn apply_mission(&self, world: &mut Skirmish, map: &MapContext) -> Result<(), String> {
+        if let Some(src) = &self.mission {
+            crate::mission::Mission::parse(src)?.install(world, map)?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,10 +111,17 @@ impl ReplayRecorder {
                 setups,
                 options: GameOptions::default(),
                 mods: crate::mods::active_identities(),
+                rules: RULES_VERSION,
+                mission: None,
             },
             commands: Vec::new(),
             checkpoints: Vec::new(),
         }
+    }
+
+    /// Phase 48: record the mission script the world runs.
+    pub fn set_mission(&mut self, mission: Option<String>) {
+        self.header.mission = mission;
     }
 
     /// Phase 18: record the game options the world was created with.
@@ -308,6 +345,61 @@ pub(crate) fn encode_command(out: &mut Vec<u8>, cmd: &Command) {
             out.extend_from_slice(&y.to_le_bytes());
             out.push(u8::from(*queue));
         }
+        Command::Dock { units, staging, queue } => {
+            out.push(21);
+            write_ids(out, units);
+            out.extend_from_slice(&staging.to_le_bytes());
+            out.push(u8::from(*queue));
+        }
+        Command::SetAutoRefuel { units, enabled } => {
+            out.push(22);
+            write_ids(out, units);
+            out.push(u8::from(*enabled));
+        }
+        Command::SetFireState { units, state } => {
+            out.push(23);
+            write_ids(out, units);
+            out.push(state.code());
+        }
+        Command::AttackGround { units, x, y, queue } => {
+            out.push(24);
+            write_ids(out, units);
+            out.extend_from_slice(&x.to_le_bytes());
+            out.extend_from_slice(&y.to_le_bytes());
+            out.push(u8::from(*queue));
+        }
+        Command::Guard { units, target, queue } => {
+            out.push(25);
+            write_ids(out, units);
+            out.extend_from_slice(&target.to_le_bytes());
+            out.push(u8::from(*queue));
+        }
+        Command::SetBuildPaused { units, paused } => {
+            out.push(26);
+            write_ids(out, units);
+            out.push(u8::from(*paused));
+        }
+        Command::Ping { kind, x, y } => {
+            out.push(29);
+            out.push(*kind);
+            out.extend_from_slice(&x.to_le_bytes());
+            out.extend_from_slice(&y.to_le_bytes());
+        }
+        Command::MoveWaypoint { units, index, x, y } => {
+            out.push(27);
+            write_ids(out, units);
+            out.extend_from_slice(&index.to_le_bytes());
+            out.extend_from_slice(&x.to_le_bytes());
+            out.extend_from_slice(&y.to_le_bytes());
+        }
+        Command::Ferry { transports, from, to, queue } => {
+            out.push(28);
+            write_ids(out, transports);
+            for v in [from.0, from.1, to.0, to.1] {
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            out.push(u8::from(*queue));
+        }
         Command::Enhance { unit, name } => {
             out.push(18);
             out.extend_from_slice(&unit.to_le_bytes());
@@ -424,6 +516,49 @@ pub(crate) fn decode_command(data: &[u8], pos: &mut usize) -> Result<Command, St
             y: read_i64(data, pos)?,
             queue: read_u8(data, pos)? != 0,
         }),
+        21 => Ok(Command::Dock {
+            units: read_ids(data, pos)?,
+            staging: read_u32(data, pos)?,
+            queue: read_u8(data, pos)? != 0,
+        }),
+        22 => Ok(Command::SetAutoRefuel {
+            units: read_ids(data, pos)?,
+            enabled: read_u8(data, pos)? != 0,
+        }),
+        23 => {
+            let units = read_ids(data, pos)?;
+            let code = read_u8(data, pos)?;
+            let state = crate::skirmish::FireState::from_code(code).ok_or_else(|| format!("unknown fire state {code}"))?;
+            Ok(Command::SetFireState { units, state })
+        }
+        24 => Ok(Command::AttackGround {
+            units: read_ids(data, pos)?,
+            x: read_i64(data, pos)?,
+            y: read_i64(data, pos)?,
+            queue: read_u8(data, pos)? != 0,
+        }),
+        25 => Ok(Command::Guard {
+            units: read_ids(data, pos)?,
+            target: read_u32(data, pos)?,
+            queue: read_u8(data, pos)? != 0,
+        }),
+        26 => Ok(Command::SetBuildPaused {
+            units: read_ids(data, pos)?,
+            paused: read_u8(data, pos)? != 0,
+        }),
+        29 => Ok(Command::Ping { kind: read_u8(data, pos)?, x: read_i64(data, pos)?, y: read_i64(data, pos)? }),
+        27 => Ok(Command::MoveWaypoint {
+            units: read_ids(data, pos)?,
+            index: read_u32(data, pos)?,
+            x: read_i64(data, pos)?,
+            y: read_i64(data, pos)?,
+        }),
+        28 => {
+            let transports = read_ids(data, pos)?;
+            let from = (read_i64(data, pos)?, read_i64(data, pos)?);
+            let to = (read_i64(data, pos)?, read_i64(data, pos)?);
+            Ok(Command::Ferry { transports, from, to, queue: read_u8(data, pos)? != 0 })
+        }
         18 => Ok(Command::Enhance {
             unit: read_u32(data, pos)?,
             name: read_str(data, pos)?,
@@ -459,6 +594,14 @@ impl Replay {
         out.push(self.header.options.victory.code());
         out.extend_from_slice(&self.header.options.unit_cap.to_le_bytes());
         crate::mods::encode_identities(&mut out, &self.header.mods);
+        out.extend_from_slice(&self.header.rules.to_le_bytes());
+        match &self.header.mission {
+            Some(src) => {
+                out.push(1);
+                write_str(&mut out, src);
+            }
+            None => out.push(0),
+        }
         out.extend_from_slice(&(self.commands.len() as u32).to_le_bytes());
         for c in &self.commands {
             out.extend_from_slice(&c.tick.to_le_bytes());
@@ -519,11 +662,13 @@ impl Replay {
         } else {
             GameOptions::default()
         };
-        let mods = if ver >= REPLAY_VERSION {
+        let mods = if ver >= REPLAY_VERSION_V4 {
             crate::mods::decode_identities(data, &mut pos)?
         } else {
             Vec::new()
         };
+        let rules = if ver >= REPLAY_VERSION_V5 { read_u32(data, &mut pos)? } else { 1 };
+        let mission = if ver >= REPLAY_VERSION && read_u8(data, &mut pos)? != 0 { Some(read_str(data, &mut pos)?) } else { None };
         let n_cmds = read_u32(data, &mut pos)? as usize;
         let mut commands = Vec::with_capacity(n_cmds.min(100_000));
         for _ in 0..n_cmds {
@@ -542,7 +687,7 @@ impl Replay {
         let final_tick = read_u64(data, &mut pos)?;
         let final_hash = read_u64(data, &mut pos)?;
         Ok(Replay {
-            header: ReplayHeader { map_id, seed, setups, options, mods },
+            header: ReplayHeader { map_id, seed, setups, options, mods, rules, mission },
             commands,
             checkpoints,
             final_tick,
@@ -577,6 +722,7 @@ impl Replay {
             ));
         }
         crate::mods::check_match(&self.header.mods, &catalog.mods, "this replay")?;
+        self.header.check_rules("this replay")?;
         let mut world = Skirmish::new(
             catalog,
             map.grid.clone(),
@@ -585,12 +731,9 @@ impl Replay {
             &self.header.setups,
             self.header.seed,
         )?;
-        world.set_domain_grids(
-            map.naval_grid.clone(),
-            map.amphib_grid.clone(),
-            map.hydro_points.clone(),
-        );
+        world.attach_map(map);
         world.set_options(self.header.options);
+        self.header.apply_mission(&mut world, map)?;
 
         let mut cmd_idx = 0usize;
         let mut cp_idx = 0usize;
@@ -638,6 +781,22 @@ impl Replay {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn rules_version_round_trips_and_mismatch_is_refused() {
+        let setups = (0..2)
+            .map(|i| ArmySetup { name: format!("A{i}"), faction: 0, start: (0, 0), team: i })
+            .collect();
+        let mut rec = ReplayRecorder::new("SCMP_001", 3, setups);
+        rec.header.rules = 1;
+        let r = Replay { header: rec.header.clone(), commands: vec![], checkpoints: vec![], final_tick: 0, final_hash: 0 };
+        let back = Replay::from_bytes(&r.to_bytes()).unwrap();
+        assert_eq!(back.header.rules, 1);
+        let err = back.header.check_rules("this replay").unwrap_err();
+        assert!(err.contains("rules v1") && err.contains(&format!("v{RULES_VERSION}")), "{err}");
+        assert!(ReplayRecorder::new("X", 1, vec![]).header.check_rules("x").is_ok());
+    }
+
     use super::*;
     use crate::pathfinding::PathGrid;
     use crate::scmap::{ScMap, WaterInfo};
@@ -670,6 +829,8 @@ mod tests {
                     elevation_deep: 8.0,
                     elevation_abyss: 2.0,
                 },
+                unknown1: 0, unknown2: 0, unknown3: 0, unknown4: 0, post_heightmap_byte: 0,
+                shader_raw: Vec::new(), background_raw: Vec::new(), sky_raw: Vec::new(), cubemaps_raw: Vec::new(), tail_bytes: Vec::new(),
                 terrain_textures: None,
             },
             grid: PathGrid::new(64, 64, 4 * SCALE),
@@ -683,6 +844,9 @@ mod tests {
             mass_points: vec![(40 * SCALE, 40 * SCALE), (210 * SCALE, 210 * SCALE)],
             hydro_points: vec![],
             has_water: false,
+            props: Vec::new(),
+            markers: Default::default(),
+            areas: Default::default(),
         }
     }
 
@@ -706,6 +870,20 @@ mod tests {
             Command::Patrol { units: vec![3, 4], x: 6000, y: 7000, queue: true },
             Command::ToggleShield { units: vec![10], enabled: true },
             Command::CancelProduce { factory: 7, unit_type: "UEL0201".into(), count: 2 },
+            Command::Load { units: vec![1, 2], transport: 3, queue: false },
+            Command::Unload { transports: vec![3], x: 100, y: 200, queue: true },
+            Command::Enhance { unit: 1, name: "Shield".into() },
+            Command::SetRepeat { factories: vec![7], enabled: true },
+            Command::Dock { units: vec![11, 12], staging: 40, queue: true },
+            Command::SetAutoRefuel { units: vec![11], enabled: false },
+            Command::SetFireState { units: vec![1, 2], state: crate::skirmish::FireState::HoldFire },
+            Command::SetFireState { units: vec![3], state: crate::skirmish::FireState::ReturnFire },
+            Command::AttackGround { units: vec![4], x: -5, y: 9_000, queue: true },
+            Command::Guard { units: vec![5, 6], target: 7, queue: false },
+            Command::SetBuildPaused { units: vec![8], paused: true },
+            Command::MoveWaypoint { units: vec![1, 9], index: 2, x: 777, y: -3 },
+            Command::Ferry { transports: vec![30], from: (1_000, 2_000), to: (-5, 90_000), queue: true },
+            Command::Ping { kind: 2, x: 4_000, y: -7 },
         ];
         let mut buf = Vec::new();
         for c in &all {

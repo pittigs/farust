@@ -1,0 +1,42 @@
+# Phase 57: Flatpak manifest (build: flatpak-builder --user --install build-dir packaging/flatpak/org.farust.Farust.yml)
+#
+# Flatpak builds are offline: generate `cargo-sources.json` first with
+#   python3 flatpak-cargo-generator.py Cargo.lock -o packaging/flatpak/cargo-sources.json
+# (https://github.com/flatpak/flatpak-builder-tools/tree/master/cargo).
+# The game install is read through the Steam / GOG folders granted below (read-only).
+app-id: org.farust.Farust
+runtime: org.freedesktop.Platform
+runtime-version: '24.08'
+sdk: org.freedesktop.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: farust
+finish-args:
+  - --share=ipc
+  - --share=network
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --socket=pulseaudio
+  - --device=dri
+  - --filesystem=~/.local/share/Steam/steamapps:ro
+  - --filesystem=~/.steam:ro
+  - --filesystem=~/GOG Games:ro
+  - --env=PATH=/app/bin:/usr/bin
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin
+  env:
+    CARGO_HOME: /run/build/farust/cargo
+modules:
+  - name: farust
+    buildsystem: simple
+    build-commands:
+      - cargo --offline fetch --manifest-path Cargo.toml --verbose
+      - cargo --offline build --release --locked
+      - install -Dm755 target/release/farust /app/bin/farust
+      - install -Dm644 packaging/linux/org.farust.Farust.desktop /app/share/applications/org.farust.Farust.desktop
+      - install -Dm644 packaging/linux/org.farust.Farust.metainfo.xml /app/share/metainfo/org.farust.Farust.metainfo.xml
+      - install -Dm644 assets/icon.svg /app/share/icons/hicolor/scalable/apps/org.farust.Farust.svg
+    sources:
+      - type: dir
+        path: ../..
+      - cargo-sources.json

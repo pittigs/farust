@@ -57,8 +57,71 @@ pub fn apply_hit(target_hp: &mut i64, damage: i64) -> bool {
     }
 }
 
+/// Phase 29: one full turn in milliradians (rounded `2π`).
+pub const TWO_PI_MRAD: i64 = 6_283;
+
+/// `atan(2^-i)` in nanoradians (CORDIC vectoring table).
+const CORDIC_ATAN_NRAD: [i128; 32] = [
+    785_398_163, 463_647_609, 244_978_663, 124_354_995, 62_418_810, 31_239_833, 15_623_729, 7_812_341,
+    3_906_230, 1_953_123, 976_562, 488_281, 244_141, 122_070, 61_035, 30_518, 15_259, 7_629, 3_815,
+    1_907, 954, 477, 238, 119, 60, 30, 15, 7, 4, 2, 1, 0,
+];
+const PI_NRAD: i128 = 3_141_592_654;
+
+/// Phase 29: integer-only `atan2(y, x)` in milliradians, range `[-π, π]`, bit-identical on
+/// every platform (CORDIC vectoring, no floats). `(0, 0)` yields 0.
+pub fn atan2_mrad(y: i64, x: i64) -> i64 {
+    if x == 0 && y == 0 {
+        return 0;
+    }
+    let (mut x, mut y) = (x as i128, y as i128);
+    let mut ang: i128 = 0;
+    if x < 0 {
+        ang = if y >= 0 { PI_NRAD } else { -PI_NRAD };
+        x = -x;
+        y = -y;
+    }
+    x <<= 20;
+    y <<= 20;
+    for (i, &a) in CORDIC_ATAN_NRAD.iter().enumerate() {
+        let (dx, dy) = (y >> i, x >> i);
+        if y > 0 {
+            x += dx;
+            y -= dy;
+            ang += a;
+        } else {
+            x -= dx;
+            y += dy;
+            ang -= a;
+        }
+    }
+    (ang + 500_000).div_euclid(1_000_000) as i64
+}
+
+/// Phase 29: wraps an angle difference into `[-π, π]` milliradians.
+pub fn wrap_mrad(a: i64) -> i64 {
+    (a + TWO_PI_MRAD / 2).rem_euclid(TWO_PI_MRAD) - TWO_PI_MRAD / 2
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn integer_atan2_matches_float_within_a_milliradian() {
+        let samples = [
+            (0, 1), (1, 0), (0, -1), (-1, 0), (1, 1), (-1, -1), (3, -4), (-7, 2), (1_000_000, 3),
+            (-3, -2_000_000), (123_456, -654_321), (5, 5_000_000), (-1, 1), (1, -1), (0, 7),
+        ];
+        for (y, x) in samples {
+            let want = ((y as f64).atan2(x as f64) * 1000.0).round() as i64;
+            let got = atan2_mrad(y, x);
+            assert!((got - want).abs() <= 1, "atan2({y}, {x}) = {got}, want {want}");
+        }
+        assert_eq!(atan2_mrad(0, 0), 0);
+        assert_eq!(wrap_mrad(3_200), 3_200 - TWO_PI_MRAD);
+        assert_eq!(wrap_mrad(-3_200), -3_200 + TWO_PI_MRAD);
+        assert_eq!(wrap_mrad(1_000), 1_000);
+    }
+
     use super::*;
 
     #[test]

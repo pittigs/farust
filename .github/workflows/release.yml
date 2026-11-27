@@ -1,0 +1,77 @@
+# Phase 57: tagged releases (`git tag v1.0.0 && git push --tags`) build and publish
+# archives for Linux (x86_64 + aarch64, plus an x86_64 AppImage), Windows and macOS
+# (Apple Silicon + Intel) after the full test suite passed on each runner.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  FA_PATH: /nonexistent
+  FARUST_BUILD_ID: ${{ github.ref_name }}
+
+jobs:
+  build:
+    name: build (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, macos-latest, macos-13]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Tests (a release must pass them on its own platform)
+        run: cargo test --release --locked
+      - name: AppImage tool (Linux x86_64)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          curl -fsSL -o /usr/local/bin/appimagetool \
+            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x /usr/local/bin/appimagetool
+          sudo apt-get update && sudo apt-get install -y libfuse2
+      - name: Package (Linux / macOS)
+        if: runner.os != 'Windows'
+        run: bash packaging/package.sh
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cargo build --release --locked
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"').Matches[0].Groups[1].Value
+          $name = "farust-$version-windows-x86_64"
+          $stage = "dist/$name"
+          New-Item -ItemType Directory -Force -Path "$stage/docs", "$stage/missions", "$stage/examples" | Out-Null
+          Copy-Item target/release/farust.exe, README.md $stage
+          Copy-Item docs/PLAN.md, docs/RELEASE.md "$stage/docs"
+          Copy-Item missions/*.farust-mission "$stage/missions"
+          Copy-Item -Recurse examples/mods "$stage/examples"
+          if (Test-Path LICENSE) { Copy-Item LICENSE $stage }
+          Compress-Archive -Path $stage -DestinationPath "dist/$name.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: farust-${{ matrix.os }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.AppImage
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          draft: true
+          generate_release_notes: true

@@ -24,7 +24,7 @@ use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 use crate::camera::OrbitCamera;
-use crate::dds_decode::{RgbaImage, decode_dds_rgba8};
+use crate::dds_decode::{RgbaImage, SpecGlowMap, decode_dds_rgba8};
 use crate::hud::{self, HudAction, HudLayout};
 use crate::replay::Replay;
 use crate::scd;
@@ -37,7 +37,7 @@ use crate::skirmish::{
     UnitOrder,
 };
 use crate::skirmish_ai::ScriptedAi;
-use crate::viewer::{self, DEPTH_FORMAT, GpuMeshTemplate, GpuSceneResources, GpuUnitInstance, MSAA_SAMPLES};
+use crate::viewer::{self, GpuMeshTemplate, GpuSceneResources, GpuUnitInstance};
 
 // ---------------------------------------------------------------------------
 // Terrain sampling & mouse-ray picking
@@ -187,6 +187,7 @@ pub struct NormalizedMesh {
     pub uvs: Vec<[f32; 2]>,
     pub indices: Vec<u32>,
     pub albedo: Option<RgbaImage>,
+    pub spec_glow: Option<SpecGlowMap>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -257,15 +258,14 @@ impl UnitMeshCache {
                             && let Ok(scm) = ScmMesh::parse(bytes)
                             && let Some(mut norm) = normalize_scm(&scm, *target_span)
                         {
+                            let spec = files
+                                .get(&format!("units/{l}/{l}_specteam.dds"))
+                                .and_then(|b| crate::dds_decode::decode_dds_rgba8(b).ok());
+                            norm.spec_glow = spec.as_ref().map(SpecGlowMap::from_spec_team);
                             norm.albedo = files
                                 .get(&format!("units/{l}/{l}_albedo.dds"))
                                 .and_then(|b| crate::dds_decode::decode_dds_rgba8(b).ok())
-                                .map(|albedo| {
-                                    let spec = files
-                                        .get(&format!("units/{l}/{l}_specteam.dds"))
-                                        .and_then(|b| crate::dds_decode::decode_dds_rgba8(b).ok());
-                                    scene::pack_albedo_team_mask(albedo, spec.as_ref())
-                                });
+                                .map(|albedo| scene::pack_albedo_team_mask(albedo, spec.as_ref()));
                             loaded = Some(norm);
                             break;
                         }
@@ -296,9 +296,10 @@ impl UnitMeshCache {
             Role::Radar,
             Role::Engineer,
             Role::Mobile,
+            Role::Wall,
         ]
         .into_iter()
-        .map(|r| (r, procedural_role_mesh(r, if r == Role::Factory { 5.0 } else { 1.8 })))
+        .map(|r| (r, procedural_role_mesh(r, match r { Role::Factory => 5.0, Role::Wall => 1.0, _ => 1.8 })))
         .collect();
 
         Self { by_type, fallback, living }
@@ -309,6 +310,7 @@ impl UnitMeshCache {
             let target = match role {
                 Role::AirFactory | Role::NavalFactory => Role::Factory,
                 Role::Hydro | Role::MassStorage | Role::EnergyStorage => Role::Generator,
+                Role::AirStaging | Role::EngStation | Role::Orbital => Role::Factory,
                 Role::Shield | Role::AntiAir | Role::MissileSilo | Role::MissileDefense => Role::PointDefense,
                 Role::Experimental => Role::Mobile,
                 r => r,
@@ -355,6 +357,7 @@ fn normalize_scm(scm: &ScmMesh, target_span: f32) -> Option<NormalizedMesh> {
         uvs,
         indices,
         albedo: None,
+        spec_glow: None,
     })
 }
 
@@ -396,11 +399,14 @@ fn procedural_role_mesh(role: Role, span: f32) -> NormalizedMesh {
             append_local_box(&mut positions, &mut normals, &mut uvs, &mut indices, [0.0, 0.0, 0.0], [half * 0.75, span * 0.32, half * 0.85]);
             append_local_box(&mut positions, &mut normals, &mut uvs, &mut indices, [0.0, span * 0.32, half * 0.3], [half * 0.35, span * 0.35, half * 0.35]);
         }
+        Role::Wall => {
+            append_local_box(&mut positions, &mut normals, &mut uvs, &mut indices, [0.0, 0.0, 0.0], [half, span * 0.9, half]);
+        }
         Role::Mobile | Role::Experimental => {
             append_local_box(&mut positions, &mut normals, &mut uvs, &mut indices, [0.0, 0.0, 0.0], [half * 0.75, span * 0.35, half]);
             append_local_box(&mut positions, &mut normals, &mut uvs, &mut indices, [0.0, span * 0.35, half * 0.1], [half * 0.4, span * 0.25, half * 0.65]);
         }
-        Role::AirFactory | Role::NavalFactory | Role::Hydro | Role::MassStorage | Role::EnergyStorage | Role::Shield | Role::AntiAir | Role::MissileSilo | Role::MissileDefense => {
+        Role::AirFactory | Role::NavalFactory | Role::Hydro | Role::MassStorage | Role::EnergyStorage | Role::Shield | Role::AntiAir | Role::MissileSilo | Role::MissileDefense | Role::AirStaging | Role::EngStation | Role::Orbital => {
             append_local_box(&mut positions, &mut normals, &mut uvs, &mut indices, [0.0, 0.0, 0.0], [half * 0.75, span * 0.55, half * 0.75]);
             append_local_box(&mut positions, &mut normals, &mut uvs, &mut indices, [0.0, span * 0.55, 0.0], [half * 0.45, span * 0.35, half * 0.45]);
         }
@@ -411,6 +417,7 @@ fn procedural_role_mesh(role: Role, span: f32) -> NormalizedMesh {
         uvs,
         indices,
         albedo: None,
+        spec_glow: None,
     }
 }
 
@@ -493,6 +500,8 @@ pub struct PlaySession {
     pub end_shown: bool,
     /// Write the automatic replay on exit / game end (`--no-record` disables).
     pub auto_record: bool,
+    /// Phase 41: render-only dynamic decal tracker (observed while preparing frames).
+    pub decals: std::cell::RefCell<crate::decals::DecalTracker>,
 }
 
 impl PlaySession {
@@ -543,6 +552,7 @@ impl PlaySession {
             menu: Default::default(),
             end_shown: false,
             auto_record: !crate::savegame::recording_disabled(),
+            decals: Default::default(),
         }
     }
 
@@ -576,6 +586,7 @@ impl PlaySession {
             menu: Default::default(),
             end_shown: false,
             auto_record: false,
+            decals: Default::default(),
         }
     }
 
@@ -800,6 +811,9 @@ impl PlaySession {
         if self.handle_left_click_order(world_xz, queue, pick_radius) {
             return true;
         }
+        if self.place_template(world_xz, queue) {
+            return true;
+        }
         if let Some(ref btype) = self.build_mode.clone() {
             let Some(builder_id) = self.builder_for(btype) else {
                 self.build_mode = None;
@@ -944,6 +958,9 @@ impl PlaySession {
         }
 
         if self.handle_right_click_board(world_xz, queue, pick_radius) {
+            return;
+        }
+        if self.handle_right_click_dock(world_xz, queue, pick_radius) {
             return;
         }
 
@@ -1220,7 +1237,22 @@ impl PlaySession {
 // Colors, Instanced Unit Batches & Dynamic Overlays (Tracers, Projectiles, Icons)
 // ---------------------------------------------------------------------------
 
+/// Phase 39: Okabe–Ito colour-blind safe palette, one colour per army slot.
+pub(crate) const COLORBLIND_ARMY_RGB: [[f32; 3]; 8] = [
+    [0.00, 0.45, 0.70],
+    [0.90, 0.62, 0.00],
+    [0.00, 0.62, 0.45],
+    [0.80, 0.47, 0.65],
+    [0.34, 0.71, 0.91],
+    [0.95, 0.90, 0.25],
+    [0.84, 0.37, 0.00],
+    [0.60, 0.60, 0.60],
+];
+
 pub(crate) fn army_rgb(world: &Skirmish, army: ArmyId) -> [f32; 3] {
+    if crate::settings::colorblind() {
+        return COLORBLIND_ARMY_RGB[(army & 7) as usize];
+    }
     let faction_key = world
         .army(army)
         .and_then(|a| world.catalog().factions.get(a.faction))
@@ -1277,6 +1309,15 @@ fn unit_yaw(world: &Skirmish, u: &crate::skirmish::Unit) -> f32 {
             .unwrap_or(0.0),
         Some(UnitOrder::Unload { x, y }) => ((x - u.pos.x) as f32).atan2((y - u.pos.y) as f32),
         Some(UnitOrder::Board(_) | UnitOrder::Enhance(_)) => 0.0,
+        Some(UnitOrder::AttackGround { x, y }) => ((x - u.pos.x) as f32).atan2((y - u.pos.y) as f32),
+        Some(UnitOrder::Ferry { from, to }) => {
+            let g = if u.cargo.is_empty() { *from } else { *to };
+            ((g.0 - u.pos.x) as f32).atan2((g.1 - u.pos.y) as f32)
+        }
+        Some(UnitOrder::Guard(tid)) | Some(UnitOrder::Dock(tid)) => world
+            .unit(*tid)
+            .map(|t| ((t.pos.x - u.pos.x) as f32).atan2((t.pos.y - u.pos.y) as f32))
+            .unwrap_or(0.0),
         Some(UnitOrder::Upgrade(_)) | None => 0.0,
     }
 }
@@ -1557,7 +1598,7 @@ pub(crate) fn build_skirmish_render_frame(
                 prog,
                 [0.20, 0.85, 1.0, 0.15],
             );
-            if u.role.is_builder() {
+            if u.role.is_builder() && !meshes.living.has_effect_library() {
                 let bx = job.x as f32 / scale;
                 let bz = job.y as f32 / scale;
                 let by = sample_terrain_y(scmap, bx, bz) + 1.2;
@@ -1574,6 +1615,7 @@ pub(crate) fn build_skirmish_render_frame(
 
         if let Some((tid, shot_tick)) = u.last_shot
             && world.tick().saturating_sub(shot_tick) <= 2
+            && !meshes.living.has_weapon_beam(&u.type_id)
             && let Some(t) = world.unit(tid)
         {
             let tx = t.pos.x as f32 / scale;
@@ -1608,6 +1650,16 @@ pub(crate) fn build_skirmish_render_frame(
                     UnitOrder::Upgrade(_) => continue,
                     UnitOrder::Unload { x, y } => ((*x, *y), [0.85, 0.80, 0.30, 0.2]),
                     UnitOrder::Board(_) | UnitOrder::Enhance(_) => continue,
+                    UnitOrder::AttackGround { x, y } => ((*x, *y), [1.0, 0.45, 0.10, 0.2]),
+                    UnitOrder::Ferry { from, to } => (if u.cargo.is_empty() { *from } else { *to }, [0.85, 0.80, 0.30, 0.2]),
+                    UnitOrder::Guard(tid) => match world.unit(*tid) {
+                        Some(t) => ((t.pos.x, t.pos.y), [0.45, 1.0, 0.55, 0.2]),
+                        None => continue,
+                    },
+                    UnitOrder::Dock(tid) => match world.unit(*tid) {
+                        Some(t) => ((t.pos.x, t.pos.y), [0.40, 0.85, 1.0, 0.2]),
+                        None => continue,
+                    },
                     UnitOrder::Attack(tid) | UnitOrder::Overcharge(tid) => {
                         if let Some(t) = world.unit(*tid) {
                             ((t.pos.x, t.pos.y), [1.0, 0.22, 0.22, 0.2])
@@ -2016,6 +2068,7 @@ pub(crate) fn build_terrain_loaded_scene(
         overlay_vertices,
         overlay_indices,
         albedo,
+        spec_glow: None,
         initial_camera: camera,
         clear_color: [
             f64::from(fc[0].clamp(0.05, 1.0)),
@@ -2059,6 +2112,7 @@ pub(crate) fn upload_unit_templates(
             &verts,
             &nm.indices,
             nm.albedo.as_ref(),
+            nm.spec_glow.as_ref(),
             id,
         );
         templates.insert(id.clone(), tpl);
@@ -2079,6 +2133,19 @@ pub(crate) fn upload_frame_resources(
     height: u32,
 ) {
     let _p = crate::profiler::scope("render.prep_upload");
+    // Phase 41: dynamic terrain marks (rebuilt only when the tracker's revision moves).
+    {
+        let _p = crate::profiler::scope("render.decals");
+        let mut t = session.decals.borrow_mut();
+        t.observe(&session.world);
+        if t.revision != resources.dyn_decal_rev {
+            for k in 0..crate::decals::KINDS {
+                let (v, i) = t.geometry(k, &map.scmap);
+                resources.set_dynamic_decals(device, k, &v, &i);
+            }
+            resources.dyn_decal_rev = t.revision;
+        }
+    }
     let (batches, dyn_v, dyn_i) = build_skirmish_render_frame(session, &map.scmap, meshes, camera);
     {
         let _p = crate::profiler::scope("render.upload_units");
@@ -2096,10 +2163,10 @@ pub(crate) fn upload_frame_resources(
     }
 
     let _p = crate::profiler::scope("render.hud");
-    let (mm_v, mm_i, mut bg_v, mut bg_i, ic_v, ic_i, mut fg_v, mut fg_i) =
-        hud::build_hud_geometry(session, map, camera, width, height);
-    crate::profiler::append_overlay(&mut bg_v, &mut bg_i, &mut fg_v, &mut fg_i, width as f32, height as f32);
-    resources.set_hud(device, &mm_v, &mm_i, &bg_v, &bg_i, &ic_v, &ic_i, &fg_v, &fg_i);
+    let mut g = hud::build_hud_geometry_ex(session, map, camera, width, height, crate::settings::ui_theme());
+    crate::profiler::append_overlay(&mut g.bg_v, &mut g.bg_i, &mut g.fg_v, &mut g.fg_i, width as f32, height as f32);
+    resources.set_hud(device, &g.mm_v, &g.mm_i, &g.bg_v, &g.bg_i, &g.ic_v, &g.ic_i, &g.fg_v, &g.fg_i);
+    resources.set_hud_ttf(device, &g.ttf_v, &g.ttf_i);
 }
 
 pub(crate) fn upload_hud_icons(
@@ -2109,11 +2176,20 @@ pub(crate) fn upload_hud_icons(
     resources: &mut GpuSceneResources,
     session: &PlaySession,
 ) {
-    // Phase 23: grid atlas of every catalog unit icon (command card, queue panel).
+    // Phase 23/37: grid atlas of every catalog unit icon, TrueType HUD font atlas, and FA localization tables.
     let Some(dir) = game_dir else {
         crate::command_card::set_atlas_ids(None);
+        hud::set_hud_fonts(None);
         return;
     };
+    crate::loc::init(dir);
+    let hud_fonts = std::sync::Arc::new(crate::ui_kit::Fonts::load(dir));
+    if hud_fonts.has_faces() {
+        resources.set_hud_font_texture(device, queue, &hud_fonts.atlas);
+        hud::set_hud_fonts(Some(hud_fonts));
+    } else {
+        hud::set_hud_fonts(None);
+    }
     let ids = crate::command_card::atlas_icon_ids(session.world.catalog());
     match crate::command_card::load_icon_atlas(dir, &ids) {
         Some((atlas, found_ids)) => {
@@ -2150,6 +2226,9 @@ pub fn render_skirmish_snapshot(
     // `=factory` (with a queue) or `=enhance` (ACU mid-enhancement) select one unit class for
     // the command card / queue / enhancement panels; `FARUST_SNAPSHOT_HOVER=card` hovers the
     // first card entry (tooltip), `FARUST_SNAPSHOT_TAB=N` picks the card tech tab.
+    if let Some(dir) = game_dir {
+        crate::loc::init(dir);
+    }
     let preselected;
     let session = if let Ok(sel) = std::env::var("FARUST_SNAPSHOT_SELECT") {
         let mut s = session.clone();
@@ -2159,9 +2238,22 @@ pub fn render_skirmish_snapshot(
         if let Some(t) = std::env::var("FARUST_SNAPSHOT_TAB").ok().and_then(|v| v.trim().parse::<u8>().ok()) {
             s.set_card_tab(t);
         }
-        if std::env::var("FARUST_SNAPSHOT_HOVER").is_ok_and(|v| v.trim() == "card") {
+        if let Ok(hov) = std::env::var("FARUST_SNAPSHOT_HOVER") {
             let layout = HudLayout::compute(&s, width, height);
-            if let Some(r) = layout.card.slots.first() {
+            let hspec = hov.trim().to_ascii_lowercase();
+            let (kind, idx) = match hspec.split_once(':') {
+                Some((k, n)) => (k, n.parse::<usize>().unwrap_or(0)),
+                None => (hspec.as_str(), 0),
+            };
+            let target_rect = match kind {
+                "card" => layout.card.slots.get(idx).copied(),
+                "order" => layout.buttons.get(idx).map(|b| [b.x, b.y, b.w, b.h]),
+                "enhance" => layout.enh.as_ref().and_then(|e| e.rows.get(idx).map(|(r, _, _)| *r)),
+                "group" => layout.card.groups.get(idx).map(|(r, _)| *r),
+                "tab" => layout.card.tabs.get(idx).map(|(r, _)| *r),
+                _ => None,
+            };
+            if let Some(r) = target_rect {
                 s.ui.cursor_px = Some((r[0] + r[2] * 0.5, r[1] + r[3] * 0.5));
                 s.ui.hud_hover = layout.hit_test_button(r[0] + r[2] * 0.5, r[1] + r[3] * 0.5);
             }
@@ -2201,10 +2293,13 @@ pub fn render_skirmish_snapshot(
     .map_err(|e| format!("failed to create GPU device: {e}"))?;
 
     let format = wgpu::TextureFormat::Rgba8UnormSrgb;
-    let mut resources = GpuSceneResources::new(&device, &queue, &scene, format, MSAA_SAMPLES, &camera);
+    let msaa4_ok = viewer::hdr_msaa4_supported(&adapter);
+    let mut resources =
+        GpuSceneResources::new(&device, &queue, &scene, format, width, height, msaa4_ok, &camera);
     if let Some(ref mm) = minimap_img {
         resources.set_minimap_texture(&device, &queue, mm);
     }
+    resources.set_dynamic_decal_textures(&device, &queue, &scene::load_dynamic_decal_textures(game_dir));
     upload_hud_icons(game_dir, &device, &queue, &mut resources, session);
     let templates = upload_unit_templates(&device, &queue, &resources, meshes);
     upload_frame_resources(
@@ -2219,15 +2314,6 @@ pub fn render_skirmish_snapshot(
         height,
     );
 
-    let (_msaa_tex, msaa_view) = viewer::create_attachment(
-        &device,
-        width,
-        height,
-        format,
-        MSAA_SAMPLES,
-        wgpu::TextureUsages::RENDER_ATTACHMENT,
-        "play_snap_msaa",
-    );
     let (resolve_tex, resolve_view) = viewer::create_attachment(
         &device,
         width,
@@ -2236,15 +2322,6 @@ pub fn render_skirmish_snapshot(
         1,
         wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
         "play_snap_resolve",
-    );
-    let (_depth_tex, depth_view) = viewer::create_attachment(
-        &device,
-        width,
-        height,
-        DEPTH_FORMAT,
-        MSAA_SAMPLES,
-        wgpu::TextureUsages::RENDER_ATTACHMENT,
-        "play_snap_depth",
     );
 
     let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
@@ -2260,13 +2337,7 @@ pub fn render_skirmish_snapshot(
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("play_snap_encoder"),
     });
-    resources.encode_draw(
-        &mut encoder,
-        &msaa_view,
-        Some(&resolve_view),
-        &depth_view,
-        scene.clear_color,
-    );
+    resources.encode_draw(&mut encoder, &resolve_view, scene.clear_color);
     encoder.copy_texture_to_buffer(
         wgpu::TexelCopyTextureInfo {
             texture: &resolve_tex,
@@ -2359,8 +2430,6 @@ struct PlayGpuState {
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
-    msaa_view: wgpu::TextureView,
-    depth_view: wgpu::TextureView,
     resources: GpuSceneResources,
     templates: BTreeMap<String, GpuMeshTemplate>,
     camera: OrbitCamera,
@@ -2379,6 +2448,24 @@ struct PlayGpuState {
     /// Phase 23: window focus (edge scrolling) and the OS cursor currently shown.
     focused: bool,
     cursor_icon: winit::window::CursorIcon,
+    /// Phase 34: every map prop batch as loaded, and how many reclaimed props the uploaded
+    /// batches already hide (re-filtered at most once a second).
+    prop_cpu: Vec<crate::scene::PropMeshBatch>,
+    props_hidden: usize,
+    props_filtered_at: Instant,
+}
+
+/// Phase 34: `batches` without the props whose `.scmap` (x, z) position bits are in `gone`.
+fn filter_reclaimed_props(batches: &[crate::scene::PropMeshBatch], gone: &[(u32, u32)]) -> Vec<crate::scene::PropMeshBatch> {
+    let gone: std::collections::BTreeSet<(u32, u32)> = gone.iter().copied().collect();
+    batches
+        .iter()
+        .map(|b| {
+            let mut b = b.clone();
+            b.instances.retain(|i| !gone.contains(&(i.row0[3].to_bits(), i.row2[3].to_bits())));
+            b
+        })
+        .collect()
 }
 
 /// How the player asked to leave a running match (pause menu / end-of-game screen).
@@ -2507,13 +2594,24 @@ impl PlayApp {
         let (terrain_scene, minimap_img) =
             build_terrain_loaded_scene(self.game_dir.as_deref(), &self.map, camera.clone());
         let clear_color = terrain_scene.clear_color;
+        let prop_cpu = terrain_scene.prop_batches.clone();
 
-        let mut resources =
-            GpuSceneResources::new(&device, &queue, &terrain_scene, format, MSAA_SAMPLES, &camera);
+        let msaa4_ok = viewer::hdr_msaa4_supported(&adapter);
+        let mut resources = GpuSceneResources::new(
+            &device,
+            &queue,
+            &terrain_scene,
+            format,
+            width,
+            height,
+            msaa4_ok,
+            &camera,
+        );
         resources.enable_gpu_timer(&device, &queue);
         if let Some(ref mm) = minimap_img {
             resources.set_minimap_texture(&device, &queue, mm);
         }
+        resources.set_dynamic_decal_textures(&device, &queue, &scene::load_dynamic_decal_textures(self.game_dir.as_deref()));
         upload_hud_icons(
             self.game_dir.as_deref(),
             &device,
@@ -2534,33 +2632,12 @@ impl PlayApp {
             height,
         );
 
-        let (_msaa_tex, msaa_view) = viewer::create_attachment(
-            &device,
-            width,
-            height,
-            format,
-            MSAA_SAMPLES,
-            wgpu::TextureUsages::RENDER_ATTACHMENT,
-            "play_win_msaa",
-        );
-        let (_depth_tex, depth_view) = viewer::create_attachment(
-            &device,
-            width,
-            height,
-            DEPTH_FORMAT,
-            MSAA_SAMPLES,
-            wgpu::TextureUsages::RENDER_ATTACHMENT,
-            "play_win_depth",
-        );
-
         Ok(PlayGpuState {
             window,
             surface,
             device,
             queue,
             config,
-            msaa_view,
-            depth_view,
             resources,
             templates,
             camera,
@@ -2578,6 +2655,9 @@ impl PlayApp {
             dirty_dynamic: false,
             focused: true,
             cursor_icon: winit::window::CursorIcon::Default,
+            prop_cpu,
+            props_hidden: 0,
+            props_filtered_at: Instant::now(),
         })
     }
 
@@ -2747,7 +2827,12 @@ impl ApplicationHandler for PlayApp {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         if let Some(st) = self.state.as_ref() {
             let _p = crate::profiler::scope("audio.frame");
-            crate::audio_play::frame(&mut self.session, self.game_dir.as_deref(), &st.camera);
+            crate::audio_play::frame(
+                &mut self.session,
+                Some(&self.map.scmap),
+                self.game_dir.as_deref(),
+                &st.camera,
+            );
         }
         let Some(st) = self.state.as_mut() else {
             return;
@@ -2769,6 +2854,20 @@ impl ApplicationHandler for PlayApp {
 
         if self.session.seeking() {
             self.session.pump_replay_seek(Duration::from_millis(24));
+            if !self.session.seeking()
+                && let Some((mx, mz)) = self
+                    .session
+                    .ui
+                    .replay
+                    .as_mut()
+                    .and_then(|r| r.camera_jump.take())
+            {
+                let wx = mx as f32 / SCALE as f32;
+                let wz = mz as f32 / SCALE as f32;
+                let wy = sample_terrain_y(&self.map.scmap, wx, wz);
+                st.camera.target = [wx, wy, wz];
+                st.resources.update_camera(&st.queue, &st.camera);
+            }
             st.accum_secs = 0.0;
             st.dirty_dynamic = true;
             st.window
@@ -2776,6 +2875,20 @@ impl ApplicationHandler for PlayApp {
             st.window.request_redraw();
             event_loop.set_control_flow(ControlFlow::Poll);
             return;
+        }
+        if let Some((mx, mz)) = self
+            .session
+            .ui
+            .replay
+            .as_mut()
+            .and_then(|r| r.camera_jump.take())
+        {
+            let wx = mx as f32 / SCALE as f32;
+            let wz = mz as f32 / SCALE as f32;
+            let wy = sample_terrain_y(&self.map.scmap, wx, wz);
+            st.camera.target = [wx, wy, wz];
+            st.resources.update_camera(&st.queue, &st.camera);
+            st.dirty_dynamic = true;
         }
 
         if self.session.sim_active() {
@@ -2894,30 +3007,12 @@ impl ApplicationHandler for PlayApp {
                     st.config.width = new_size.width;
                     st.config.height = new_size.height;
                     st.surface.configure(&st.device, &st.config);
-                    let (_, msaa_view) = viewer::create_attachment(
-                        &st.device,
-                        new_size.width,
-                        new_size.height,
-                        st.config.format,
-                        MSAA_SAMPLES,
-                        wgpu::TextureUsages::RENDER_ATTACHMENT,
-                        "play_win_msaa",
-                    );
-                    let (_, depth_view) = viewer::create_attachment(
-                        &st.device,
-                        new_size.width,
-                        new_size.height,
-                        DEPTH_FORMAT,
-                        MSAA_SAMPLES,
-                        wgpu::TextureUsages::RENDER_ATTACHMENT,
-                        "play_win_depth",
-                    );
-                    st.msaa_view = msaa_view;
-                    st.depth_view = depth_view;
+                    st.resources.resize(&st.device, new_size.width, new_size.height);
                     st.camera.set_aspect(new_size.width, new_size.height);
-                    // Window re-config: apply the active shadow quality live.
+                    // Window re-config: apply active shadow & HDR post settings live.
                     st.resources
                         .set_shadow_quality(&st.device, crate::settings::shadow_quality());
+                    st.resources.sync_render_settings(&st.device, &st.queue);
                     st.resources.update_camera(&st.queue, &st.camera);
                     st.dirty_dynamic = true;
                     st.window.request_redraw();
@@ -3061,6 +3156,12 @@ impl ApplicationHandler for PlayApp {
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
+                // Phase 39: optional left/right swap.
+                let button = match button {
+                    MouseButton::Left if crate::settings::mouse_swap() => MouseButton::Right,
+                    MouseButton::Right if crate::settings::mouse_swap() => MouseButton::Left,
+                    b => b,
+                };
                 let pressed = state == ElementState::Pressed;
                 let cur = st.cursor_px.unwrap_or((
                     st.config.width as f64 * 0.5,
@@ -3109,6 +3210,15 @@ impl ApplicationHandler for PlayApp {
                         };
                         self.session.chat.send_ping(kind, x, z);
                         self.session.flush_local_chat();
+                        // Phase 53: also a sim command, so allied AIs can react.
+                        if !self.session.is_replay() {
+                            let code = match kind {
+                                crate::chat::PingKind::Alert => 0,
+                                crate::chat::PingKind::Move => 1,
+                                crate::chat::PingKind::Attack => 2,
+                            };
+                            self.session.world.issue(self.session.human_army, Command::Ping { kind: code, x, y: z });
+                        }
                         self.session.status_banner = format!("{} ping sent to allies", kind.label());
                         st.dirty_dynamic = true;
                         st.window.request_redraw();
@@ -3151,6 +3261,15 @@ impl ApplicationHandler for PlayApp {
                                     self.session.speed = (self.session.speed * 2).clamp(1, max_speed)
                                 }
                                 hud::TimelineHit::Perspective => self.session.cycle_replay_perspective(),
+                                hud::TimelineHit::PrevBookmark => {
+                                    self.session.jump_adjacent_bookmark(false);
+                                }
+                                hud::TimelineHit::NextBookmark => {
+                                    self.session.jump_adjacent_bookmark(true);
+                                }
+                                hud::TimelineHit::Bookmark(idx) => {
+                                    self.session.jump_to_bookmark(idx);
+                                }
                             }
                             st.dirty_dynamic = true;
                             st.window.request_redraw();
@@ -3240,7 +3359,8 @@ impl ApplicationHandler for PlayApp {
                                     down.1 as f32,
                                     st.config.width,
                                     st.config.height,
-                                ) {
+                                ) && !self.session.finish_waypoint_drag(world_f32_to_milli(start_hit), world_xz, pick_r)
+                                {
                                     self.session.select_box(
                                         world_f32_to_milli(start_hit),
                                         world_xz,
@@ -3394,7 +3514,10 @@ impl ApplicationHandler for PlayApp {
                 use crate::keymap::Action as KA;
                 match action {
                     KA::CancelOrMenu => {
-                        if self.session.build_mode.is_some() || self.session.current_order_mode().is_some() {
+                        if self.session.build_mode.is_some()
+                            || self.session.current_order_mode().is_some()
+                            || self.session.ui.template_mode.is_some()
+                        {
                             self.session.build_mode = None;
                             self.session.clear_order_mode();
                             self.session.ui.build_drag = None;
@@ -3671,6 +3794,29 @@ impl ApplicationHandler for PlayApp {
                         self.session.cycle_card_tab();
                         ui_changed = true;
                     }
+                    KA::HotbuildFactory | KA::HotbuildDefense | KA::HotbuildEconomy | KA::HotbuildIntel => {
+                        use crate::roster::BuildGroup as G;
+                        let g = match action {
+                            KA::HotbuildFactory => G::Factory,
+                            KA::HotbuildDefense => G::Defense,
+                            KA::HotbuildEconomy => G::Economy,
+                            _ => G::Intel,
+                        };
+                        if !self.session.is_replay() {
+                            self.session.hotbuild(g);
+                        }
+                        ui_changed = true;
+                    }
+                    KA::TemplateSave => {
+                        self.session.save_template_from_selection();
+                        ui_changed = true;
+                    }
+                    KA::TemplateCycle => {
+                        if !self.session.is_replay() {
+                            self.session.cycle_template();
+                        }
+                        ui_changed = true;
+                    }
                     KA::CardSlot(i) => {
                         self.session.trigger_card_item(i as usize, shift, false);
                         ui_changed = true;
@@ -3713,6 +3859,46 @@ impl ApplicationHandler for PlayApp {
                 }
                 st.device.poll(wgpu::Maintain::Poll);
                 st.resources.poll_gpu_timer();
+                // Phase 48: mission messages / objective changes → banner, camera requests.
+                if let Some(rt) = self.session.world.mission() {
+                    let mut banner = None;
+                    if rt.log.len() > self.session.ui.mission_said {
+                        banner = rt.log.last().map(|(_, t)| t.clone());
+                    }
+                    let states: Vec<crate::mission::ObjectiveState> =
+                        rt.mission.objectives.iter().map(|o| rt.objectives[&o.id]).collect();
+                    for (i, o) in rt.mission.objectives.iter().enumerate() {
+                        if self.session.ui.mission_objectives.get(i).is_some_and(|s| *s != states[i]) {
+                            banner = Some(format!("Objective {:?}: {}", states[i], o.text));
+                        }
+                    }
+                    let cam = rt.camera;
+                    self.session.ui.mission_said = rt.log.len();
+                    self.session.ui.mission_objectives = states;
+                    if let Some(b) = banner {
+                        self.session.status_banner = b;
+                    }
+                    if let Some((t, at, zoom)) = cam
+                        && self.session.ui.mission_camera != Some(t)
+                    {
+                        self.session.ui.mission_camera = Some(t);
+                        let (wx, wz) = (at.0 as f32 / 1000.0, at.1 as f32 / 1000.0);
+                        st.camera.target = [wx, sample_terrain_y(&self.map.scmap, wx, wz), wz];
+                        if let Some(z) = zoom {
+                            st.camera.distance = z as f32;
+                        }
+                        st.resources.update_camera(&st.queue, &st.camera);
+                        st.dirty_dynamic = true;
+                    }
+                }
+                // Phase 34: hide reclaimed trees / rocks (also restores them after a seek back).
+                let gone = self.session.world.props_gone();
+                if gone.len() != st.props_hidden && st.props_filtered_at.elapsed().as_secs_f32() >= 1.0 {
+                    let batches = filter_reclaimed_props(&st.prop_cpu, gone);
+                    st.resources.update_prop_batches(&st.device, &st.queue, &batches);
+                    st.props_hidden = gone.len();
+                    st.props_filtered_at = Instant::now();
+                }
                 if crate::profiler::overlay_visible() {
                     st.dirty_dynamic = true;
                 }
@@ -3748,13 +3934,7 @@ impl ApplicationHandler for PlayApp {
                         });
                 {
                     let _p = crate::profiler::scope("render.encode_submit");
-                    st.resources.encode_draw(
-                        &mut encoder,
-                        &st.msaa_view,
-                        Some(&resolve_view),
-                        &st.depth_view,
-                        st.clear_color,
-                    );
+                    st.resources.encode_draw(&mut encoder, &resolve_view, st.clear_color);
                     st.queue.submit(Some(encoder.finish()));
                     st.resources.gpu_timer_after_submit();
                 }
@@ -3774,6 +3954,26 @@ impl ApplicationHandler for PlayApp {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn reclaimed_props_are_filtered_out_of_their_batches() {
+        let inst = |x: f32, z: f32| crate::viewer::GpuUnitInstance::from_basis([x, 0.0, z], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [1.0; 3], [1.0; 4], [0.0; 4]);
+        let batch = crate::scene::PropMeshBatch {
+            label: "t".into(),
+            vertices: vec![],
+            indices: vec![],
+            albedo: None,
+            alpha_cutout: false,
+            instances: vec![inst(10.5, 20.25), inst(30.0, 40.0)],
+            bounds_min: [0.0; 3],
+            bounds_max: [1.0; 3],
+        };
+        let out = super::filter_reclaimed_props(&[batch.clone()], &[(10.5f32.to_bits(), 20.25f32.to_bits())]);
+        assert_eq!(out[0].instances.len(), 1);
+        assert_eq!(out[0].instances[0].row0[3], 30.0);
+        assert_eq!(super::filter_reclaimed_props(&[batch], &[])[0].instances.len(), 2);
+    }
+
     use super::*;
     use crate::scmap::{ScMap, WaterInfo};
     use crate::skirmish::tests::test_world;
@@ -3800,6 +4000,8 @@ mod tests {
                 elevation_deep: 8.0,
                 elevation_abyss: 2.0,
             },
+            unknown1: 0, unknown2: 0, unknown3: 0, unknown4: 0, post_heightmap_byte: 0,
+            shader_raw: Vec::new(), background_raw: Vec::new(), sky_raw: Vec::new(), cubemaps_raw: Vec::new(), tail_bytes: Vec::new(),
             terrain_textures: None,
         }
     }

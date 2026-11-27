@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=FARust
+Comment=Deterministic RTS engine for Supreme Commander: Forged Alliance game data
+Exec=farust
+Icon=org.farust.Farust
+Terminal=false
+Categories=Game;StrategyGame;
+Keywords=RTS;Forged Alliance;Supreme Commander;

@@ -1,0 +1,23 @@
+# FARust tutorial (Phase 39): the basics of a UEF opening, one objective at a time.
+# Started from the main menu (TUTORIAL) or: farust play --mission missions/tutorial.farust-mission
+mission "Tutorial: First Steps"
+map SCMP_009
+victory sandbox
+army 0 faction uef human
+army 1 faction cybran ai none
+
+objective move primary "Select your Commander (left-click) and move it (right-click)"
+objective mex primary "Build a Mass Extractor on a mass point (M)"
+objective power primary "Build a Power Generator (P)"
+objective factory primary "Build a Land Factory (B)"
+objective army primary "Produce three Striker tanks from the factory (Y)"
+objective defend primary "Destroy the Cybran scouts"
+
+when at 0:00 do say "Welcome, Commander. Left-click your Commander to select it, then right-click the ground to move."; camera 672,346 zoom 70
+when count 0 UEL0001 in 672,346 r12 < 1 do objective move complete; say "Good. Now press M and click a mass point to build a Mass Extractor."
+when objective move complete and count 0 UEB1103 in 672,346 r500 >= 1 do objective mex complete; say "Mass flows in. Press P and place a Power Generator."
+when objective mex complete and count 0 UEB1101 in 672,346 r500 >= 1 do objective power complete; say "Energy online. Press B to build a Land Factory."
+when objective power complete and count 0 UEB0101 in 672,346 r500 >= 1 do objective factory complete; say "Select the factory and press Y three times to queue Striker tanks."
+when objective factory complete and count 0 UEL0201 in 672,346 r500 >= 3 do objective army complete; say "Cybran scouts detected! Destroy them with your tanks."; spawn 1 URL0106 x3 at 760,420 attack 672,346
+when objective army complete and count 1 URL0106 in 672,346 r600 == 0 do objective defend complete; say "Tutorial complete. You are ready for skirmish!"; win 0
+when dead commander 0 do say "Your Commander was destroyed. Try again!"; lose 0

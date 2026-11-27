@@ -33,6 +33,8 @@ pub struct BpInfo {
     pub upgrades_to: Option<String>,
     pub domain: NavDomain,
     pub name: String,
+    /// Phase 33: `Display.Abilities` keys (`ability_*`, from `<LOC ability_x>` strings).
+    pub abilities: Vec<String>,
 }
 
 impl BpInfo {
@@ -81,7 +83,16 @@ impl BpInfo {
                 _ => d.to_string(),
             })
             .unwrap_or_else(|| id.clone());
-        Self { id, cats, buildable, enh_adds, upgrades_to, domain, name }
+        let abilities = root
+            .get("Display")
+            .and_then(|d| d.get("Abilities"))
+            .map(Value::string_list)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|a| a.strip_prefix("<LOC ").and_then(|r| r.split('>').next()))
+            .map(str::to_string)
+            .collect();
+        Self { id, cats, buildable, enh_adds, upgrades_to, domain, name, abilities }
     }
 
     pub fn has(&self, c: &str) -> bool {
@@ -129,11 +140,14 @@ pub fn infer_role(b: &BpInfo) -> Result<Role, &'static str> {
     if (h("COMMAND") || h("COMMANDER")) && !h("SUBCOMMANDER") {
         return Ok(Role::Commander);
     }
-    if h("SATELLITE") || h("ORBITALSYSTEM") {
-        return Err("orbital satellite");
+    if h("ORBITALSYSTEM") && h("STRUCTURE") {
+        return Ok(Role::Orbital);
     }
-    if h("POD") || (h("ENGINEERSTATION") || (h("PODSTAGINGPLATFORM") && h("STRUCTURE"))) {
-        return Err("engineering drones / pod staging");
+    if h("SATELLITE") {
+        return Err("orbital satellite (launched by its orbital centre)");
+    }
+    if h("ENGINEERSTATION") || (h("PODSTAGINGPLATFORM") && h("STRUCTURE")) {
+        return Ok(Role::EngStation);
     }
     if h("MOBILESONAR") {
         return Ok(Role::Radar);
@@ -151,10 +165,10 @@ pub fn infer_role(b: &BpInfo) -> Result<Role, &'static str> {
         return Err("neither mobile nor structure");
     }
     if h("WALL") {
-        return Err("walls (pathing blockers)");
+        return Ok(Role::Wall);
     }
     if h("AIRSTAGINGPLATFORM") {
-        return Err("air staging / refuelling");
+        return Ok(Role::AirStaging);
     }
     if h("FACTORY") {
         if h("GATE") {
@@ -249,9 +263,11 @@ impl BuildGroup {
             return BuildGroup::Experimental;
         }
         match role {
-            Role::Factory | Role::AirFactory | Role::NavalFactory => BuildGroup::Factory,
+            Role::Factory | Role::AirFactory | Role::NavalFactory | Role::AirStaging => BuildGroup::Factory,
+            Role::EngStation => BuildGroup::Engineer,
+            Role::Orbital => BuildGroup::Experimental,
             Role::Extractor | Role::Generator | Role::Hydro | Role::MassStorage | Role::EnergyStorage => BuildGroup::Economy,
-            Role::PointDefense | Role::AntiAir | Role::Shield | Role::MissileDefense => BuildGroup::Defense,
+            Role::PointDefense | Role::AntiAir | Role::Shield | Role::MissileDefense | Role::Wall => BuildGroup::Defense,
             Role::Radar => BuildGroup::Intel,
             Role::MissileSilo => BuildGroup::Strategic,
             Role::Experimental => BuildGroup::Experimental,
@@ -345,7 +361,12 @@ fn sim_options(
     let faction = builder.faction();
     let exprs: Vec<&String> = builder.buildable.iter().chain(builder.enh_adds.iter()).collect();
     let lists = |c: &BpInfo| exprs.iter().any(|e| expr_matches(e, &c.cats));
-    if role.is_builder() {
+    // Phase 32: mobile non-engineers build (`CONSTRUCTION`, e.g. the Megalith laying eggs)
+    // or produce (`FACTORY`: Fatboy, carriers, CZAR, Tempest) like their structure cousins.
+    let mobile = builder.is_mobile_kind();
+    let mobile_builder = mobile && !role.is_builder() && builder.has("CONSTRUCTION") && !builder.has("FACTORY");
+    let mobile_factory = mobile && !role.is_builder() && builder.has("FACTORY");
+    if role.is_builder() || mobile_builder {
         for (id, c) in bps {
             if *id == builder.id || c.faction() != faction || !lists(c) {
                 continue;
@@ -357,7 +378,7 @@ fn sim_options(
                 out.push(BuildOption { id: id.clone(), tier: c.tier(), kind: BuildKind::Build, group: BuildGroup::of(*r, c) });
             }
         }
-    } else if role.is_factory() {
+    } else if role.is_factory() || mobile_factory {
         let want = match role {
             Role::AirFactory => 1,
             Role::NavalFactory => 2,
@@ -370,7 +391,7 @@ fn sim_options(
             let Some(Ok(r)) = roles.get(id) else {
                 continue;
             };
-            if matches!(r, Role::Mobile | Role::Engineer) && mobile_domain_group(c) == want {
+            if matches!(r, Role::Mobile | Role::Engineer) && (mobile_factory || mobile_domain_group(c) == want) {
                 out.push(BuildOption { id: id.clone(), tier: c.tier(), kind: BuildKind::Produce, group: BuildGroup::of(*r, c) });
             }
         }
@@ -526,10 +547,151 @@ fn json_esc(s: &str) -> String {
 /// (playable / in FA tree, and what the pre-Phase-24 hand-made tables had), the excluded
 /// units with their missing mechanic, and (with `--faction`) every playable unit with
 /// its builders.
+/// Phase 33: how FARust handles each FA `Display.Abilities` entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AbilityStatus {
+    Modelled,
+    Partial,
+    NotModelled,
+    NotApplicable,
+}
+
+impl AbilityStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            AbilityStatus::Modelled => "modelled",
+            AbilityStatus::Partial => "partial",
+            AbilityStatus::NotModelled => "NOT MODELLED",
+            AbilityStatus::NotApplicable => "n/a",
+        }
+    }
+}
+
+/// Phase 33 ability audit table: `(ability key, status, note)`. Unknown keys report as
+/// not modelled.
+pub const ABILITY_AUDIT: &[(&str, AbilityStatus, &str)] = &[
+    ("ability_aa", AbilityStatus::Modelled, "anti-air weapons (hitscan)"),
+    ("ability_airstaging", AbilityStatus::Modelled, "Phase 30/32 docking, refuel, repair"),
+    ("ability_amphibious", AbilityStatus::Modelled, "amphibious navigation domain"),
+    ("ability_aquatic", AbilityStatus::Modelled, "naval / amphibious domains"),
+    ("ability_carrier", AbilityStatus::Partial, "produces aircraft; no internal storage / launch"),
+    ("ability_cloak", AbilityStatus::Modelled, "Phase 18 cloak + omni reveal"),
+    ("ability_customizable", AbilityStatus::Modelled, "Phase 18 enhancements"),
+    ("ability_deathaoe", AbilityStatus::Modelled, "Phase 33 death weapon area damage"),
+    ("ability_depthcharge", AbilityStatus::Partial, "fires as a surface weapon; no submarine layer"),
+    ("ability_deploys", AbilityStatus::NotModelled, "deploy / pack-up states ignored"),
+    ("ability_engineeringsuite", AbilityStatus::Modelled, "build / repair / assist / reclaim"),
+    ("ability_factory", AbilityStatus::Modelled, "structure + mobile factories (Phase 32)"),
+    ("ability_hover", AbilityStatus::Modelled, "hover units use the amphibious domain"),
+    ("ability_jamming", AbilityStatus::Modelled, "Phase 18 radar jamming"),
+    ("ability_manuallaunch", AbilityStatus::Modelled, "silo LaunchMissile"),
+    ("ability_massive", AbilityStatus::Partial, "experimental stats; no unit crushing"),
+    ("ability_notcap", AbilityStatus::NotApplicable, "there is no capture mechanic"),
+    ("ability_omni", AbilityStatus::Modelled, "omni sensors reveal cloak"),
+    ("ability_personalshield", AbilityStatus::Modelled, "personal shields"),
+    ("ability_personalstealth", AbilityStatus::Modelled, "personal radar stealth"),
+    ("ability_radar", AbilityStatus::Modelled, "radar intel"),
+    ("ability_reclaim", AbilityStatus::Modelled, "wreck reclaim"),
+    ("ability_repairs", AbilityStatus::Modelled, "repair orders / engineering stations"),
+    ("ability_sacrifice", AbilityStatus::NotModelled, "Aeon engineer sacrifice unavailable"),
+    ("ability_shielddome", AbilityStatus::Modelled, "bubble shields"),
+    ("ability_sonar", AbilityStatus::Partial, "sonar units use the radar intel model"),
+    ("ability_stealthfield", AbilityStatus::Modelled, "stealth fields"),
+    ("ability_stratmissiledef", AbilityStatus::Modelled, "SMD interception with ammo"),
+    ("ability_stun", AbilityStatus::Modelled, "Phase 33 EMP stun on impact / death"),
+    ("ability_submersible", AbilityStatus::Partial, "submarines stay on the surface layer"),
+    ("ability_suicideweapon", AbilityStatus::Modelled, "Phase 33 kamikaze detonation"),
+    ("ability_tacmissiledef", AbilityStatus::Modelled, "TMD interception"),
+    ("ability_tacticalmissledeflect", AbilityStatus::Partial, "treated as tactical missile defense"),
+    ("ability_torpedo", AbilityStatus::Partial, "fires as a surface weapon; no submarine layer"),
+    ("ability_torpedodef", AbilityStatus::NotModelled, "anti-torpedo weapons ignored"),
+    ("ability_transport", AbilityStatus::Modelled, "Phase 18 air transports"),
+    ("ability_upgradable", AbilityStatus::Modelled, "in-place upgrades"),
+];
+
+/// Status of ability `key` in [`ABILITY_AUDIT`].
+pub fn ability_status(key: &str) -> (AbilityStatus, &'static str) {
+    ABILITY_AUDIT
+        .iter()
+        .find(|(k, ..)| k.eq_ignore_ascii_case(key))
+        .map(|&(_, s, n)| (s, n))
+        .unwrap_or((AbilityStatus::NotModelled, "unknown ability"))
+}
+
+/// `farust roster --abilities [GAME_DIR]`: every `Display.Abilities` entry of the playable
+/// roster with its unit count and how FARust handles it.
+pub fn cmd_roster_abilities(args: &[String]) -> Result<(), String> {
+    use crate::skirmish::Catalog;
+    let game_dir = args
+        .iter()
+        .skip(2)
+        .find(|a| !a.starts_with("--"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(crate::scd::default_game_dir);
+    let roots = Catalog::read_blueprints(&game_dir)?;
+    let infos: BTreeMap<String, BpInfo> = roots.iter().map(|(id, r)| (id.clone(), BpInfo::from_blueprint(id, r))).collect();
+    let cat = Catalog::load(&game_dir)?;
+    let mut by: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (id, e) in &cat.roster.entries {
+        if e.status != Status::Playable {
+            continue;
+        }
+        for a in infos.get(id).map(|b| b.abilities.as_slice()).unwrap_or(&[]) {
+            by.entry(a.to_ascii_lowercase()).or_default().push(id.clone());
+        }
+    }
+    let mut rows: Vec<(AbilityStatus, &String, &Vec<String>, &str)> =
+        by.iter().map(|(k, v)| { let (s, n) = ability_status(k); (s, k, v, n) }).collect();
+    rows.sort_by(|a, b| (a.0, std::cmp::Reverse(a.2.len()), a.1).cmp(&(b.0, std::cmp::Reverse(b.2.len()), b.1)));
+    // Data check: for mechanics with a concrete catalog field, how many listed units carry it.
+    let has_data = |k: &str, id: &str| -> Option<bool> {
+        let t = cat.get(id)?;
+        Some(match k {
+            "ability_deathaoe" => t.ext.death_damage > 0 || t.ext.stun.is_some_and(|s| s.3),
+            "ability_stun" => t.ext.stun.is_some() || t.missile_stun.is_some() || t.weapons.iter().any(|w| w.stun.is_some()),
+            "ability_suicideweapon" => t.weapons.iter().any(|w| w.kamikaze),
+            "ability_airstaging" => t.ext.staging.is_some(),
+            "ability_factory" => t.role.is_factory() || t.ext.mobile_factory || t.ext.mobile_builder,
+            "ability_transport" => t.ext.transport.is_some(),
+            "ability_customizable" => !t.ext.enhancements.is_empty(),
+            _ => return None,
+        })
+    };
+    println!("abilities of playable units ({} kinds):", rows.len());
+    for (s, k, v, n) in &rows {
+        let sample: Vec<&str> = v.iter().take(3).map(String::as_str).collect();
+        let checked: Vec<bool> = v.iter().filter_map(|id| has_data(k, id)).collect();
+        let data = if checked.is_empty() {
+            String::new()
+        } else {
+            format!(" (data {}/{})", checked.iter().filter(|b| **b).count(), checked.len())
+        };
+        println!("  {:<30} {:>3} unit(s)  {:<13} {}{data}  [{}]", k, v.len(), s.label(), n, sample.join(" "));
+        if args.iter().any(|a| a == "--missing") {
+            let miss: Vec<&str> = v.iter().filter(|id| has_data(k, id) == Some(false)).map(String::as_str).collect();
+            if !miss.is_empty() {
+                println!("      without data: {}", miss.join(" "));
+            }
+        }
+    }
+    let count = |st: AbilityStatus| rows.iter().filter(|r| r.0 == st).count();
+    println!(
+        "summary: modelled {} | partial {} | not modelled {} | n/a {}",
+        count(AbilityStatus::Modelled),
+        count(AbilityStatus::Partial),
+        count(AbilityStatus::NotModelled),
+        count(AbilityStatus::NotApplicable)
+    );
+    Ok(())
+}
+
 pub fn cmd_roster(args: &[String]) -> Result<(), String> {
     use crate::skirmish::Catalog;
     if args.iter().any(|a| a == "--verify") {
         return cmd_roster_verify(args);
+    }
+    if args.iter().any(|a| a == "--abilities") {
+        return cmd_roster_abilities(args);
     }
     let mut game_dir = None;
     let mut only: Option<String> = None;
@@ -903,7 +1065,15 @@ pub fn cmd_roster_verify(args: &[String]) -> Result<(), String> {
         let done_of = |w: &Skirmish, j: &Job| -> bool {
             match j.kind {
                 BuildKind::Upgrade => w.unit(j.builder).is_some_and(|u| u.type_id.eq_ignore_ascii_case(&j.target)),
-                _ => w.units().any(|u| u.army == 0 && u.type_id == j.target && !initial.contains(&u.id)),
+                _ => {
+                    // Phase 32: eggs hatch into their `BuildUnit` the moment they finish.
+                    let hatch = w.catalog().get(&j.target).and_then(|t| t.ext.hatch.clone());
+                    w.units().any(|u| {
+                        u.army == 0
+                            && (u.type_id == j.target || hatch.as_deref() == Some(u.type_id.as_str()))
+                            && !initial.contains(&u.id)
+                    })
+                }
             }
         };
         let mut done = vec![false; jobs.len()];
@@ -1005,8 +1175,9 @@ mod tests {
         }
         // Air unit is listed by the land factory in FA but needs an air factory here.
         assert!(matches!(st("TSA0101"), Status::Excluded(_)));
-        assert_eq!(st("TSB5101"), Status::Excluded("walls (pathing blockers)"));
-        assert!(matches!(st("TSL0999"), Status::Excluded(m) if m.contains("mobile factory")));
+        assert_eq!(st("TSB5101"), Status::Playable, "Phase 28: walls are playable");
+        assert_eq!(st("TSL0999"), Status::Playable, "Phase 32: produced by the mobile factory TSL0401");
+        assert!(r.can("TSL0401", "TSL0999", BuildKind::Produce));
         assert_eq!(st("TSC0001"), Status::NotInTree);
 
         let fac = r.options_of("TSB0101");
@@ -1018,9 +1189,9 @@ mod tests {
         assert!(acu.iter().any(|o| o.id == "TSB2301" && o.tier == 2 && o.group == BuildGroup::Defense));
         assert!(acu.iter().any(|o| o.id == "TSL0401" && o.group == BuildGroup::Experimental));
         assert!(!r.can("TSL0105", "TSB2301", BuildKind::Build));
-        assert_eq!(r.playable[0].len(), 9);
+        assert_eq!(r.playable[0].len(), 11);
         let cov = coverage(&r);
-        assert_eq!(cov[0][0], (5, 8));
+        assert_eq!(cov[0][0], (7, 8));
         assert_eq!(cov[0][3], (1, 1));
     }
 

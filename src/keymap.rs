@@ -74,6 +74,13 @@ pub enum Action {
     OrderOvercharge,
     OrderLaunchMissile,
     CardNextTab,
+    /// Phase 36: hotbuild group cycles and build templates.
+    HotbuildFactory,
+    HotbuildDefense,
+    HotbuildEconomy,
+    HotbuildIntel,
+    TemplateSave,
+    TemplateCycle,
     /// Control group `0..=9`.
     Group(u8),
     /// Camera bookmark `0..4` (save / recall).
@@ -200,6 +207,12 @@ fn build_table() -> Vec<ActionInfo> {
         (A::OrderOvercharge, "order_overcharge", "Order: overcharge target", Exact, "Ctrl+O"),
         (A::OrderLaunchMissile, "order_missile", "Order: launch missile", Exact, "Ctrl+N"),
         (A::CardNextTab, "card_next_tab", "Command card: next tech tab", Exact, "Backquote"),
+        (A::HotbuildFactory, "hotbuild_factory", "Hotbuild: cycle factories", Exact, "Alt+F"),
+        (A::HotbuildDefense, "hotbuild_defense", "Hotbuild: cycle defenses", Exact, "Alt+D"),
+        (A::HotbuildEconomy, "hotbuild_economy", "Hotbuild: cycle economy", Exact, "Alt+E"),
+        (A::HotbuildIntel, "hotbuild_intel", "Hotbuild: cycle intel", Exact, "Alt+R"),
+        (A::TemplateSave, "template_save", "Save selected structures as template", Exact, "Alt+S"),
+        (A::TemplateCycle, "template_cycle", "Place / cycle build templates", Exact, "Alt+T"),
     ];
     let mut out: Vec<ActionInfo> = fixed
         .iter()

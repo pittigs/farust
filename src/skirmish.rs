@@ -29,6 +29,7 @@ use crate::scenario;
 use crate::scmap::ScMap;
 use crate::sim::{SCALE, TICK_HZ, Vec2};
 use crate::spatial::{SPATIAL_CELL_MILLI, SpatialGrid};
+use crate::terrain::HeightField;
 
 pub type ArmyId = u8;
 pub type UnitId = u32;
@@ -254,6 +255,48 @@ pub struct UnitTypeExt {
     pub ammo_cap: u32,
     /// Phase 24: structure can only be placed on water (`Physics.BuildOnLayerCaps`).
     pub water_only: bool,
+    /// Phase 30: flight time on a full tank (`Physics.FuelUseTime`, ticks); 0 = unlimited.
+    pub fuel_ticks: u32,
+    /// Phase 30: `Physics.FuelRechargeRate` (fuel seconds regained per second, milli).
+    pub fuel_recharge_milli: i64,
+    /// Phase 30: present on air staging platforms.
+    pub staging: Option<StagingSpec>,
+    /// Phase 31: pod drones an engineering station keeps alive (`Economy.EngineeringPods`
+    /// `PodUnitID`, upper-case); empty = the station works itself (Cybran Hive).
+    pub pods: Vec<String>,
+    /// Phase 32: unit this structure turns into the moment it is finished
+    /// (`Economy.BuildUnit`, e.g. Megalith crab eggs).
+    pub hatch: Option<String>,
+    /// Phase 32: non-structure that produces units (Fatboy, carriers, CZAR, Tempest).
+    pub mobile_factory: bool,
+    /// Phase 32: non-engineer that places structures (Megalith laying eggs).
+    pub mobile_builder: bool,
+    /// Phase 33: death weapon (`DeathWeapon` / `DeathImpact` / `WeaponCategory = 'Death'`):
+    /// damage and radius dealt to every unit around the wreck ("Volatile").
+    pub death_damage: i64,
+    pub death_radius: i64,
+    /// Phase 33: `Buffs.Stun` — (ticks, radius, on EMP impact, on death).
+    pub stun: Option<(u32, i64, bool, bool)>,
+    /// Phase 33: `UNTARGETABLE` category (orbital satellites).
+    pub untargetable: bool,
+    /// Phase 33: satellite an orbital launch centre keeps in orbit (resolved by the catalog).
+    pub satellite: Option<String>,
+}
+
+/// Phase 30: air staging platform data (`Transport.DockingSlots`, `AI.Refueling*`,
+/// `Transport.RepairRate`, `AI.RepairConsume*`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StagingSpec {
+    pub slots: u8,
+    /// Docked refuel speed = `FuelRechargeRate × multiplier`.
+    pub refuel_multiplier: i64,
+    /// Repair per second in ‰ of max health.
+    pub repair_permille: i64,
+    /// Resource cost per second of repairing (milli).
+    pub repair_energy: i64,
+    pub repair_mass: i64,
+    /// Auto-refuel search radius (`AI.StagingPlatformScanRadius`, milli).
+    pub scan_radius: i64,
 }
 
 /// Runtime enhancement state of one unit (effects already folded in).
@@ -318,6 +361,15 @@ pub enum Role {
     MissileSilo,
     MissileDefense,
     Experimental,
+    /// Phase 28: wall section — an inert structure that blocks land/amphibious pathing.
+    Wall,
+    /// Phase 30: air staging platform — docks, refuels and repairs aircraft.
+    AirStaging,
+    /// Phase 31: engineering station (UEF Kennel, Cybran Hive) — automatically assists and
+    /// repairs allied work in its radius, itself or through its pod drones.
+    EngStation,
+    /// Phase 33: orbital launch centre (Novax) — keeps its satellite in orbit.
+    Orbital,
 }
 
 impl Role {
@@ -338,6 +390,10 @@ impl Role {
                 | Role::AntiAir
                 | Role::MissileSilo
                 | Role::MissileDefense
+                | Role::Wall
+                | Role::AirStaging
+                | Role::EngStation
+                | Role::Orbital
         )
     }
     pub fn is_factory(self) -> bool {
@@ -366,6 +422,10 @@ impl Role {
             Role::MissileSilo => 15,
             Role::MissileDefense => 16,
             Role::Experimental => 17,
+            Role::Wall => 18,
+            Role::AirStaging => 19,
+            Role::EngStation => 20,
+            Role::Orbital => 21,
         }
     }
 }
@@ -389,7 +449,58 @@ pub struct WeaponType {
     pub anti_surface: bool,
     pub turret_yaw_bone: Option<String>,
     pub turret_pitch_bone: Option<String>,
+    /// Phase 29: turret slew rate (milliradians per tick); 0 = fixed / instant aim.
+    pub turret_yaw_speed: i64,
+    /// Phase 29: fire only when the turret is within this angle of the target (mrad).
+    pub firing_tolerance: i64,
+    /// Phase 29: instant beam / hitscan weapon (no projectile; terrain-checked line of fire).
+    pub beam: bool,
+    /// Phase 29: aim ahead of moving targets (`LeadTarget`).
+    pub lead_target: bool,
+    /// Phase 33: `DamageType = 'EMP'` — applies the unit's `Buffs.Stun` on impact.
+    pub emp: bool,
+    /// Phase 33: `WeaponCategory = 'Kamikaze'` — detonates the unit on firing.
+    pub kamikaze: bool,
+    /// Phase 33: weapon `Buffs` STUN applied on impact (ticks, radius).
+    pub stun: Option<(u32, i64)>,
 }
+
+/// Phase 33: the first `BuffType = 'STUN'` entry of a weapon's `Buffs` list that applies
+/// on impact, as (ticks, radius milli).
+fn weapon_stun(w: &Value) -> Option<(u32, i64)> {
+    w.get("Buffs")?.table_list().into_iter().find_map(|b| {
+        let on_impact = b.get("Add").and_then(|a| a.get_bool("OnImpact")).unwrap_or(true);
+        (b.get_str("BuffType") == Some("STUN") && on_impact).then(|| {
+            let ticks = (b.get_f64("Duration").unwrap_or(0.0).max(0.0) * TICK_HZ as f64).round() as u32;
+            let radius = (b.get_f64("Radius").unwrap_or(0.0).max(0.0) * SCALE as f64).round() as i64;
+            (ticks, radius)
+        })
+    }).filter(|s| s.0 > 0)
+}
+
+/// Phase 33: a death effect to resolve after cleanup: (army, position, death damage, death
+/// radius, on-death stun).
+type DeathFx = (ArmyId, (i64, i64), i64, i64, Option<(u32, i64)>);
+
+/// Phase 29: spatial reach (beyond half a shell's per-tick segment) searched for units the
+/// shell passes through; hit boxes wider than this are only hit near their centre line.
+const DIRECT_HIT_REACH: i64 = 5 * SCALE;
+
+/// Phase 29: a line of fire may graze the terrain by this much (milli) before it is blocked.
+pub const LOF_CLEARANCE: i64 = SCALE / 4;
+
+/// Phase 29: sim rules generation. Replays / saves record it and refuse to re-simulate
+/// under different rules (1 = Phases ≤ 28; 2 = Phase 29 ballistics, turrets and structure
+/// footprints blocking pathing).
+/// 3 = Phase 30 air fuel & staging; 4 = Phase 31 engineering stations & pod drones;
+/// 5 = Phase 32 mobile factories, mobile staging & hatching eggs; 6 = Phase 33 Novax
+/// satellite, EMP stun, death explosions & kamikaze weapons; 7 = Phase 34 prop reclaim;
+/// 8 = Phase 35 fire states, ground fire, guard & build pause; 9 = Phase 36 ferries;
+/// 10 = Phase 53 pings as sim commands (allied AIs react).
+pub const RULES_VERSION: u32 = 10;
+
+/// Phase 29: milliradians per degree, scaled by 1000 (17.453 mrad / deg).
+const MRAD_PER_DEG_MILLI: i64 = 17_453;
 
 /// Quantized unit type derived once from a blueprint.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -429,6 +540,8 @@ pub struct UnitType {
     pub missile_damage: i64,
     pub missile_splash: i64,
     pub missile_range: i64,
+    /// Phase 33: stun carried by this silo's missiles (Cybran nukes).
+    pub missile_stun: Option<(u32, i64)>,
     pub intercept_radius: i64,
     /// Footprint half-size (milli) and render size (milli).
     pub radius: i64,
@@ -475,6 +588,10 @@ fn default_strategic_icon(role: Role, tier: u8) -> &'static str {
         Role::Engineer => "icon_land1_engineer",
         Role::Experimental => "icon_experimental_generic",
         Role::Mobile => "icon_land1_directfire",
+        Role::Wall => "icon_structure_wall",
+        Role::AirStaging => "icon_structure2_air",
+        Role::EngStation => "icon_structure2_engineer",
+        Role::Orbital => "icon_experimental_generic",
     }
 }
 
@@ -539,6 +656,7 @@ impl UnitType {
             .unwrap_or_default();
 
         let mut missile_damage = 0i64;
+        let mut missile_stun: Option<(u32, i64)> = None;
         let mut missile_splash = 0i64;
         let mut missile_range = 0i64;
         let mut intercept_radius = 0i64;
@@ -557,6 +675,7 @@ impl UnitType {
                     && (label.contains("Missile") || has_cat("SILO"));
 
                 if is_nuke || is_tac_missile {
+                    missile_stun = missile_stun.or(weapon_stun(t));
                     let md = t.get_f64("Damage").unwrap_or(0.0).max(nuke_dmg).max(if is_nuke { 70_000.0 } else { 6_000.0 });
                     let mr = t.get_f64("NukeInnerRingRadius").or_else(|| t.get_f64("DamageRadius")).unwrap_or(if is_nuke { 25.0 } else { 4.0 });
                     missile_damage = q(md);
@@ -613,6 +732,21 @@ impl UnitType {
                 let muzzle_velocity = t.get_f64("MuzzleVelocity").map(per_tick).unwrap_or(0).max(0);
                 let turret_yaw_bone = t.get_str("TurretBoneYaw").map(ToOwned::to_owned);
                 let turret_pitch_bone = t.get_str("TurretBonePitch").map(ToOwned::to_owned);
+                let deg_to_mrad = |deg: f64| ((deg * MRAD_PER_DEG_MILLI as f64) / 1000.0).round() as i64;
+                let turreted = t.get_bool("Turreted").unwrap_or(turret_yaw_bone.is_some()) && turret_yaw_bone.is_some();
+                let turret_yaw_speed = if turreted {
+                    (deg_to_mrad(t.get_f64("TurretYawSpeed").unwrap_or(90.0).max(1.0)) / TICK_HZ as i64).max(1)
+                } else {
+                    0
+                };
+                let firing_tolerance = deg_to_mrad(t.get_f64("FiringTolerance").unwrap_or(2.0).clamp(0.0, 180.0)).max(5);
+                let beam = t.get("BeamLifetime").is_some()
+                    || t.get_bool("ContinuousBeam").unwrap_or(false)
+                    || muzzle_velocity <= 0;
+                let lead_target = t.get_bool("LeadTarget").unwrap_or(true);
+                let emp = t.get_str("DamageType") == Some("EMP");
+                let stun = weapon_stun(t);
+                let kamikaze = t.get_str("WeaponCategory") == Some("Kamikaze");
                 Some(WeaponType {
                     label,
                     damage: q(d),
@@ -624,6 +758,13 @@ impl UnitType {
                     anti_surface,
                     turret_yaw_bone,
                     turret_pitch_bone,
+                    turret_yaw_speed,
+                    firing_tolerance,
+                    beam: beam && !kamikaze,
+                    lead_target,
+                    emp,
+                    kamikaze,
+                    stun,
                 })
             })
             .collect();
@@ -705,6 +846,8 @@ impl UnitType {
         let default_build_range = match role {
             Role::Commander => 10.0,
             Role::Engineer => 6.0,
+            // Phase 31: stations work within their guard radius.
+            Role::EngStation => root.get("AI").and_then(|a| a.get_f64("GuardScanRadius")).unwrap_or(15.0),
             _ => 0.0,
         };
         let vision_default = match role {
@@ -772,6 +915,7 @@ impl UnitType {
             missile_damage,
             missile_splash,
             missile_range,
+            missile_stun,
             intercept_radius,
             radius: q(half).max(SCALE / 4),
             size: [q(size_x), q(size_y), q(size_z)],
@@ -840,6 +984,75 @@ impl UnitTypeExt {
                 class2_size: t_f("Class2AttachSize").unwrap_or(2.0).clamp(1.0, 8.0) as u8,
                 class3_size: t_f("Class3AttachSize").unwrap_or(4.0).clamp(1.0, 16.0) as u8,
                 carries_commander: has_cat("CANTRANSPORTCOMMANDER"),
+            });
+        }
+        if domain == NavDomain::Air && !role.is_structure() {
+            let fuel = root.get("Physics").and_then(|p| p.get_f64("FuelUseTime")).unwrap_or(0.0);
+            if fuel > 0.0 {
+                out.fuel_ticks = (fuel * TICK_HZ as f64).round().clamp(1.0, u32::MAX as f64 / 2.0) as u32;
+                out.fuel_recharge_milli = (root
+                    .get("Physics")
+                    .and_then(|p| p.get_f64("FuelRechargeRate"))
+                    .unwrap_or(5.0)
+                    .max(0.1)
+                    * 1000.0)
+                    .round() as i64;
+            }
+        }
+        for w in raw_weapons {
+            let label = w.get_str("Label").unwrap_or("");
+            if label == "DeathWeapon"
+                || label == "DeathImpact"
+                || w.get_str("WeaponCategory") == Some("Death")
+                || w.get_bool("FireOnDeath").unwrap_or(false)
+            {
+                let d = w.get_f64("Damage").unwrap_or(0.0).max(w.get_f64("NukeInnerRingDamage").unwrap_or(0.0));
+                let r = w.get_f64("DamageRadius").unwrap_or(0.0).max(w.get_f64("NukeInnerRingRadius").unwrap_or(0.0));
+                if d > 0.0 && r > 0.0 && q(d) > out.death_damage {
+                    out.death_damage = q(d);
+                    out.death_radius = q(r);
+                }
+            }
+        }
+        if let Some(st) = root.get("Buffs").and_then(|b| b.get("Stun"))
+            && st.get_str("BuffType") == Some("STUN")
+        {
+            let add = st.get("Add");
+            let flag = |k: &str| add.and_then(|a| a.get_bool(k)).unwrap_or(false);
+            let ticks = (st.get_f64("Duration").unwrap_or(0.0).max(0.0) * TICK_HZ as f64).round() as u32;
+            let radius = q(st.get_f64("Radius").unwrap_or(0.0).max(0.0));
+            if ticks > 0 {
+                out.stun = Some((ticks, radius, flag("OnImpact"), flag("OnDeath")));
+            }
+        }
+        out.untargetable = has_cat("UNTARGETABLE");
+        if role.is_structure() {
+            out.hatch = root
+                .get("Economy")
+                .and_then(|e| e.get_str("BuildUnit"))
+                .map(|id| id.to_ascii_uppercase());
+        }
+        if role == Role::EngStation {
+            out.pods = root
+                .get("Economy")
+                .and_then(|e| e.get("EngineeringPods"))
+                .map(|p| p.table_list())
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|p| p.get_str("PodUnitID"))
+                .map(|id| id.to_ascii_uppercase())
+                .collect();
+        }
+        if role == Role::AirStaging || has_cat("AIRSTAGINGPLATFORM") {
+            let ai = root.get("AI");
+            let ai_f = |k: &str, d: f64| ai.and_then(|a| a.get_f64(k)).unwrap_or(d);
+            out.staging = Some(StagingSpec {
+                slots: t_f("DockingSlots").unwrap_or(4.0).clamp(1.0, 32.0) as u8,
+                refuel_multiplier: ai_f("RefuelingMultiplier", 50.0).clamp(1.0, 1000.0).round() as i64,
+                repair_permille: (t_f("RepairRate").unwrap_or(0.1).clamp(0.0, 1.0) * 1000.0).round() as i64,
+                repair_energy: (ai_f("RepairConsumeEnergy", 5.0).max(0.0) * SCALE as f64).round() as i64,
+                repair_mass: (ai_f("RepairConsumeMass", 0.5).max(0.0) * SCALE as f64).round() as i64,
+                scan_radius: (ai_f("StagingPlatformScanRadius", 300.0).clamp(10.0, 2_000.0) * SCALE as f64).round() as i64,
             });
         }
         if matches!(domain, NavDomain::Land | NavDomain::Amphibious)
@@ -1355,6 +1568,37 @@ impl Catalog {
         self.roster.entries.get(id).and_then(|e| e.group)
     }
 
+    /// Phase 49: loads any mission-specific blueprints (e.g. civilian structures `XEC1301`,
+    /// `UEC1101`) from `units.scd` that are not part of the skirmish roster. No-op when all
+    /// `ids` are already loaded.
+    pub fn ensure_mission_types(&mut self, game_dir: &Path, ids: &[String]) -> Result<(), String> {
+        let missing: Vec<String> = ids
+            .iter()
+            .map(|s| s.to_ascii_uppercase())
+            .filter(|id| !self.types.contains_key(id))
+            .collect();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let units_scd = scd::gamedata_dir(game_dir).join("units.scd");
+        for id in missing {
+            if self.types.contains_key(&id) {
+                continue;
+            }
+            let inner = format!("units/{id}/{id}_unit.bp");
+            let (_, bytes) = scd::read_scd_file_ci(&units_scd, &inner)
+                .map_err(|e| format!("mission unit '{id}' not found in {}: {e}", units_scd.display()))?;
+            let root = blueprint::parse_blueprint(&String::from_utf8_lossy(&bytes))
+                .map_err(|e| format!("bad blueprint '{id}': {e}"))?;
+            let info = roster::BpInfo::from_blueprint(&id, &root);
+            let role = roster::infer_role(&info).unwrap_or_else(|_| {
+                if info.has("STRUCTURE") { Role::MassStorage } else { Role::Mobile }
+            });
+            self.types.insert(id.clone(), UnitType::from_blueprint(&id, role, &root));
+        }
+        Ok(())
+    }
+
     /// Phase 24: derives the data-driven roster from parsed blueprints and adds every
     /// playable type that the legacy tables did not load.
     fn extend_from_roster(&mut self, roots: &BTreeMap<String, Value>) {
@@ -1383,6 +1627,53 @@ impl Catalog {
             }
             self.types.insert(id.clone(), t);
         }
+        // Phase 32: mobile units with produce / build options become mobile factories /
+        // mobile builders; eggs' hatchlings must be loadable.
+        for t in self.types.values_mut() {
+            if t.role.is_structure() || t.role.is_builder() {
+                continue;
+            }
+            let opts = r.options_of(&t.id.to_ascii_uppercase());
+            t.ext.mobile_factory = opts.iter().any(|o| o.kind == roster::BuildKind::Produce);
+            t.ext.mobile_builder = opts.iter().any(|o| o.kind == roster::BuildKind::Build);
+        }
+        let hatchlings: Vec<String> = self.types.values().filter_map(|t| t.ext.hatch.clone()).collect();
+        for id in hatchlings {
+            if !self.types.contains_key(&id)
+                && let Some(root) = roots.get(&id)
+                && let Some(Ok(role)) = Some(roster::infer_role(&infos[&id]))
+            {
+                self.types.insert(id.clone(), UnitType::from_blueprint(&id, role, root));
+            }
+        }
+        // Phase 33: an orbital launch centre's satellite is its faction's `SATELLITE` unit.
+        let launchers: Vec<String> = self.types.values().filter(|t| t.role == Role::Orbital).map(|t| t.id.clone()).collect();
+        for lid in launchers {
+            let fac = infos.get(&lid.to_ascii_uppercase()).and_then(roster::BpInfo::faction);
+            let sat = infos
+                .values()
+                .filter(|b| b.has("SATELLITE") && b.faction() == fac)
+                .map(|b| b.id.clone())
+                .min();
+            if let Some(sid) = sat
+                && let Some(root) = roots.get(&sid)
+            {
+                if !self.types.contains_key(&sid) {
+                    let role = roster::infer_role(&infos[&sid]).unwrap_or(Role::Mobile);
+                    self.types.insert(sid.clone(), UnitType::from_blueprint(&sid, role, root));
+                }
+                self.types.get_mut(&lid).unwrap().ext.satellite = Some(sid);
+            }
+        }
+        // Phase 31: pod drones are spawned by their stations, never built: load them too.
+        let pods: Vec<String> = self.types.values().flat_map(|t| t.ext.pods.iter().cloned()).collect();
+        for id in pods {
+            if !self.types.contains_key(&id)
+                && let Some(root) = roots.get(&id)
+            {
+                self.types.insert(id.clone(), UnitType::from_blueprint(&id, Role::Engineer, root));
+            }
+        }
         self.roster = Arc::new(r);
     }
 
@@ -1390,7 +1681,8 @@ impl Catalog {
     /// apply the process-wide enabled mods ([`mods::active`]) and add the Phase 24
     /// data-driven roster.
     pub fn load(game_dir: &Path) -> Result<Self, String> {
-        Self::load_with_mods(game_dir, mods::active()?)
+        let active = mods::active()?;
+        Self::load_with_mods(game_dir, &active)
     }
 
     /// Every `*_unit.bp` in `units.scd`, keyed by upper-case blueprint id.
@@ -1593,6 +1885,51 @@ pub enum UnitOrder {
     Unload { x: i64, y: i64 },
     /// Phase 18: (ACU/SCU) install the named blueprint enhancement in place.
     Enhance(String),
+    /// Phase 30: (aircraft) fly to this air staging platform, dock, refuel and repair.
+    Dock(UnitId),
+    /// Phase 35: keep firing at a map position (FA ground fire).
+    AttackGround { x: i64, y: i64 },
+    /// Phase 35: follow and protect a friendly unit.
+    Guard(UnitId),
+    /// Phase 36: (air transport) shuttle idle land units from `from` to `to`, forever.
+    Ferry { from: (i64, i64), to: (i64, i64) },
+}
+
+/// Phase 35: automatic engagement rule of a unit (FA `RULEUCC_RetaliateToggle`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FireState {
+    /// Engage anything in range (FA default).
+    #[default]
+    FireAtWill,
+    /// Only shoot back at the unit that last hit it.
+    ReturnFire,
+    /// Never fire automatically; explicit attack / ground-fire orders only.
+    HoldFire,
+}
+
+impl FireState {
+    pub fn code(self) -> u8 {
+        match self {
+            FireState::FireAtWill => 0,
+            FireState::ReturnFire => 1,
+            FireState::HoldFire => 2,
+        }
+    }
+    pub fn from_code(c: u8) -> Option<Self> {
+        match c {
+            0 => Some(FireState::FireAtWill),
+            1 => Some(FireState::ReturnFire),
+            2 => Some(FireState::HoldFire),
+            _ => None,
+        }
+    }
+    pub fn next(self) -> Self {
+        match self {
+            FireState::FireAtWill => FireState::ReturnFire,
+            FireState::ReturnFire => FireState::HoldFire,
+            FireState::HoldFire => FireState::FireAtWill,
+        }
+    }
 }
 
 /// Player / AI input. Applied at the start of the next tick in issue order.
@@ -1623,6 +1960,24 @@ pub enum Command {
     ToggleShield { units: Vec<UnitId>, enabled: bool },
     /// Phase 18: `units` board air transport `transport`.
     Load { units: Vec<UnitId>, transport: UnitId, queue: bool },
+    /// Phase 30: aircraft dock at an own air staging platform.
+    Dock { units: Vec<UnitId>, staging: UnitId, queue: bool },
+    /// Phase 30: toggle automatic return to air staging on low fuel.
+    SetAutoRefuel { units: Vec<UnitId>, enabled: bool },
+    /// Phase 35: engagement rule.
+    SetFireState { units: Vec<UnitId>, state: FireState },
+    /// Phase 35: fire at a map position until given another order.
+    AttackGround { units: Vec<UnitId>, x: i64, y: i64, queue: bool },
+    /// Phase 35: follow and protect a friendly unit.
+    Guard { units: Vec<UnitId>, target: UnitId, queue: bool },
+    /// Phase 35: pause / resume construction and production.
+    SetBuildPaused { units: Vec<UnitId>, paused: bool },
+    /// Phase 36: move the `index`-th queued Move / AttackMove / Patrol point of each unit.
+    MoveWaypoint { units: Vec<UnitId>, index: u32, x: i64, y: i64 },
+    /// Phase 36: set up a ferry route for air transports.
+    Ferry { transports: Vec<UnitId>, from: (i64, i64), to: (i64, i64), queue: bool },
+    /// Phase 53: map ping for allies (0 alert / 1 move / 2 attack); allied AIs react.
+    Ping { kind: u8, x: i64, y: i64 },
     /// Phase 18: `transports` fly to `(x, y)` and drop their cargo.
     Unload { transports: Vec<UnitId>, x: i64, y: i64, queue: bool },
     /// Phase 18: install ACU/SCU enhancement `name` (blueprint `Enhancements` key).
@@ -1660,6 +2015,39 @@ pub struct WeaponState {
     pub muzzle_velocity: i64,
     pub anti_air: bool,
     pub anti_surface: bool,
+    /// Phase 29: copied from [`WeaponType`].
+    pub turret_yaw_speed: i64,
+    pub firing_tolerance: i64,
+    pub beam: bool,
+    pub lead_target: bool,
+    pub emp: bool,
+    pub kamikaze: bool,
+    pub stun: Option<(u32, i64)>,
+    /// Phase 29: current turret yaw (mrad, `atan2(dx, dz)` convention).
+    pub yaw: i64,
+}
+
+impl WeaponState {
+    pub fn from_type(w: &WeaponType) -> Self {
+        Self {
+            damage: w.damage,
+            range_sq: (w.range as i128) * (w.range as i128),
+            reset: w.reset,
+            cooldown: 0,
+            splash_radius: w.splash_radius,
+            muzzle_velocity: w.muzzle_velocity,
+            anti_air: w.anti_air,
+            anti_surface: w.anti_surface,
+            turret_yaw_speed: w.turret_yaw_speed,
+            firing_tolerance: w.firing_tolerance,
+            beam: w.beam,
+            lead_target: w.lead_target,
+            emp: w.emp,
+            kamikaze: w.kamikaze,
+            stun: w.stun,
+            yaw: 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1728,6 +2116,29 @@ pub struct Unit {
     still_ticks: u32,
     /// Armies (bit = army id) whose omni sensors (or allies') reveal this cloaked unit.
     omni_mask: u8,
+    /// Phase 29: hit-box height (milli, blueprint `SizeY`) for line-of-fire tests.
+    pub height: i64,
+    /// Phase 29: ground displacement during the last tick (milli), used to lead targets.
+    pub vel: (i64, i64),
+    /// Phase 30: remaining flight time (ticks; only meaningful when the type has fuel).
+    pub fuel: u32,
+    /// Phase 30: return to the nearest free air staging platform when fuel runs low.
+    pub auto_refuel: bool,
+    /// Phase 31: the engineering station this pod drone belongs to.
+    pub drone_of: Option<UnitId>,
+    /// Phase 31: (station) ticks spent rebuilding a missing pod drone.
+    pub pod_timer: u32,
+    /// Phase 33: ticks left stunned (no moving, firing or building).
+    pub stunned: u32,
+    /// Phase 33: never auto- or manually targeted (orbital satellites).
+    pub untargetable: bool,
+    /// Phase 35: automatic engagement rule.
+    pub fire_state: FireState,
+    /// Phase 35: construction / production paused.
+    pub build_paused: bool,
+    /// Phase 54: cached type economy `[mass/tick, energy/tick, mass storage, energy
+    /// storage]` (refreshed on upgrade) so per-tick passes avoid catalog lookups.
+    eco: [i64; 4],
 }
 
 impl Unit {
@@ -1739,7 +2150,7 @@ impl Unit {
     /// Whether army `army` may target this unit (not aboard a transport, and not cloaked
     /// unless revealed by `army`'s or its allies' omni sensors).
     pub fn targetable_by(&self, army: ArmyId) -> bool {
-        self.carried_by.is_none() && (!self.cloaked || (self.omni_mask >> (army & 7)) & 1 == 1)
+        !self.untargetable && self.carried_by.is_none() && (!self.cloaked || (self.omni_mask >> (army & 7)) & 1 == 1)
     }
 }
 
@@ -1762,6 +2173,12 @@ struct UnitSpatialSnap {
     radius: i64,
     speed: i64,
     is_struct: bool,
+    /// Phase 28: wall sections are only auto-targeted when nothing else is in range.
+    is_wall: bool,
+    /// Phase 29: hit-box height (milli) for direct-fire collisions.
+    height: i64,
+    /// Phase 33: orbital satellites are never acquired as targets.
+    untargetable: bool,
     can_fire_aa: bool,
     can_fire_surface: bool,
     max_range: i64,
@@ -1773,7 +2190,7 @@ struct UnitSpatialSnap {
 impl UnitSpatialSnap {
     /// Phase 18: cloak blocks automatic target acquisition unless omni reveals it.
     fn hidden_from(&self, army: ArmyId) -> bool {
-        self.cloaked && (self.omni_mask >> (army & 7)) & 1 == 0
+        self.untargetable || (self.cloaked && (self.omni_mask >> (army & 7)) & 1 == 0)
     }
 }
 
@@ -1794,6 +2211,17 @@ pub struct Projectile {
     pub is_missile: bool,
     pub is_nuke: bool,
     pub target_air: bool,
+    /// Phase 29: straight-flying single-target direct-fire shell.
+    pub direct: bool,
+    /// Phase 29: firing unit (excluded from collisions; 0 = none).
+    pub shooter: UnitId,
+    /// Phase 29: current / start / aim height (milli) of a direct shell.
+    pub z: i64,
+    pub start_z: i64,
+    pub target_z: i64,
+    /// Phase 33: EMP stun (ticks, radius) applied around the impact point.
+    pub stun_ticks: u32,
+    pub stun_radius: i64,
 }
 
 /// Visual/audio telemetry emitted during simulation ticks (excluded from `state_hash()`).
@@ -1872,6 +2300,31 @@ pub struct ArmySetup {
     pub team: u8,
 }
 
+/// Phase 34: a reclaimable map prop (tree, rock, log) from the `.scmap` prop list with its
+/// blueprint's `ReclaimMassMax` / `ReclaimEnergyMax`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MapProp {
+    pub pos: (i64, i64),
+    pub mass: i64,
+    pub energy: i64,
+    /// Original `.scmap` position bits (x, z) so the renderer can hide reclaimed props.
+    pub src_xz: (u32, u32),
+}
+
+/// Phase 34: what a reclaim order is eating.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReclaimKind {
+    Wreck,
+    Prop,
+    Unit,
+}
+
+/// Phase 36: idle land units this close to a ferry's pick-up point board it.
+pub const FERRY_RADIUS: i64 = 12 * SCALE;
+
+/// Phase 34: snap radius for prop reclaim orders.
+pub const PROP_SNAP: i64 = 3 * SCALE;
+
 /// Map-derived context shared by headless runs, the AI and the viewer.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -1890,9 +2343,62 @@ pub struct MapContext {
     /// Hydrocarbon markers in milli-units.
     pub hydro_points: Vec<(i64, i64)>,
     pub has_water: bool,
+    /// Phase 34: reclaimable props (empty when their blueprints cannot be read).
+    pub props: Vec<MapProp>,
+    /// Phase 49: all named markers `(x, z)` in milli-units from `_save.lua`.
+    pub markers: BTreeMap<String, (i64, i64)>,
+    /// Phase 49: named rectangular areas `(x0, z0, x1, z1)` in milli-units from `_save.lua`.
+    pub areas: BTreeMap<String, (i64, i64, i64, i64)>,
 }
 
 impl MapContext {
+    /// Phase 49: looks up a named marker (exact, then ASCII case-insensitive).
+    pub fn marker(&self, name: &str) -> Option<(i64, i64)> {
+        self.markers.get(name).copied().or_else(|| {
+            self.markers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, &v)| v)
+        })
+    }
+
+    /// Phase 49: looks up a named area rectangle `(x0, z0, x1, z1)` in milli-units.
+    pub fn area(&self, name: &str) -> Option<(i64, i64, i64, i64)> {
+        self.areas.get(name).copied().or_else(|| {
+            self.areas.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, &v)| v)
+        })
+    }
+    /// Phase 34: reclaimable props of `scmap`, values from the prop blueprints in `env.scd`
+    /// (case-insensitive paths, cached per blueprint).
+    pub fn load_props(game_dir: &Path, scmap: &ScMap) -> Vec<MapProp> {
+        let Some(tt) = scmap.terrain_textures.as_ref() else {
+            return Vec::new();
+        };
+        let env = scd::gamedata_dir(game_dir).join("env.scd");
+        let mut values: BTreeMap<String, (i64, i64)> = BTreeMap::new();
+        let q = |v: f64| (v * SCALE as f64).round() as i64;
+        let mut out = Vec::new();
+        for p in &tt.props {
+            let key = p.blueprint_path.trim().trim_start_matches('/').replace('\\', "/").to_ascii_lowercase();
+            let (mass, energy) = *values.entry(key.clone()).or_insert_with(|| {
+                scd::read_scd_file_ci(&env, &key)
+                    .ok()
+                    .and_then(|(_, b)| blueprint::parse_any_blueprint(&String::from_utf8_lossy(&b)).ok().map(|(_, v)| v))
+                    .and_then(|root| {
+                        let e = root.get("Economy")?;
+                        Some((q(e.get_f64("ReclaimMassMax").unwrap_or(0.0).max(0.0)), q(e.get_f64("ReclaimEnergyMax").unwrap_or(0.0).max(0.0))))
+                    })
+                    .unwrap_or((0, 0))
+            });
+            if mass > 0 || energy > 0 {
+                out.push(MapProp {
+                    pos: (q(p.position[0] as f64), q(p.position[2] as f64)),
+                    mass,
+                    energy,
+                    src_xz: (p.position[0].to_bits(), p.position[2].to_bits()),
+                });
+            }
+        }
+        out
+    }
+
     pub fn load(game_dir: &Path, map: &str) -> Result<Self, String> {
         let files = scenario::find_map(game_dir, map)?;
         let meta = scenario::parse_scenario_file(&files.scenario_path, &files.id)?;
@@ -1914,9 +2420,20 @@ impl MapContext {
             .iter()
             .map(|m| (m.name.clone(), (q(m.position[0]), q(m.position[2]))))
             .collect::<Vec<_>>();
-        if starts.len() < 2 {
+        if starts.len() < 2 && !meta.scenario_type.eq_ignore_ascii_case("campaign") {
             return Err(format!("map '{}' has fewer than 2 start spots", files.id));
         }
+        let mdata = scenario::parse_save_mission_data_file(save).unwrap_or_default();
+        let named_markers = mdata
+            .markers
+            .into_iter()
+            .map(|(k, p)| (k, (q(p[0]), q(p[2]))))
+            .collect();
+        let areas = mdata
+            .areas
+            .into_iter()
+            .map(|(k, r)| (k, (q(r[0]), q(r[1]), q(r[2]), q(r[3]))))
+            .collect();
         let water = scmap.water.has_water.then_some(scmap.water.elevation);
         let mass_points = markers
             .mass_points
@@ -1932,6 +2449,7 @@ impl MapContext {
             .collect();
         let has_water = scmap.water.has_water && naval_grid.blocked_count() < (naval_grid.width * naval_grid.height) as usize;
         let size = (q(scmap.map_width), q(scmap.map_height));
+        let props = Self::load_props(game_dir, &scmap);
         Ok(Self {
             map_id: files.id.clone(),
             map_name: meta.name.clone(),
@@ -1944,6 +2462,9 @@ impl MapContext {
             mass_points,
             hydro_points,
             has_water,
+            props,
+            markers: named_markers,
+            areas,
         })
     }
 }
@@ -1964,6 +2485,25 @@ pub struct Skirmish {
     grid: Arc<PathGrid>,
     naval_grid: Arc<PathGrid>,
     amphib_grid: Arc<PathGrid>,
+    /// Phase 28: terrain-only land / amphibious grids; live walls are stamped on top of
+    /// these into `grid` / `amphib_grid` by [`Skirmish::sync_walls`].
+    base_grid: Arc<PathGrid>,
+    base_amphib: Arc<PathGrid>,
+    base_naval: Arc<PathGrid>,
+    /// Phase 28/29: live structures (walls and, since Phase 29, every structure) per
+    /// land-grid cell (row-major, `base_grid` layout).
+    wall_cells: Vec<u16>,
+    walls_dirty: bool,
+    /// Phase 29: integer terrain heights (flat on synthetic maps).
+    terrain: Arc<HeightField>,
+    /// Phase 34: reclaimable map props still standing (key = index in the map's list).
+    props: BTreeMap<u32, MapProp>,
+    /// Phase 34: `.scmap` position bits of props reclaimed so far (render hides them).
+    props_gone: Vec<(u32, u32)>,
+    /// Phase 48: running mission script (triggers evaluated after every tick's cleanup).
+    mission: Option<Box<crate::mission::MissionRuntime>>,
+    /// Phase 53: recent map pings `(tick, army, kind, position)`, oldest first (≤ 32).
+    pings: VecDeque<(u64, ArmyId, u8, (i64, i64))>,
     flow_cache: FlowFieldCache,
     spatial: Arc<SpatialGrid>,
     spatial_snap: Arc<Vec<UnitSpatialSnap>>,
@@ -1983,10 +2523,16 @@ pub struct Skirmish {
     paths_solved: u64,
     commands_applied: u64,
     commands_rejected: u64,
+    /// Phase 38: (tick, army) of recently applied commands, for the observer APM readout.
+    /// Presentation only: never hashed, trimmed to the last [`APM_WINDOW_TICKS`].
+    apm_log: VecDeque<(u64, ArmyId)>,
     result: Option<GameResult>,
     /// Phase 18 game options (victory condition, unit cap).
     options: GameOptions,
 }
+
+/// Phase 38: rolling window of the observer APM readout (one minute).
+pub const APM_WINDOW_TICKS: u64 = 60 * TICK_HZ;
 
 /// Integer square root (floor) for non-negative `i128`.
 pub fn isqrt(v: i128) -> i64 {
@@ -2034,9 +2580,19 @@ impl Skirmish {
             units: BTreeMap::new(),
             wrecks: BTreeMap::new(),
             projectiles: BTreeMap::new(),
+            wall_cells: vec![0; (grid_arc.width as usize) * (grid_arc.height as usize)],
+            walls_dirty: false,
             grid: Arc::clone(&grid_arc),
             naval_grid: Arc::clone(&grid_arc),
-            amphib_grid: grid_arc,
+            amphib_grid: Arc::clone(&grid_arc),
+            base_grid: Arc::clone(&grid_arc),
+            base_amphib: Arc::clone(&grid_arc),
+            base_naval: grid_arc,
+            terrain: Arc::new(HeightField::flat()),
+            props: BTreeMap::new(),
+            props_gone: Vec::new(),
+            mission: None,
+            pings: VecDeque::new(),
             flow_cache: FlowFieldCache::new(),
             spatial,
             spatial_snap: Arc::new(Vec::new()),
@@ -2055,6 +2611,7 @@ impl Skirmish {
             paths_solved: 0,
             commands_applied: 0,
             commands_rejected: 0,
+            apm_log: VecDeque::new(),
             result: None,
             options: GameOptions::default(),
         };
@@ -2127,11 +2684,7 @@ impl Skirmish {
             &setups,
             seed,
         )?;
-        w.set_domain_grids(
-            map.naval_grid.clone(),
-            map.amphib_grid.clone(),
-            map.hydro_points.clone(),
-        );
+        w.attach_map(map);
         Ok(w)
     }
 
@@ -2143,9 +2696,345 @@ impl Skirmish {
     ) {
         self.naval_grid = Arc::new(naval_grid);
         self.amphib_grid = Arc::new(amphib_grid);
+        self.base_amphib = Arc::clone(&self.amphib_grid);
+        self.base_naval = Arc::clone(&self.naval_grid);
         self.hydro_claims = vec![None; hydro_points.len()];
         self.hydro_points = hydro_points;
         self.flow_cache.clear();
+        if self.wall_cells.iter().any(|&c| c > 0) {
+            // Re-stamp existing walls onto the new amphibious grid.
+            self.wall_cells.iter_mut().for_each(|c| *c = 0);
+            self.walls_dirty = true;
+            self.sync_walls();
+        }
+    }
+
+    /// Phase 29: terrain heights used for line-of-fire and projectile collisions.
+    pub fn set_terrain(&mut self, terrain: HeightField) {
+        self.terrain = Arc::new(terrain);
+    }
+
+    pub fn terrain(&self) -> &HeightField {
+        &self.terrain
+    }
+
+    /// Attaches the naval / amphibious grids, hydro markers and terrain of `map` (the
+    /// common tail of every map-based world construction).
+    pub fn attach_map(&mut self, map: &MapContext) {
+        self.set_domain_grids(map.naval_grid.clone(), map.amphib_grid.clone(), map.hydro_points.clone());
+        self.set_terrain(HeightField::from_scmap(&map.scmap));
+        self.set_props(map.props.clone());
+    }
+
+    /// Phase 53: recent map pings `(tick, army, kind, position)`, oldest first.
+    pub fn pings(&self) -> impl Iterator<Item = &(u64, ArmyId, u8, (i64, i64))> {
+        self.pings.iter()
+    }
+
+    /// Phase 48: runs `mission` in this world from now on.
+    pub fn set_mission(&mut self, mission: crate::mission::Mission) {
+        self.mission = Some(Box::new(crate::mission::MissionRuntime::new(mission)));
+    }
+
+    pub fn mission(&self) -> Option<&crate::mission::MissionRuntime> {
+        self.mission.as_deref()
+    }
+
+    /// Phase 48: the mission script text (stored in replay headers).
+    pub fn mission_source(&self) -> Option<String> {
+        self.mission.as_ref().map(|m| m.mission.source.clone())
+    }
+
+    /// Phase 49: removes an army's tick-0 commander (`no_acu` campaign armies).
+    pub fn remove_initial_commander(&mut self, army: ArmyId) {
+        self.units.retain(|_, u| !(u.army == army && u.role == Role::Commander));
+    }
+
+    /// Phase 49: sets `id`'s hit points to `pct`% (`1..=100`) of its max health.
+    pub fn set_unit_hp_pct(&mut self, id: UnitId, pct: u8) {
+        if let Some(u) = self.units.get_mut(&id) {
+            u.hp = (u.max_hp * i64::from(pct.clamp(1, 100)) / 100).max(1);
+        }
+    }
+
+    /// Phase 49: binds pre-placed extractors/hydros to map resource markers, stamps structure
+    /// footprints, and fills initial storage caps after mission `start` placements.
+    pub fn finalize_mission_start(&mut self) {
+        let snap_sq = (MASS_SNAP as i128) * (MASS_SNAP as i128);
+        let ids: Vec<UnitId> = self.units.keys().copied().collect();
+        for id in ids {
+            let Some((role, pos, has_m, has_h)) = self
+                .units
+                .get(&id)
+                .map(|u| (u.role, (u.pos.x, u.pos.y), u.mass_point.is_some(), u.hydro_point.is_some()))
+            else {
+                continue;
+            };
+            if role == Role::Extractor && !has_m {
+                if let Some((idx, mp)) = self
+                    .mass_points
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, m)| self.mass_claims[*i].is_none() && dist_sq(pos, **m) <= snap_sq)
+                    .min_by_key(|(i, m)| (dist_sq(pos, **m), *i))
+                {
+                    let mp = *mp;
+                    self.mass_claims[idx] = Some(id);
+                    if let Some(u) = self.units.get_mut(&id) {
+                        u.pos = Vec2 { x: mp.0, y: mp.1 };
+                        u.mass_point = Some(idx);
+                    }
+                }
+            } else if role == Role::Hydro && !has_h
+                && let Some((idx, hp)) = self
+                    .hydro_points
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, h)| self.hydro_claims[*i].is_none() && dist_sq(pos, **h) <= snap_sq)
+                    .min_by_key(|(i, h)| (dist_sq(pos, **h), *i))
+            {
+                let hp = *hp;
+                self.hydro_claims[idx] = Some(id);
+                if let Some(u) = self.units.get_mut(&id) {
+                    u.pos = Vec2 { x: hp.0, y: hp.1 };
+                    u.hydro_point = Some(idx);
+                }
+            }
+        }
+        self.sync_walls();
+        self.recompute_caps();
+        for a in &mut self.armies {
+            a.mass = a.mass_cap;
+            a.energy = a.energy_cap;
+        }
+        self.rebuild_spatial();
+    }
+
+    /// Phase 49: marks `army` defeated and clears its remaining units (campaign stage cleanup).
+    pub fn defeat_army(&mut self, army: ArmyId) {
+        let Some(a) = self.armies.get_mut(army as usize) else {
+            return;
+        };
+        if a.defeated {
+            return;
+        }
+        a.defeated = true;
+        let mut lost = 0u32;
+        let mut had_structure = false;
+        self.units.retain(|_, u| {
+            if u.army == army && u.alive {
+                lost += 1;
+                had_structure |= u.role.is_structure();
+                false
+            } else {
+                true
+            }
+        });
+        self.armies[army as usize].units_lost += lost;
+        for slot in &mut self.mass_claims {
+            if slot.is_some_and(|id| !self.units.contains_key(&id)) {
+                *slot = None;
+            }
+        }
+        for slot in &mut self.hydro_claims {
+            if slot.is_some_and(|id| !self.units.contains_key(&id)) {
+                *slot = None;
+            }
+        }
+        if had_structure {
+            self.walls_dirty = true;
+            self.sync_walls();
+        }
+    }
+
+    /// Phase 34: reclaimable props (tests and map attachment).
+    pub fn set_props(&mut self, props: Vec<MapProp>) {
+        self.props = props.into_iter().enumerate().map(|(i, p)| (i as u32, p)).collect();
+        self.props_gone.clear();
+    }
+
+    pub fn props(&self) -> impl Iterator<Item = &MapProp> {
+        self.props.values()
+    }
+
+    /// Phase 34: `.scmap` position bits of every reclaimed prop, in reclaim order.
+    pub fn props_gone(&self) -> &[(u32, u32)] {
+        &self.props_gone
+    }
+
+    /// Phase 34: nearest standing prop to `p` within `max_dist` (ties by index).
+    pub fn prop_at(&self, p: (i64, i64), max_dist: i64) -> Option<(u32, (i64, i64))> {
+        let max_sq = (max_dist as i128) * (max_dist as i128);
+        self.props
+            .iter()
+            .map(|(&i, q)| (dist_sq(p, q.pos), i, q.pos))
+            .filter(|(d, _, _)| *d <= max_sq)
+            .min()
+            .map(|(_, i, pos)| (i, pos))
+    }
+
+    /// Phase 34: what a reclaim order at `p` works on: a wreck (snap 16 m) first, else a prop
+    /// (snap [`PROP_SNAP`]), else a live unit (walls, structures, land units — never
+    /// commanders or aircraft) whose footprint covers `p`.
+    fn reclaim_target(&self, p: (i64, i64)) -> Option<(ReclaimKind, u32, (i64, i64))> {
+        self.wreck_at(p, MASS_SNAP * 2)
+            .map(|(id, wp)| (ReclaimKind::Wreck, id, wp))
+            .or_else(|| self.prop_at(p, PROP_SNAP).map(|(i, pp)| (ReclaimKind::Prop, i, pp)))
+            .or_else(|| {
+                self.units
+                    .values()
+                    .filter(|u| {
+                        u.alive
+                            && u.role != Role::Commander
+                            && u.domain != NavDomain::Air
+                            && u.carried_by.is_none()
+                            && dist_sq(p, (u.pos.x, u.pos.y)) <= ((u.radius + SCALE) as i128).pow(2)
+                    })
+                    .map(|u| (dist_sq(p, (u.pos.x, u.pos.y)), u.id, (u.pos.x, u.pos.y)))
+                    .min()
+                    .map(|(_, id, up)| (ReclaimKind::Unit, id, up))
+            })
+    }
+
+    /// Phase 34: nearest reclaimable mass to `p` within `r` (wrecks, then mass-bearing props).
+    pub fn reclaimable_mass_near(&self, p: (i64, i64), r: i64) -> Option<(i64, i64)> {
+        let max_sq = (r as i128) * (r as i128);
+        self.wreck_at(p, r).map(|(_, wp)| wp).or_else(|| {
+            self.props
+                .iter()
+                .filter(|(_, q)| q.mass > 0)
+                .map(|(&i, q)| (dist_sq(p, q.pos), i, q.pos))
+                .filter(|(d, _, _)| *d <= max_sq)
+                .min()
+                .map(|(_, _, pos)| pos)
+        })
+    }
+
+    /// Phase 28: grid cells covered by a square footprint of half-size `r` centred on `p`.
+    /// Walls block every cell they touch (so 1 m sections form solid lines); other
+    /// structures (Phase 29) block the cells whose centre lies inside their footprint, so
+    /// small structures and the 1 m gaps between buildings do not seal off whole cells.
+    fn footprint_cells(grid: &PathGrid, p: (i64, i64), r: i64, wall: bool) -> Vec<(u32, u32)> {
+        let r = r.max(1);
+        let (x0, z0) = grid.world_to_cell(p.0 - r, p.1 - r);
+        let (x1, z1) = grid.world_to_cell(p.0 + r - 1, p.1 + r - 1);
+        let half = grid.cell_size_milli / 2;
+        let cs = grid.cell_size_milli;
+        let inside = |c: u32, lo: i64, hi: i64| {
+            let m = c as i64 * cs + half;
+            m >= lo && m < hi
+        };
+        (z0..=z1)
+            .flat_map(|z| (x0..=x1).map(move |x| (x, z)))
+            .filter(|&(x, z)| wall || (inside(x, p.0 - r, p.0 + r) && inside(z, p.1 - r, p.1 + r)))
+            .collect()
+    }
+
+    /// Phase 28: whether a live wall section covers the grid cell containing `p`.
+    pub fn is_wall_cell(&self, p: (i64, i64)) -> bool {
+        let g = &self.base_grid;
+        if p.0 < 0 || p.1 < 0 {
+            return false;
+        }
+        let (cx, cz) = g.world_to_cell(p.0, p.1);
+        self.wall_cells
+            .get((cz as usize) * (g.width as usize) + cx as usize)
+            .is_some_and(|&c| c > 0)
+    }
+
+    /// Phase 28: number of grid cells currently blocked by walls.
+    pub fn wall_cell_count(&self) -> usize {
+        self.wall_cells.iter().filter(|&&c| c > 0).count()
+    }
+
+    fn stamp_walls(base: &PathGrid, cells: &[u16]) -> PathGrid {
+        let mut g = base.clone();
+        for (i, _) in cells.iter().enumerate().filter(|(_, c)| **c > 0) {
+            let w = g.width as usize;
+            g.set_blocked((i % w) as u32, (i / w) as u32, true);
+        }
+        g
+    }
+
+    /// Phase 28: re-derives the wall overlay from live `Role::Wall` units when a wall was
+    /// spawned or died. On change, the land / amphibious grids are re-stamped, flow fields
+    /// and cached paths are dropped (so movers re-route around the new layout), and ground
+    /// units standing on a freshly walled cell are pushed to the nearest open cell.
+    /// A no-op (no hash-visible side effects) when the wall layout is unchanged.
+    fn sync_walls(&mut self) {
+        if !self.walls_dirty {
+            return;
+        }
+        self.walls_dirty = false;
+        let mut cells = vec![0u16; self.wall_cells.len()];
+        let w = self.base_grid.width as usize;
+        for u in self.units.values().filter(|u| u.alive && u.role.is_structure() && u.carried_by.is_none()) {
+            for (cx, cz) in Self::footprint_cells(&self.base_grid, (u.pos.x, u.pos.y), u.radius, u.role == Role::Wall) {
+                let c = &mut cells[(cz as usize) * w + cx as usize];
+                *c = c.saturating_add(1);
+            }
+        }
+        if cells == self.wall_cells {
+            return;
+        }
+        let newly: Vec<bool> = cells.iter().zip(&self.wall_cells).map(|(&n, &o)| n > 0 && o == 0).collect();
+        // Bounding box (cells) of newly blocked cells: only paths near it can be invalid.
+        let mut bb: Option<(u32, u32, u32, u32)> = None;
+        for (i, _) in newly.iter().enumerate().filter(|(_, n)| **n) {
+            let (x, z) = ((i % w) as u32, (i / w) as u32);
+            bb = Some(bb.map_or((x, z, x, z), |(a, b, c, d)| (a.min(x), b.min(z), c.max(x), d.max(z))));
+        }
+        self.wall_cells = cells;
+        self.grid = Arc::new(Self::stamp_walls(&self.base_grid, &self.wall_cells));
+        let same_dims = |g: &PathGrid| g.width == self.base_grid.width && g.height == self.base_grid.height;
+        self.amphib_grid = if same_dims(&self.base_amphib) {
+            Arc::new(Self::stamp_walls(&self.base_amphib, &self.wall_cells))
+        } else {
+            Arc::clone(&self.base_amphib)
+        };
+        self.naval_grid = if same_dims(&self.base_naval) {
+            Arc::new(Self::stamp_walls(&self.base_naval, &self.wall_cells))
+        } else {
+            Arc::clone(&self.base_naval)
+        };
+        self.flow_cache.clear();
+        let Some((bx0, bz0, bx1, bz1)) = bb else {
+            return; // only unblocking: existing paths stay valid
+        };
+        let cs = self.base_grid.cell_size_milli;
+        let (lo_x, lo_z) = (bx0 as i64 * cs, bz0 as i64 * cs);
+        let (hi_x, hi_z) = ((bx1 as i64 + 1) * cs, (bz1 as i64 + 1) * cs);
+        let mut evict = Vec::new();
+        for u in self.units.values_mut() {
+            if u.domain == NavDomain::Air {
+                continue;
+            }
+            // Re-route units whose remaining path (incl. current position) overlaps the
+            // newly blocked area's bounding box.
+            let mut ax = (u.pos.x, u.pos.x);
+            let mut az = (u.pos.y, u.pos.y);
+            for &(x, z) in &u.path {
+                ax = (ax.0.min(x), ax.1.max(x));
+                az = (az.0.min(z), az.1.max(z));
+            }
+            if ax.1 >= lo_x - cs && ax.0 <= hi_x + cs && az.1 >= lo_z - cs && az.0 <= hi_z + cs {
+                u.path.clear();
+                u.path_goal = None;
+            }
+            if u.alive && u.speed > 0 && u.carried_by.is_none() {
+                let (cx, cz) = self.base_grid.world_to_cell(u.pos.x, u.pos.y);
+                if newly[(cz as usize) * w + cx as usize] {
+                    evict.push(u.id);
+                }
+            }
+        }
+        for id in evict {
+            let p = self.units[&id].pos;
+            let np = self.walkable_near(id, (p.x, p.y));
+            let u = self.units.get_mut(&id).unwrap();
+            u.pos.x = np.0;
+            u.pos.y = np.1;
+        }
     }
 
     /// Attach or detach a persistent `WorkerPool` for batched A* pathfinding.
@@ -2268,6 +3157,33 @@ impl Skirmish {
     }
     pub fn commands_rejected(&self) -> u64 {
         self.commands_rejected
+    }
+
+    /// Phase 38: actions per minute of `army` over the last [`APM_WINDOW_TICKS`] (or the
+    /// elapsed game time if shorter). Counts accepted commands only.
+    pub fn apm(&self, army: ArmyId) -> u32 {
+        let cutoff = self.tick.saturating_sub(APM_WINDOW_TICKS);
+        let n = self.apm_log.iter().filter(|&&(t, a)| a == army && t >= cutoff).count() as u64;
+        let window = self.tick.clamp(TICK_HZ * 10, APM_WINDOW_TICKS);
+        (n * 60 * TICK_HZ / window) as u32
+    }
+
+    /// Phase 38: live observer summary of one army: (mobile unit count, structure count,
+    /// army value = summed mass cost of living mobile non-commander units, in whole mass).
+    pub fn army_summary(&self, army: ArmyId) -> (u32, u32, i64) {
+        let (mut mobile, mut structs, mut value) = (0u32, 0u32, 0i64);
+        for u in self.units.values().filter(|u| u.alive && u.army == army) {
+            if u.role.is_structure() {
+                structs += 1;
+            } else {
+                mobile += 1;
+                // The commander is priceless (and would swamp the comparison): not counted.
+                if u.role != Role::Commander {
+                    value += self.catalog.get(&u.type_id).map_or(0, |t| t.cost_mass);
+                }
+            }
+        }
+        (mobile, structs, value / SCALE)
     }
     pub fn result(&self) -> Option<GameResult> {
         self.result
@@ -2598,18 +3514,21 @@ impl Skirmish {
         if check_grid.is_blocked(cx, cy) {
             return false;
         }
-        let margin = SCALE;
+        // Phase 28: wall sections may sit flush against each other and other structures.
+        let is_wall = t.role == Role::Wall;
+        let margin_with = |other_wall: bool| if is_wall || other_wall { 0 } else { SCALE };
         let overlaps_structure = self.units().any(|u| {
             u.role.is_structure() && {
-                let lim = (u.radius + r + margin) as i128;
+                let lim = (u.radius + r + margin_with(u.role == Role::Wall)) as i128;
                 dist_sq((u.pos.x, u.pos.y), (x, y)) < lim * lim
             }
         });
         let overlaps_site = self.units().any(|u| {
             u.build.as_ref().is_some_and(|j| {
                 u.role.is_builder() && {
-                    let other = self.catalog.get(&j.unit_type).map(|t| t.radius).unwrap_or(0);
-                    let lim = (other + r + margin) as i128;
+                    let other_t = self.catalog.get(&j.unit_type);
+                    let other = other_t.map(|t| t.radius).unwrap_or(0);
+                    let lim = (other + r + margin_with(other_t.is_some_and(|t| t.role == Role::Wall))) as i128;
                     dist_sq((j.x, j.y), (x, y)) < lim * lim
                 }
             })
@@ -2657,6 +3576,11 @@ impl Skirmish {
             && self.apply_command(army, cmd);
         if ok {
             self.commands_applied += 1;
+            self.apm_log.push_back((self.tick, army));
+            let cutoff = self.tick.saturating_sub(APM_WINDOW_TICKS);
+            while self.apm_log.front().is_some_and(|&(t, _)| t < cutoff) {
+                self.apm_log.pop_front();
+            }
         } else {
             self.commands_rejected += 1;
         }
@@ -2918,7 +3842,7 @@ impl Skirmish {
                 let Some(b) = self.unit(builder) else {
                     return false;
                 };
-                if b.army != army || !b.role.is_builder() || b.carried_by.is_some() {
+                if b.army != army || !self.is_constructor(b) || b.carried_by.is_some() {
                     return false;
                 }
                 let Some(fi) = self.army(army).map(|a| a.faction) else {
@@ -2962,7 +3886,7 @@ impl Skirmish {
                 let fi = self.army(army).map(|a| a.faction).unwrap_or(usize::MAX);
                 let ok = self.unit(factory).is_some_and(|u| {
                     u.army == army
-                        && u.role.is_factory()
+                        && self.is_producer(u)
                         && (self.catalog.faction_can_produce(fi, &unit_type)
                             || self.catalog.builder_can_produce(&u.type_id, &unit_type))
                 });
@@ -2978,8 +3902,9 @@ impl Skirmish {
             }
             Command::Rally { factory, x, y } => {
                 let p = self.clamp_to_map(x, y);
+                let producer = self.unit(factory).is_some_and(|u| self.is_producer(u));
                 match self.units.get_mut(&factory) {
-                    Some(u) if u.alive && u.army == army && u.role.is_factory() => {
+                    Some(u) if u.alive && u.army == army && producer => {
                         u.rally = Some(p);
                         true
                     }
@@ -3137,6 +4062,134 @@ impl Skirmish {
                 }
                 true
             }
+            Command::Dock { units, staging, queue } => {
+                if !self.is_staging_of(staging, army) {
+                    return false;
+                }
+                let mut ids: Vec<UnitId> = units
+                    .iter()
+                    .copied()
+                    .filter(|&id| self.unit(id).is_some_and(|u| u.army == army && u.domain == NavDomain::Air && u.speed > 0 && u.carried_by.is_none()))
+                    .collect();
+                ids.sort_unstable();
+                ids.dedup();
+                if ids.is_empty() {
+                    return false;
+                }
+                for id in ids {
+                    self.push_order(id, UnitOrder::Dock(staging), queue);
+                }
+                true
+            }
+            Command::SetFireState { units, state } => {
+                let mut any = false;
+                for id in units {
+                    if let Some(u) = self.units.get_mut(&id).filter(|u| u.army == army && u.alive) {
+                        u.fire_state = state;
+                        any = true;
+                    }
+                }
+                any
+            }
+            Command::SetBuildPaused { units, paused } => {
+                let mut any = false;
+                for id in units {
+                    if let Some(u) = self.units.get_mut(&id).filter(|u| u.army == army && u.alive) {
+                        u.build_paused = paused;
+                        any = true;
+                    }
+                }
+                any
+            }
+            Command::AttackGround { units, x, y, queue } => {
+                let p = self.clamp_to_map(x, y);
+                let mut v: Vec<UnitId> = units
+                    .iter()
+                    .copied()
+                    .filter(|id| self.unit(*id).is_some_and(|u| u.army == army && u.can_fire_surface && u.carried_by.is_none()))
+                    .collect();
+                v.sort_unstable();
+                v.dedup();
+                for id in &v {
+                    self.push_order(*id, UnitOrder::AttackGround { x: p.0, y: p.1 }, queue);
+                }
+                !v.is_empty()
+            }
+            Command::Guard { units, target, queue } => {
+                if !self.unit(target).is_some_and(|t| t.alive && self.are_allies(army, t.army)) {
+                    return false;
+                }
+                let mut v: Vec<UnitId> = units
+                    .iter()
+                    .copied()
+                    .filter(|&id| id != target && self.unit(id).is_some_and(|u| u.army == army && u.speed > 0 && u.carried_by.is_none()))
+                    .collect();
+                v.sort_unstable();
+                v.dedup();
+                for id in &v {
+                    self.push_order(*id, UnitOrder::Guard(target), queue);
+                }
+                !v.is_empty()
+            }
+            Command::Ping { kind, x, y } => {
+                if kind > 2 {
+                    return false;
+                }
+                let p = self.clamp_to_map(x, y);
+                if self.pings.len() >= 32 {
+                    self.pings.pop_front();
+                }
+                self.pings.push_back((self.tick, army, kind, p));
+                true
+            }
+            Command::MoveWaypoint { units, index, x, y } => {
+                let p = self.clamp_to_map(x, y);
+                let mut any = false;
+                for id in units {
+                    let Some(u) = self.units.get_mut(&id).filter(|u| u.army == army && u.alive) else { continue };
+                    let Some(o) = u.orders.get_mut(index as usize) else { continue };
+                    match o {
+                        UnitOrder::Move { x, y } | UnitOrder::AttackMove { x, y } | UnitOrder::Patrol { x, y } => {
+                            (*x, *y) = p;
+                            any = true;
+                            if index == 0 {
+                                u.path.clear();
+                                u.path_goal = None;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                any
+            }
+            Command::Ferry { transports, from, to, queue } => {
+                let (from, to) = (self.clamp_to_map(from.0, from.1), self.clamp_to_map(to.0, to.1));
+                let mut v: Vec<UnitId> = transports
+                    .iter()
+                    .copied()
+                    .filter(|id| {
+                        self.unit(*id).is_some_and(|u| {
+                            u.army == army && u.carried_by.is_none() && self.catalog.get(&u.type_id).is_some_and(|t| t.ext.transport.is_some())
+                        })
+                    })
+                    .collect();
+                v.sort_unstable();
+                v.dedup();
+                for id in &v {
+                    self.push_order(*id, UnitOrder::Ferry { from, to }, queue);
+                }
+                !v.is_empty()
+            }
+            Command::SetAutoRefuel { units, enabled } => {
+                let mut any = false;
+                for id in units {
+                    if let Some(u) = self.units.get_mut(&id).filter(|u| u.army == army && u.alive) {
+                        u.auto_refuel = enabled;
+                        any = true;
+                    }
+                }
+                any
+            }
             Command::Unload { transports, x, y, queue } => {
                 let p = self.clamp_to_map(x, y);
                 let mut ids = transports;
@@ -3180,10 +4233,11 @@ impl Skirmish {
                 ids.sort_unstable();
                 ids.dedup();
                 for id in ids {
+                    let producer = self.unit(id).is_some_and(|u| self.is_producer(u));
                     if let Some(u) = self.units.get_mut(&id)
                         && u.alive
                         && u.army == army
-                        && u.role.is_factory()
+                        && producer
                     {
                         u.repeat_queue = enabled;
                         any = true;
@@ -3192,10 +4246,11 @@ impl Skirmish {
                 any
             }
             Command::CancelProduce { factory, unit_type, count } => {
+                let producer = self.unit(factory).is_some_and(|u| self.is_producer(u));
                 let Some(u) = self.units.get_mut(&factory) else {
                     return false;
                 };
-                if !u.alive || u.army != army || !u.role.is_factory() || count == 0 {
+                if !u.alive || u.army != army || !producer || count == 0 {
                     return false;
                 }
                 let mut left = count.min(500);
@@ -3231,25 +4286,27 @@ impl Skirmish {
 
     pub fn spawn_unit(&mut self, army: ArmyId, type_id: &str, pos: (i64, i64)) -> Option<UnitId> {
         let t = self.catalog.get(type_id)?.clone();
+        // Phase 32: a finished egg hatches straight into its unit.
+        if let Some(h) = t.ext.hatch.as_deref()
+            && h != t.id
+            && self.catalog.get(h).is_some()
+        {
+            return self.spawn_unit(army, h, pos);
+        }
         let id = self.next_id;
         self.next_id += 1;
         let weapons: Vec<WeaponState> = t
             .weapons
             .iter()
-            .map(|w| WeaponState {
-                damage: w.damage,
-                range_sq: (w.range as i128) * (w.range as i128),
-                reset: w.reset,
-                cooldown: 0,
-                splash_radius: w.splash_radius,
-                muzzle_velocity: w.muzzle_velocity,
-                anti_air: w.anti_air,
-                anti_surface: w.anti_surface,
-            })
+            .map(WeaponState::from_type)
             .collect();
         let can_aa = weapons.iter().any(|w| w.anti_air);
         let can_surf = weapons.iter().any(|w| w.anti_surface);
         let shield_init = t.shield_max_hp;
+        if t.role.is_structure() {
+            self.walls_dirty = true;
+        }
+        let spawn_pods = t.ext.pods.clone();
         self.units.insert(
             id,
             Unit {
@@ -3308,9 +4365,134 @@ impl Skirmish {
                 intercept_cd: 0,
                 still_ticks: 0,
                 omni_mask: 0,
+                height: t.size[1].max(SCALE / 4),
+                vel: (0, 0),
+                fuel: t.ext.fuel_ticks,
+                auto_refuel: t.ext.fuel_ticks > 0,
+                drone_of: None,
+                pod_timer: 0,
+                stunned: 0,
+                untargetable: t.ext.untargetable,
+                fire_state: FireState::FireAtWill,
+                build_paused: false,
+                eco: [t.mass_per_tick, t.energy_per_tick, t.storage_mass, t.storage_energy],
             },
         );
+        // Phase 31: a finished engineering station comes with its pod drones.
+        for pod in spawn_pods {
+            self.spawn_pod(id, &pod);
+        }
+        // Phase 33: an orbital launch centre puts its satellite into orbit.
+        if let Some(sat) = t.ext.satellite.clone() {
+            self.spawn_pod(id, &sat);
+        }
         Some(id)
+    }
+
+    /// Phase 31: spawns pod drone `pod_type` docked at station `station`.
+    fn spawn_pod(&mut self, station: UnitId, pod_type: &str) -> Option<UnitId> {
+        let (army, pos) = self.units.get(&station).map(|s| (s.army, (s.pos.x, s.pos.y)))?;
+        let pid = self.spawn_unit(army, pod_type, pos)?;
+        let p = self.units.get_mut(&pid).unwrap();
+        p.drone_of = Some(station);
+        p.auto_refuel = false;
+        Some(pid)
+    }
+
+    /// Phase 31: live pod drones of station `sid`.
+    pub fn pods_of(&self, sid: UnitId) -> Vec<UnitId> {
+        self.units.values().filter(|u| u.alive && u.drone_of == Some(sid)).map(|u| u.id).collect()
+    }
+
+    /// Phase 31: work an engineering station at `p` with radius `r` should pick up for
+    /// `army`: the nearest allied construction (builder site, factory, in-place upgrade) in
+    /// range, else the nearest damaged allied surface unit — ties by id.
+    fn station_target(&self, sid: UnitId, army: ArmyId, p: (i64, i64), r: i64) -> Option<UnitOrder> {
+        let lim = (r as i128) * (r as i128);
+        let mut assist: Option<(i128, UnitId)> = None;
+        let mut repair: Option<(i128, UnitId)> = None;
+        for u in self.units.values() {
+            if !u.alive || u.id == sid || u.carried_by.is_some() || u.drone_of.is_some() || !self.are_allies(army, u.army) {
+                continue;
+            }
+            if let Some(j) = &u.build {
+                let site = if u.role.is_builder() { (j.x, j.y) } else { (u.pos.x, u.pos.y) };
+                let d = dist_sq(p, site);
+                if d <= lim && assist.is_none_or(|(bd, bid)| (d, u.id) < (bd, bid)) {
+                    assist = Some((d, u.id));
+                }
+            } else if u.hp < u.max_hp && u.domain != NavDomain::Air {
+                let d = dist_sq(p, (u.pos.x, u.pos.y));
+                if d <= lim && repair.is_none_or(|(bd, bid)| (d, u.id) < (bd, bid)) {
+                    repair = Some((d, u.id));
+                }
+            }
+        }
+        assist.map(|(_, id)| UnitOrder::Assist(id)).or(repair.map(|(_, id)| UnitOrder::Repair(id)))
+    }
+
+    /// Phase 31 engineering stations (ascending id): pods die with their station; stations
+    /// rebuild missing pods (pod build time at the station's rate, paid on completion);
+    /// every second an idle-or-finished station (or each of its pods) re-targets the nearest
+    /// allied construction / damaged unit in its radius. Pods fly out to work and return to
+    /// the station when idle; work outside the radius is dropped.
+    fn step_eng_stations(&mut self) {
+        if !self.units.values().any(|u| u.role == Role::EngStation || u.drone_of.is_some()) {
+            return;
+        }
+        let ids: Vec<UnitId> = self.units.keys().copied().collect();
+        for &id in &ids {
+            let Some(parent) = self.units[&id].drone_of else { continue };
+            if !self.units.get(&parent).is_some_and(|s| s.alive) {
+                self.units.get_mut(&id).unwrap().hp = 0;
+            }
+        }
+        let retarget = self.tick.is_multiple_of(TICK_HZ);
+        for &sid in &ids {
+            let Some(s) = self.units.get(&sid).filter(|s| s.alive && s.role == Role::EngStation && s.carried_by.is_none()) else {
+                continue;
+            };
+            let (army, sp, upgrading) = (s.army, (s.pos.x, s.pos.y), matches!(s.orders.front(), Some(UnitOrder::Upgrade(_))));
+            let Some(t) = self.catalog.get(&s.type_id) else { continue };
+            let (pods_spec, radius, rate) = (t.ext.pods.clone(), t.build_range, t.build_rate.max(1));
+            // Rebuild missing pods.
+            let live = self.pods_of(sid);
+            if !upgrading && live.len() < pods_spec.len() {
+                let pod_type = pods_spec[live.len()].clone();
+                let (work, cm, ce) = self.catalog.get(&pod_type).map_or((1, 0, 0), |p| (p.build_work, p.cost_mass, p.cost_energy));
+                let st = self.units.get_mut(&sid).unwrap();
+                st.pod_timer = st.pod_timer.saturating_add(1);
+                let a = &self.armies[army as usize];
+                if st.pod_timer as i64 * rate >= work && a.mass >= cm && a.energy >= ce {
+                    st.pod_timer = 0;
+                    self.armies[army as usize].mass -= cm;
+                    self.armies[army as usize].energy -= ce;
+                    self.spawn_pod(sid, &pod_type);
+                }
+            }
+            if !retarget || upgrading {
+                continue;
+            }
+            let target = self.station_target(sid, army, sp, radius);
+            let workers: Vec<UnitId> = if pods_spec.is_empty() { vec![sid] } else { self.pods_of(sid) };
+            for wid in workers {
+                let w = self.units.get_mut(&wid).unwrap();
+                let busy = matches!(w.orders.front(), Some(UnitOrder::Assist(t) | UnitOrder::Repair(t)) if Some(*t) == target.as_ref().and_then(|o| match o { UnitOrder::Assist(x) | UnitOrder::Repair(x) => Some(*x), _ => None }));
+                if busy {
+                    continue;
+                }
+                w.orders.clear();
+                w.path.clear();
+                w.path_goal = None;
+                match &target {
+                    Some(o) => w.orders.push_back(o.clone()),
+                    None if wid != sid && dist_sq((w.pos.x, w.pos.y), sp) > (2 * SCALE as i128).pow(2) => {
+                        w.orders.push_back(UnitOrder::Move { x: sp.0, y: sp.1 });
+                    }
+                    None => {}
+                }
+            }
+        }
     }
 
     pub fn rebuild_spatial(&mut self) {
@@ -3327,6 +4509,9 @@ impl Skirmish {
                 radius: u.radius,
                 speed: u.speed,
                 is_struct: u.role.is_structure(),
+                is_wall: u.role == Role::Wall,
+                height: u.height,
+                untargetable: u.untargetable,
                 can_fire_aa: u.can_fire_aa,
                 can_fire_surface: u.can_fire_surface,
                 max_range: u.max_range,
@@ -3347,10 +4532,8 @@ impl Skirmish {
     fn recompute_caps(&mut self) {
         let mut caps = vec![(0i64, 0i64); self.armies.len()];
         for u in self.units.values().filter(|u| u.alive) {
-            if let Some(t) = self.catalog.get(&u.type_id) {
-                caps[u.army as usize].0 += t.storage_mass;
-                caps[u.army as usize].1 += t.storage_energy;
-            }
+            caps[u.army as usize].0 += u.eco[2];
+            caps[u.army as usize].1 += u.eco[3];
         }
         for (a, (m, e)) in self.armies.iter_mut().zip(caps) {
             a.mass_cap = m;
@@ -3401,21 +4584,39 @@ impl Skirmish {
         self.tick += 1;
         let _ = self.next_rng();
         { let _p = scope("sim.commands"); self.apply_commands(); }
+        for u in self.units.values_mut() {
+            u.stunned = u.stunned.saturating_sub(1);
+        }
         if self.tick == 1 || self.tick % 10 == 0 {
             let _p = scope("sim.adjacency");
             self.recompute_adjacency();
         }
         { let _p = scope("sim.economy"); self.step_income(); self.step_shields(); self.step_enhancements(); self.step_silos(); }
-        { let _p = scope("sim.construction"); self.step_construction(); }
+        { let _p = scope("sim.construction"); self.step_eng_stations(); self.step_construction(); self.sync_walls(); }
         { let _p = scope("sim.spatial"); self.rebuild_spatial(); }
+        // Phase 29: per-tick ground velocity (for target leading) = position delta over the
+        // movement, separation and transport passes.
+        for u in self.units.values_mut() {
+            u.vel = (u.pos.x, u.pos.y);
+        }
         { let _p = scope("sim.movement"); self.step_movement(); }
         { let _p = scope("sim.separation"); self.step_separation(); }
-        { let _p = scope("sim.transport"); self.step_transport(); }
+        { let _p = scope("sim.transport"); self.step_transport(); self.step_ferries(); self.step_staging(); }
+        for u in self.units.values_mut() {
+            u.vel = (u.pos.x - u.vel.0, u.pos.y - u.vel.1);
+        }
         { let _p = scope("sim.intel"); self.step_intel(); }
         { let _p = scope("sim.spatial"); self.rebuild_spatial(); }
         { let _p = scope("sim.weapons"); self.step_weapons(); }
         { let _p = scope("sim.projectiles"); self.step_projectiles(); }
         { let _p = scope("sim.cleanup"); self.step_cleanup(); }
+        if let Some(mut m) = self.mission.take() {
+            m.step(self);
+            if let Some(r) = m.outcome {
+                self.result = Some(r);
+            }
+            self.mission = Some(m);
+        }
         { let _p = scope("sim.spatial"); self.rebuild_spatial(); }
     }
 
@@ -3429,17 +4630,25 @@ impl Skirmish {
     }
 
     fn step_income(&mut self) {
-        self.recompute_caps();
+        // Storage caps and income in one pass over the cached per-unit economy.
+        let mut caps = vec![(0i64, 0i64); self.armies.len()];
         let mut income = vec![(0i64, 0i64); self.armies.len()];
         for u in self.units.values().filter(|u| u.alive) {
-            if let Some(t) = self.catalog.get(&u.type_id) {
+            let a = u.army as usize;
+            caps[a].0 += u.eco[2];
+            caps[a].1 += u.eco[3];
+            if u.eco[0] != 0 || u.eco[1] != 0 {
                 let mult = 100 + u.adjacency_bonus_pct;
-                income[u.army as usize].0 += t.mass_per_tick * mult / 100;
-                income[u.army as usize].1 += t.energy_per_tick * mult / 100;
+                income[a].0 += u.eco[0] * mult / 100;
+                income[a].1 += u.eco[1] * mult / 100;
             }
             // Phase 18: Resource Allocation enhancements.
-            income[u.army as usize].0 += u.enh.mass_per_tick;
-            income[u.army as usize].1 += u.enh.energy_per_tick;
+            income[a].0 += u.enh.mass_per_tick;
+            income[a].1 += u.enh.energy_per_tick;
+        }
+        for (a, (m, e)) in self.armies.iter_mut().zip(caps) {
+            a.mass_cap = m;
+            a.energy_cap = e;
         }
         let mut overflow = vec![(0i64, 0i64); self.armies.len()];
         for (i, (a, (m, e))) in self.armies.iter_mut().zip(income).enumerate() {
@@ -3495,7 +4704,7 @@ impl Skirmish {
     }
 
     fn step_shields(&mut self) {
-        let ids: Vec<UnitId> = self.units.keys().copied().collect();
+        let ids: Vec<UnitId> = self.units.values().filter(|u| u.shield_max_hp > 0).map(|u| u.id).collect();
         for id in ids {
             let (army, max_sh, upkeep, regen, on, cur_sh, cd) = match self.units.get(&id) {
                 Some(u) if u.alive && u.shield_max_hp > 0 => (
@@ -3665,21 +4874,17 @@ impl Skirmish {
             u.shield_hp = new_t.shield_max_hp;
         }
         u.max_range = new_t.max_range();
+        u.height = new_t.size[1].max(SCALE / 4);
+        u.eco = [new_t.mass_per_tick, new_t.energy_per_tick, new_t.storage_mass, new_t.storage_energy];
+        if new_t.role.is_structure() {
+            self.walls_dirty = true;
+        }
         u.vision_radius = new_t.vision_radius;
         u.radar_radius = new_t.radar_radius;
         u.weapons = new_t
             .weapons
             .iter()
-            .map(|w| WeaponState {
-                damage: w.damage,
-                range_sq: (w.range as i128) * (w.range as i128),
-                reset: w.reset,
-                cooldown: 0,
-                splash_radius: w.splash_radius,
-                muzzle_velocity: w.muzzle_velocity,
-                anti_air: w.anti_air,
-                anti_surface: w.anti_surface,
-            })
+            .map(WeaponState::from_type)
             .collect();
         u.can_fire_aa = u.weapons.iter().any(|w| w.anti_air);
         u.can_fire_surface = u.weapons.iter().any(|w| w.anti_surface);
@@ -3802,6 +5007,7 @@ impl Skirmish {
         st.health_bonus = health_bonus;
 
         let old_cd: Vec<u32> = u.weapons.iter().map(|w| w.cooldown).collect();
+        let old_yaw: Vec<i64> = u.weapons.iter().map(|w| w.yaw).collect();
         u.weapons = t
             .weapons
             .iter()
@@ -3825,9 +5031,8 @@ impl Skirmish {
                     reset,
                     cooldown: old_cd.get(i).copied().unwrap_or(0).min(reset),
                     splash_radius: splash,
-                    muzzle_velocity: w.muzzle_velocity,
-                    anti_air: w.anti_air,
-                    anti_surface: w.anti_surface,
+                    yaw: old_yaw.get(i).copied().unwrap_or(0),
+                    ..WeaponState::from_type(w)
                 }
             })
             .collect();
@@ -3888,7 +5093,7 @@ impl Skirmish {
         let mut assist_bonus: BTreeMap<UnitId, i64> = BTreeMap::new();
         for &id in &ids {
             let Some(u) = self.units.get(&id) else { continue };
-            if !u.alive || !u.role.is_builder() || u.carried_by.is_some() {
+            if !u.alive || !(u.role.is_builder() || u.role == Role::EngStation) || u.carried_by.is_some() {
                 continue;
             }
             if let Some(UnitOrder::Assist(target_id)) = u.orders.front()
@@ -3903,6 +5108,18 @@ impl Skirmish {
         }
 
         for id in ids {
+            // Phase 54: plain mobile units with nothing to build skip the whole pass.
+            if self.units.get(&id).is_some_and(|u| {
+                u.role == Role::Mobile
+                    && u.build.is_none()
+                    && u.production.is_empty()
+                    && !matches!(
+                        u.orders.front(),
+                        Some(UnitOrder::Build { .. } | UnitOrder::Repair(_) | UnitOrder::Assist(_) | UnitOrder::Reclaim { .. } | UnitOrder::Upgrade(_) | UnitOrder::Enhance(_))
+                    )
+            }) {
+                continue;
+            }
             let (alive, role, army, pos, radius, rate, head, adj, silocnt, type_id) =
                 match self.units.get(&id) {
                     Some(u) => (
@@ -3919,7 +5136,7 @@ impl Skirmish {
                     ),
                     None => continue,
                 };
-            if !alive {
+            if !alive || self.units[&id].stunned > 0 || self.units[&id].build_paused {
                 continue;
             }
 
@@ -3934,6 +5151,7 @@ impl Skirmish {
                     let is_nuke = ut.is_some_and(|t| t.tier >= 3);
                     let dmg = ut.map(|t| t.missile_damage).unwrap_or(6_000 * SCALE);
                     let spl = ut.map(|t| t.missile_splash).unwrap_or(4 * SCALE);
+                    let missile_stun = ut.and_then(|t| t.missile_stun);
                     self.spawn_projectile_full(
                         army,
                         Vec2 { x: pos.0, y: pos.1 },
@@ -3946,6 +5164,12 @@ impl Skirmish {
                         is_nuke,
                         false,
                     );
+                    if let Some((ticks, radius)) = missile_stun
+                        && let Some(p) = self.projectiles.get_mut(&(self.next_projectile_id - 1))
+                    {
+                        p.stun_ticks = ticks;
+                        p.stun_radius = radius;
+                    }
                     self.emit_event(SimEvent::MissileLaunched {
                         pos: (pos.0, pos.1, 4 * SCALE),
                         is_nuke,
@@ -3981,7 +5205,9 @@ impl Skirmish {
             };
             let assisted_rate = build_rate * (100 + adj) / 100 + assist_bonus.get(&id).copied().unwrap_or(0);
 
-            if role.is_factory() {
+            let (mobile_factory, mobile_builder) =
+                self.catalog.get(&type_id).map_or((false, false), |t| (t.ext.mobile_factory, t.ext.mobile_builder));
+            if role.is_factory() || mobile_factory {
                 if self.units[&id].build.is_none() && !capped(&cap_counts, army) {
                     let next = self.units.get_mut(&id).unwrap().production.pop_front();
                     if let Some(tid) = next {
@@ -4005,6 +5231,11 @@ impl Skirmish {
                         f.production.push_back(job.unit_type.clone());
                     }
                     if let Some(nid) = self.spawn_unit(army, &job.unit_type, exit) {
+                        // Phase 29: roll off onto open ground when the exit is built over.
+                        let free = self.walkable_near(nid, exit);
+                        if let Some(nu) = self.units.get_mut(&nid) {
+                            nu.pos = Vec2 { x: free.0, y: free.1 };
+                        }
                         self.armies[army as usize].units_built += 1;
                         let rally = self.units[&id].rally;
                         let u = self.units.get_mut(&nid).unwrap();
@@ -4025,7 +5256,7 @@ impl Skirmish {
                     }
                     self.units.get_mut(&id).unwrap().build = Some(job);
                 }
-            } else if role.is_builder() {
+            } else if role.is_builder() || role == Role::EngStation || mobile_builder {
                 match head {
                     Some(UnitOrder::Build { unit_type, x, y }) => {
                         let target_r = self.catalog.get(&unit_type).map(|t| t.radius).unwrap_or(0);
@@ -4110,20 +5341,65 @@ impl Skirmish {
                     }
                     Some(UnitOrder::Reclaim { x, y }) => {
                         let reach = build_range + 4 * SCALE;
-                        if let Some((wid, wpos)) = self.wreck_at((x, y), MASS_SNAP * 2)
-                            && dist_sq(pos, wpos) <= (reach as i128) * (reach as i128)
-                        {
-                            let gain = (build_rate.max(1) * 400).max(SCALE / 5);
-                            let w = self.wrecks.get_mut(&wid).unwrap();
-                            let harvested = w.mass_left.min(gain);
-                            w.mass_left -= harvested;
-                            let a = &mut self.armies[army as usize];
-                            a.mass = (a.mass + harvested).min(a.mass_cap.max(a.mass));
-                            if w.mass_left <= 0 {
-                                self.wrecks.remove(&wid);
+                        match self.reclaim_target((x, y)) {
+                            Some((ReclaimKind::Wreck, wid, wpos)) if dist_sq(pos, wpos) <= (reach as i128) * (reach as i128) => {
+                                let gain = (build_rate.max(1) * 400).max(SCALE / 5);
+                                let w = self.wrecks.get_mut(&wid).unwrap();
+                                let harvested = w.mass_left.min(gain);
+                                w.mass_left -= harvested;
+                                let a = &mut self.armies[army as usize];
+                                a.mass = (a.mass + harvested).min(a.mass_cap.max(a.mass));
+                                if w.mass_left <= 0 {
+                                    self.wrecks.remove(&wid);
+                                }
                             }
-                        } else if self.wreck_at((x, y), MASS_SNAP * 2).is_none() {
-                            self.units.get_mut(&id).unwrap().orders.pop_front();
+                            Some((ReclaimKind::Unit, tid, tpos)) if tid != id && dist_sq(pos, tpos) <= (reach as i128) * (reach as i128) => {
+                                // Phase 34: a live unit drains back into its mass cost; fully
+                                // reclaimed units vanish (no wreck, no kill credit).
+                                let gain = (build_rate.max(1) * 400).max(SCALE / 5);
+                                let cost = self.units.get(&tid).and_then(|t| self.catalog.get(&t.type_id)).map_or(SCALE, |t| t.cost_mass.max(SCALE));
+                                let t = self.units.get_mut(&tid).unwrap();
+                                let hp_loss = ((t.max_hp as i128 * gain as i128) / cost as i128).max(1) as i64;
+                                let taken = hp_loss.min(t.hp);
+                                let value = ((cost as i128 * taken as i128) / t.max_hp.max(1) as i128) as i64;
+                                t.hp -= taken;
+                                let gone = t.hp <= 0;
+                                if gone {
+                                    t.alive = false;
+                                    t.hp = 0;
+                                }
+                                let structure = t.role.is_structure();
+                                let a = &mut self.armies[army as usize];
+                                a.mass = (a.mass + value).min(a.mass_cap.max(a.mass));
+                                if gone {
+                                    self.units.get_mut(&id).unwrap().orders.pop_front();
+                                    if structure {
+                                        self.walls_dirty = true;
+                                    }
+                                }
+                            }
+                            Some((ReclaimKind::Prop, pid, ppos)) if dist_sq(pos, ppos) <= (reach as i128) * (reach as i128) => {
+                                // Phase 34: props drain mass and energy at the wreck rate
+                                // (energy ten times faster, matching its lower value).
+                                let gain = (build_rate.max(1) * 400).max(SCALE / 5);
+                                let pr = self.props.get_mut(&pid).unwrap();
+                                let (dm, de) = (pr.mass.min(gain), pr.energy.min(gain * 10));
+                                pr.mass -= dm;
+                                pr.energy -= de;
+                                let done = pr.mass <= 0 && pr.energy <= 0;
+                                let src = pr.src_xz;
+                                let a = &mut self.armies[army as usize];
+                                a.mass = (a.mass + dm).min(a.mass_cap.max(a.mass));
+                                a.energy = (a.energy + de).min(a.energy_cap.max(a.energy));
+                                if done {
+                                    self.props.remove(&pid);
+                                    self.props_gone.push(src);
+                                }
+                            }
+                            Some(_) => {}
+                            None => {
+                                self.units.get_mut(&id).unwrap().orders.pop_front();
+                            }
                         }
                     }
                     Some(UnitOrder::Repair(tid)) => {
@@ -4298,6 +5574,7 @@ impl Skirmish {
         let lim = (radius as i128) * (radius as i128);
         let mut best_mobile: Option<(i128, UnitId)> = None;
         let mut best_struct: Option<(i128, UnitId)> = None;
+        let mut best_wall: Option<(i128, UnitId)> = None;
         spatial
             .for_each_enemy_in_radius(p.0, p.1, radius + 6 * SCALE, team, |idx| {
                 let u = &snap[idx as usize];
@@ -4312,7 +5589,9 @@ impl Skirmish {
                 if d > lim {
                     return;
                 }
-                let slot = if u.is_struct {
+                let slot = if u.is_wall {
+                    &mut best_wall
+                } else if u.is_struct {
                     &mut best_struct
                 } else {
                     &mut best_mobile
@@ -4321,7 +5600,7 @@ impl Skirmish {
                     *slot = Some((d, u.id));
                 }
             });
-        best_mobile.or(best_struct).map(|(_, id)| id)
+        best_mobile.or(best_struct).or(best_wall).map(|(_, id)| id)
     }
 
     /// Attack-move/patrol acquisition for every eligible mover, solved up front on the pool.
@@ -4385,7 +5664,7 @@ impl Skirmish {
             let Some(u) = self.units.get(&id) else {
                 return None;
             };
-            if !u.alive || u.speed <= 0 || u.carried_by.is_some() {
+            if !u.alive || u.speed <= 0 || u.carried_by.is_some() || u.stunned > 0 {
                 return None;
             }
             let Some(head) = u.orders.front().cloned() else {
@@ -4405,7 +5684,9 @@ impl Skirmish {
                 }
                 UnitOrder::AttackMove { x, y } | UnitOrder::Patrol { x, y } => {
                     let acquire = u.max_range + ACQUIRE_BONUS;
+                    let holding = u.fire_state != FireState::FireAtWill;
                     let found = match pre_acquired.and_then(|m| m.get(&id)) {
+                        _ if holding => None,
                         Some(&hit) => hit,
                         None if u.max_range > 0 => self.nearest_enemy_filtered(army, pos, acquire, can_aa, can_surf),
                         None => None,
@@ -4475,10 +5756,7 @@ impl Skirmish {
                         .map(|t| t.build_range)
                         .unwrap_or(0);
                     let reach = range + 4 * SCALE;
-                    let target = self
-                        .wreck_at((x, y), MASS_SNAP * 2)
-                        .map(|(_, wp)| wp)
-                        .unwrap_or((x, y));
+                    let target = self.reclaim_target((x, y)).map(|(_, _, p)| p).unwrap_or((x, y));
                     if dist_sq(pos, target) <= (reach as i128) * (reach as i128) {
                         return None;
                     }
@@ -4521,9 +5799,227 @@ impl Skirmish {
                     }
                     return Some(((x, y), SCALE));
                 }
+                UnitOrder::Ferry { from, to } => {
+                    let goal = if u.cargo.is_empty() { from } else { to };
+                    if pos == goal {
+                        return None;
+                    }
+                    return Some((goal, SCALE));
+                }
+                UnitOrder::AttackGround { x, y } => {
+                    let reach = (u.max_range - SCALE).max(SCALE) as i128;
+                    if dist_sq(pos, (x, y)) <= reach * reach {
+                        return None;
+                    }
+                    return Some(((x, y), SCALE));
+                }
+                UnitOrder::Guard(gid) => {
+                    let Some(g) = self.unit(gid).filter(|g| g.alive && self.are_allies(army, g.army)) else {
+                        self.units.get_mut(&id).unwrap().orders.pop_front();
+                        continue;
+                    };
+                    let gp = (g.pos.x, g.pos.y);
+                    // Engage threats near the guarded unit (unless holding fire), else follow.
+                    if u.max_range > 0 && u.fire_state == FireState::FireAtWill {
+                        let threat = self.nearest_enemy_filtered(army, gp, u.max_range + ACQUIRE_BONUS, can_aa, can_surf);
+                        if let Some(e) = threat {
+                            if self.in_weapon_range(&self.units[&id], e) && u.domain != NavDomain::Air {
+                                return None;
+                            }
+                            let ep = self.unit(e).map(|t| (t.pos.x, t.pos.y)).unwrap();
+                            return Some((ep, SCALE));
+                        }
+                    }
+                    let near = (g.radius + u.radius + 5 * SCALE) as i128;
+                    if dist_sq(pos, gp) <= near * near {
+                        return None;
+                    }
+                    return Some((gp, 3 * SCALE));
+                }
+                UnitOrder::Dock(sid) => {
+                    if !self.is_staging_of(sid, army) {
+                        self.units.get_mut(&id).unwrap().orders.pop_front();
+                        continue;
+                    }
+                    let s = &self.units[&sid];
+                    let sp = (s.pos.x, s.pos.y);
+                    if pos == sp {
+                        return None;
+                    }
+                    return Some((sp, SCALE));
+                }
             }
         }
         None
+    }
+
+    /// Phase 30/32: whether `sid` is a live air staging platform (structure, or a mobile
+    /// one such as the Fatboy, Atlantis or CZAR) owned by `army`.
+    fn is_staging_of(&self, sid: UnitId, army: ArmyId) -> bool {
+        self.unit(sid).is_some_and(|s| {
+            s.alive && s.army == army && s.carried_by.is_none() && self.catalog.get(&s.type_id).is_some_and(|t| t.ext.staging.is_some())
+        })
+    }
+
+    /// Phase 32: unit `u` can queue unit production (factory structures and mobile factories).
+    pub fn is_producer(&self, u: &Unit) -> bool {
+        u.role.is_factory() || self.catalog.get(&u.type_id).is_some_and(|t| t.ext.mobile_factory)
+    }
+
+    /// Phase 32: unit `u` can place structures (engineers, commanders, mobile builders).
+    pub fn is_constructor(&self, u: &Unit) -> bool {
+        u.role.is_builder() || self.catalog.get(&u.type_id).is_some_and(|t| t.ext.mobile_builder)
+    }
+
+    /// Phase 30: docking slots of staging platform `sid` taken by docked aircraft.
+    fn docked_at(&self, sid: UnitId) -> Vec<UnitId> {
+        self.units
+            .values()
+            .filter(|u| u.alive && u.carried_by == Some(sid) && matches!(u.orders.front(), Some(UnitOrder::Dock(s)) if *s == sid))
+            .map(|u| u.id)
+            .collect()
+    }
+
+    /// Phase 30 air fuel & staging (ascending unit id throughout):
+    /// 1. aircraft whose staging platform died are released;
+    /// 2. airborne aircraft burn one tick of fuel and fly at half speed when empty;
+    /// 3. every second, low-fuel aircraft with auto-refuel queue a `Dock` at the nearest own
+    ///    platform with a free slot within its scan radius;
+    /// 4. aircraft that reached their platform dock (if a slot is free);
+    /// 5. docked aircraft refuel (`FuelRechargeRate × RefuelingMultiplier`) and are repaired
+    ///    (`RepairRate`, paid per second in energy/mass), then undock and resume orders.
+    fn step_staging(&mut self) {
+        if !self.units.values().any(|u| u.domain == NavDomain::Air) {
+            return;
+        }
+        let ids: Vec<UnitId> = self.units.keys().copied().collect();
+        // 1. Release aircraft from dead platforms.
+        for &id in &ids {
+            let Some(sid) = self.units[&id].carried_by else { continue };
+            let staged = matches!(self.units[&id].orders.front(), Some(UnitOrder::Dock(s)) if *s == sid);
+            if staged && !self.units.get(&sid).is_some_and(|s| s.alive) {
+                let u = self.units.get_mut(&id).unwrap();
+                u.carried_by = None;
+                u.orders.pop_front();
+            }
+        }
+        // 2. Fuel burn.
+        for &id in &ids {
+            if self.units[&id].domain != NavDomain::Air {
+                continue;
+            }
+            let (fuel_ticks, base_speed) = match self.units.get(&id).and_then(|u| self.catalog.get(&u.type_id)) {
+                Some(t) => (t.ext.fuel_ticks, t.speed_per_tick),
+                None => continue,
+            };
+            let u = self.units.get_mut(&id).unwrap();
+            if fuel_ticks == 0 || !u.alive || u.carried_by.is_some() || u.domain != NavDomain::Air || u.drone_of.is_some() {
+                continue;
+            }
+            u.fuel = u.fuel.saturating_sub(1);
+            u.speed = if u.fuel == 0 { base_speed / 2 } else { base_speed };
+        }
+        // 3. Auto-refuel.
+        if self.tick.is_multiple_of(TICK_HZ) {
+            let platforms: Vec<(UnitId, ArmyId, (i64, i64), StagingSpec)> = self
+                .units
+                .values()
+                .filter(|s| s.alive && s.carried_by.is_none())
+                .filter_map(|s| self.catalog.get(&s.type_id).and_then(|t| t.ext.staging).map(|sp| (s.id, s.army, (s.pos.x, s.pos.y), sp)))
+                .collect();
+            if !platforms.is_empty() {
+                let mut load: BTreeMap<UnitId, u32> = BTreeMap::new();
+                for u in self.units.values().filter(|u| u.alive) {
+                    if let Some(UnitOrder::Dock(s)) = u.orders.front() {
+                        *load.entry(*s).or_insert(0) += 1;
+                    }
+                }
+                for &id in &ids {
+                    let Some(u) = self.units.get(&id).filter(|u| u.domain == NavDomain::Air) else { continue };
+                    let fuel_ticks = self.catalog.get(&u.type_id).map_or(0, |t| t.ext.fuel_ticks);
+                    if !u.alive || !u.auto_refuel || fuel_ticks == 0 || u.carried_by.is_some()
+                        || matches!(u.orders.front(), Some(UnitOrder::Dock(_)))
+                        || u.fuel as u64 * 5 > fuel_ticks as u64
+                    {
+                        continue;
+                    }
+                    let p = (u.pos.x, u.pos.y);
+                    let best = platforms
+                        .iter()
+                        .filter(|(sid, a, sp_pos, sp)| {
+                            *a == u.army
+                                && load.get(sid).copied().unwrap_or(0) < sp.slots as u32
+                                && dist_sq(p, *sp_pos) <= (sp.scan_radius as i128) * (sp.scan_radius as i128)
+                        })
+                        .min_by_key(|(sid, _, sp_pos, _)| (dist_sq(p, *sp_pos), *sid))
+                        .map(|(sid, ..)| *sid);
+                    if let Some(sid) = best {
+                        *load.entry(sid).or_insert(0) += 1;
+                        let u = self.units.get_mut(&id).unwrap();
+                        u.orders.push_front(UnitOrder::Dock(sid));
+                        u.path.clear();
+                        u.path_goal = None;
+                    }
+                }
+            }
+        }
+        // 4. Docking on arrival; 5. servicing.
+        for &id in &ids {
+            let Some(u) = self.units.get(&id) else { continue };
+            let Some(&UnitOrder::Dock(sid)) = u.orders.front() else { continue };
+            if !u.alive {
+                continue;
+            }
+            let Some((spos, sradius, spec)) = self
+                .units
+                .get(&sid)
+                .and_then(|s| self.catalog.get(&s.type_id).and_then(|t| t.ext.staging).map(|sp| ((s.pos.x, s.pos.y), s.radius, sp)))
+            else {
+                continue;
+            };
+            let (army, docked) = (u.army, u.carried_by == Some(sid));
+            if !docked {
+                let reach = (sradius + 3 * SCALE) as i128;
+                if dist_sq((u.pos.x, u.pos.y), spos) > reach * reach || self.docked_at(sid).len() >= spec.slots as usize {
+                    continue;
+                }
+                let u = self.units.get_mut(&id).unwrap();
+                u.carried_by = Some(sid);
+                u.pos = Vec2 { x: spos.0, y: spos.1 };
+                u.path.clear();
+                u.path_goal = None;
+                u.moving = false;
+                continue;
+            }
+            self.units.get_mut(&id).unwrap().pos = Vec2 { x: spos.0, y: spos.1 };
+            let (fuel_ticks, recharge, base_speed) = self
+                .catalog
+                .get(&self.units[&id].type_id)
+                .map_or((0, 0, 0), |t| (t.ext.fuel_ticks, t.ext.fuel_recharge_milli, t.speed_per_tick));
+            // `FuelRechargeRate` fuel-seconds per second = fuel ticks per tick.
+            let refuel = ((recharge * spec.refuel_multiplier) / 1000).clamp(1, u32::MAX as i64 / 4) as u32;
+            let (hp, max_hp) = (self.units[&id].hp, self.units[&id].max_hp);
+            let mut heal = 0;
+            if hp < max_hp {
+                let e = spec.repair_energy / TICK_HZ as i64;
+                let m = spec.repair_mass / TICK_HZ as i64;
+                let a = &mut self.armies[army as usize];
+                if a.energy >= e && a.mass >= m {
+                    a.energy -= e;
+                    a.mass -= m;
+                    heal = (max_hp * spec.repair_permille / 1000 / TICK_HZ as i64).max(1);
+                }
+            }
+            let u = self.units.get_mut(&id).unwrap();
+            u.fuel = u.fuel.saturating_add(refuel).min(fuel_ticks);
+            u.hp = (u.hp + heal).min(u.max_hp);
+            u.speed = base_speed;
+            if u.fuel >= fuel_ticks && u.hp >= u.max_hp {
+                u.carried_by = None;
+                u.orders.pop_front();
+                u.pos = Vec2 { x: spos.0, y: (spos.1 + sradius + 2 * SCALE).min(self.size.1) };
+            }
+        }
     }
 
     fn step_movement(&mut self) {
@@ -4539,10 +6035,15 @@ impl Skirmish {
         let pre_acquired = self.prefetch_attack_move_targets();
         let _pg = crate::profiler::scope("move.goals");
         for id in ids {
-            let Some((goal, _tol)) = self.pop_completed_and_goal(id, Some(&pre_acquired)) else {
+            let Some((mut goal, _tol)) = self.pop_completed_and_goal(id, Some(&pre_acquired)) else {
                 continue;
             };
             let domain = self.units[&id].domain;
+            // Phase 28: a goal inside a wall (e.g. attacking a wall section) is reached from
+            // the nearest open cell instead of walking straight through the wall line.
+            if domain != NavDomain::Air && self.is_wall_cell(goal) {
+                goal = self.walkable_near(id, goal);
+            }
             if domain != NavDomain::Air {
                 let gcell = self.domain_grid(domain).world_to_cell(goal.0, goal.1);
                 *group_counts.entry((domain, gcell.0, gcell.1)).or_insert(0) += 1;
@@ -4756,12 +6257,18 @@ impl Skirmish {
 
         let (max_x, max_y) = self.size;
         for (id, dx, dy) in deltas {
-            if (dx != 0 || dy != 0)
-                && let Some(u) = self.units.get_mut(&id)
-            {
-                u.pos.x = (u.pos.x + dx).clamp(0, max_x);
-                u.pos.y = (u.pos.y + dy).clamp(0, max_y);
+            if dx == 0 && dy == 0 {
+                continue;
             }
+            let Some(u) = self.units.get(&id) else { continue };
+            let np = ((u.pos.x + dx).clamp(0, max_x), (u.pos.y + dy).clamp(0, max_y));
+            // Phase 28: crowd pushes never shove ground units into a wall cell.
+            if u.domain != NavDomain::Air && self.is_wall_cell(np) && !self.is_wall_cell((u.pos.x, u.pos.y)) {
+                continue;
+            }
+            let u = self.units.get_mut(&id).unwrap();
+            u.pos.x = np.0;
+            u.pos.y = np.1;
         }
     }
 
@@ -5031,6 +6538,13 @@ impl Skirmish {
                 is_missile,
                 is_nuke,
                 target_air,
+                direct: false,
+                shooter: 0,
+                z: 0,
+                start_z: 0,
+                target_z: 0,
+                stun_ticks: 0,
+                stun_radius: 0,
             },
         );
     }
@@ -5118,6 +6632,7 @@ impl Skirmish {
         let p = (u.x, u.y);
         let mut best_mobile: Option<(i128, UnitId)> = None;
         let mut best_struct: Option<(i128, UnitId)> = None;
+        let mut best_wall: Option<(i128, UnitId)> = None;
         grid.for_each_enemy_in_radius(p.0, p.1, lim_r + 6 * SCALE, u.team, |oidx| {
             let o = &snap[oidx as usize];
             if o.team == u.team || o.hidden_from(u.army) {
@@ -5132,7 +6647,9 @@ impl Skirmish {
             if d > lim_sq || d > reach * reach {
                 return;
             }
-            let slot = if o.is_struct {
+            let slot = if o.is_wall {
+                &mut best_wall
+            } else if o.is_struct {
                 &mut best_struct
             } else {
                 &mut best_mobile
@@ -5141,7 +6658,7 @@ impl Skirmish {
                 *slot = Some((d, o.id));
             }
         });
-        (u.id, best_mobile.or(best_struct).map(|(_, id)| id))
+        (u.id, best_mobile.or(best_struct).or(best_wall).map(|(_, id)| id))
     }
 
     fn step_weapons(&mut self) {
@@ -5190,7 +6707,7 @@ impl Skirmish {
         let ids: Vec<UnitId> = self.units.keys().copied().collect();
         for id in ids {
             let (army, pos, alt, role, explicit, overcharge, has_guns) = match self.units.get(&id) {
-                Some(u) if u.alive && u.carried_by.is_none() => (
+                Some(u) if u.alive && u.carried_by.is_none() && u.stunned == 0 => (
                     u.army,
                     (u.pos.x, u.pos.y),
                     u.altitude,
@@ -5251,29 +6768,60 @@ impl Skirmish {
             if !has_guns {
                 continue;
             }
+            // Phase 35: ground fire — shoot at the position (splash shells, direct shells into
+            // the ground, terrain-checked beams).
+            if let Some(UnitOrder::AttackGround { x, y }) = self.units[&id].orders.front().cloned() {
+                self.fire_at_ground(id, (x, y), &shield_ids);
+                continue;
+            }
+            let (fire_state, last_attacker) = {
+                let u = &self.units[&id];
+                (u.fire_state, u.last_hit_by_unit)
+            };
             let target = explicit
                 .filter(|t| self.in_weapon_range(&self.units[&id], *t))
-                .or_else(|| {
-                    target_map
-                        .get(&id)
-                        .copied()
-                        .filter(|t| self.unit(*t).is_some())
+                .or_else(|| match fire_state {
+                    FireState::FireAtWill => target_map.get(&id).copied().filter(|t| self.unit(*t).is_some()),
+                    FireState::ReturnFire => last_attacker.filter(|t| {
+                        self.unit(*t).is_some_and(|e| e.alive && e.targetable_by(army) && !self.are_allies(army, e.army))
+                            && self.in_weapon_range(&self.units[&id], *t)
+                    }),
+                    FireState::HoldFire => None,
                 });
             let tinfo = target.and_then(|t| {
-                self.unit(t)
-                    .map(|u| (t, (u.pos.x, u.pos.y), u.radius, u.altitude, u.domain == NavDomain::Air))
+                self.unit(t).map(|u| {
+                    (t, (u.pos.x, u.pos.y), u.radius, u.altitude, u.domain == NavDomain::Air, u.height, u.vel)
+                })
             });
+            let my_height = self.units[&id].height;
             let n = self.units[&id].weapons.len();
             for wi in 0..n {
+                // Phase 29: turrets slew toward the current target (also while reloading)
+                // and only fire once within `FiringTolerance`.
+                let mut aimed = true;
+                if let Some((_, tp, _, _, t_air, _, _)) = tinfo {
+                    let me = self.units.get_mut(&id).unwrap();
+                    let ws = &mut me.weapons[wi];
+                    if (t_air && ws.anti_air) || (!t_air && ws.anti_surface) {
+                        let desired = combat::atan2_mrad(tp.0 - pos.0, tp.1 - pos.1);
+                        if ws.turret_yaw_speed > 0 {
+                            let diff = combat::wrap_mrad(desired - ws.yaw);
+                            ws.yaw = combat::wrap_mrad(ws.yaw + diff.clamp(-ws.turret_yaw_speed, ws.turret_yaw_speed));
+                            aimed = combat::wrap_mrad(desired - ws.yaw).abs() <= ws.firing_tolerance;
+                        } else {
+                            ws.yaw = desired;
+                        }
+                    }
+                }
                 let w = self.units[&id].weapons[wi].clone();
                 if w.cooldown > 0 {
                     self.units.get_mut(&id).unwrap().weapons[wi].cooldown -= 1;
                     continue;
                 }
-                let Some((tid, tp, tr, t_alt, t_air)) = tinfo else {
+                let Some((tid, tp, tr, t_alt, t_air, t_height, t_vel)) = tinfo else {
                     continue;
                 };
-                if (t_air && !w.anti_air) || (!t_air && !w.anti_surface) {
+                if (t_air && !w.anti_air) || (!t_air && !w.anti_surface) || !aimed {
                     continue;
                 }
                 let alive = self.units.get(&tid).is_some_and(|t| t.alive);
@@ -5281,10 +6829,7 @@ impl Skirmish {
                 let reach_sq = (reach as i128) * (reach as i128);
                 if combat::can_fire(0, alive, Some(reach_sq), dist_sq(pos, tp), Some(w.damage)) {
                     let tick = self.tick;
-                    // Quantized turret yaw angle in milliradians for Phase 11 turret tracking
-                    let dx = (tp.0 - pos.0) as f64;
-                    let dz = (tp.1 - pos.1) as f64;
-                    let yaw_mrad = (dx.atan2(dz) * 1000.0).round() as i64;
+                    let yaw_mrad = w.yaw;
                     {
                         let me = self.units.get_mut(&id).unwrap();
                         me.weapons[wi].cooldown = w.reset;
@@ -5299,6 +6844,18 @@ impl Skirmish {
                         heavy: w.splash_radius > 0 || w.damage >= 100 * SCALE,
                         anti_air: t_air,
                     });
+                    let stun = w.stun.or_else(|| {
+                        w.emp
+                            .then(|| self.catalog.get(&self.units[&id].type_id).and_then(|t| t.ext.stun).filter(|s| s.2).map(|s| (s.0, s.1)))
+                            .flatten()
+                    });
+                    if w.kamikaze {
+                        // Phase 33: detonate in place — damage enemies around, then die.
+                        self.splash_damage(army, pos, w.splash_radius.max(SCALE), w.damage, Some(id), false, &shield_ids);
+                        self.units.get_mut(&id).unwrap().hp = 0;
+                        self.emit_event(SimEvent::Explosion { pos: (pos.0, pos.1, SCALE / 2), radius: w.splash_radius.max(2 * SCALE), is_nuke: false });
+                        break;
+                    }
                     if w.splash_radius > 0 {
                         let spd = if w.muzzle_velocity > 0 {
                             w.muzzle_velocity
@@ -5317,10 +6874,222 @@ impl Skirmish {
                             false,
                             t_air,
                         );
-                    } else {
+                        if let Some(p) = self.projectiles.get_mut(&(self.next_projectile_id - 1)) {
+                            // Phase 55: renderers resolve the shell look from its shooter.
+                            p.shooter = id;
+                            if let Some((ticks, radius)) = stun {
+                                p.stun_ticks = ticks;
+                                p.stun_radius = radius;
+                            }
+                        }
+                    } else if t_air {
+                        // Anti-air stays hitscan (FA AA is homing / flak).
                         self.apply_shield_and_damage(tid, w.damage, army, Some(id), &shield_ids);
+                    } else {
+                        // Phase 29: surface direct fire from the muzzle to the target's centre.
+                        let muzzle = (pos.0, pos.1, self.terrain.height_at(pos.0, pos.1) + alt + (my_height * 3 / 4).max(SCALE / 2));
+                        let centre = |p: (i64, i64)| (p.0, p.1, self.terrain.height_at(p.0, p.1) + t_alt + t_height / 2);
+                        if w.beam {
+                            // Instant beam: the terrain between muzzle and target soaks the shot.
+                            let aim = centre(tp);
+                            match self.terrain.segment_hit(muzzle, aim, LOF_CLEARANCE, SCALE, tr + SCALE) {
+                                Some(_) => {}
+                                None => {
+                                    self.apply_shield_and_damage(tid, w.damage, army, Some(id), &shield_ids);
+                                    if let Some((ticks, radius)) = stun {
+                                        self.apply_stun(army, tp, radius, ticks);
+                                    }
+                                }
+                            }
+                        } else {
+                            // Projectile: lead the target by its last-tick velocity.
+                            let spd = w.muzzle_velocity.max(SCALE / 2);
+                            let mut aim2 = tp;
+                            if w.lead_target && t_vel != (0, 0) {
+                                for _ in 0..2 {
+                                    let t = isqrt(dist_sq(pos, aim2)) / spd;
+                                    aim2 = self.clamp_to_map(tp.0 + t_vel.0 * t, tp.1 + t_vel.1 * t);
+                                }
+                            }
+                            self.spawn_direct_projectile(army, id, muzzle, centre(aim2), spd, w.damage);
+                            if let Some((ticks, radius)) = stun
+                                && let Some(p) = self.projectiles.get_mut(&(self.next_projectile_id - 1))
+                            {
+                                p.stun_ticks = ticks;
+                                p.stun_radius = radius;
+                            }
+                        }
                     }
                 }
+            }
+        }
+    }
+
+    /// Phase 35: every ready weapon of `id` in range of ground point `g` fires at it.
+    fn fire_at_ground(&mut self, id: UnitId, g: (i64, i64), shield_ids: &[UnitId]) {
+        let Some((army, pos, alt, height)) = self.units.get(&id).map(|u| (u.army, (u.pos.x, u.pos.y), u.altitude, u.height)) else {
+            return;
+        };
+        let _ = shield_ids;
+        let n = self.units[&id].weapons.len();
+        for wi in 0..n {
+            let w = self.units[&id].weapons[wi].clone();
+            if w.cooldown > 0 {
+                self.units.get_mut(&id).unwrap().weapons[wi].cooldown -= 1;
+                continue;
+            }
+            if !w.anti_surface || w.kamikaze || dist_sq(pos, g) > w.range_sq {
+                continue;
+            }
+            let tick = self.tick;
+            {
+                let me = self.units.get_mut(&id).unwrap();
+                me.weapons[wi].cooldown = w.reset;
+                me.weapons[wi].yaw = combat::atan2_mrad(g.0 - pos.0, g.1 - pos.1);
+                me.turret_yaw_mrad = me.weapons[wi].yaw;
+                me.last_shot = Some((0, tick));
+            }
+            self.shots_fired += 1;
+            let gz = self.terrain.height_at(g.0, g.1);
+            self.emit_event(SimEvent::WeaponFired {
+                from: (pos.0, pos.1, alt + SCALE),
+                to: (g.0, g.1, gz),
+                army,
+                heavy: w.splash_radius > 0,
+                anti_air: false,
+            });
+            if w.splash_radius > 0 {
+                let spd = if w.muzzle_velocity > 0 { w.muzzle_velocity } else { 14 * SCALE / TICK_HZ as i64 };
+                self.spawn_projectile_full(army, Vec2 { x: pos.0, y: pos.1 }, Vec2 { x: g.0, y: g.1 }, spd, w.damage, w.splash_radius, false, false, false, false);
+            } else if !w.beam {
+                let muzzle = (pos.0, pos.1, self.terrain.height_at(pos.0, pos.1) + alt + (height * 3 / 4).max(SCALE / 2));
+                self.spawn_direct_projectile(army, id, muzzle, (g.0, g.1, gz), w.muzzle_velocity.max(SCALE / 2), w.damage);
+            }
+        }
+    }
+
+    /// Phase 29: a straight-flying direct-fire shell from `start` to `target` (3-D, milli).
+    fn spawn_direct_projectile(
+        &mut self,
+        army: ArmyId,
+        shooter: UnitId,
+        start: (i64, i64, i64),
+        target: (i64, i64, i64),
+        speed: i64,
+        damage: i64,
+    ) {
+        let id = self.next_projectile_id;
+        self.next_projectile_id += 1;
+        let (dx, dy, dz) = ((target.0 - start.0) as i128, (target.1 - start.1) as i128, (target.2 - start.2) as i128);
+        let d = isqrt(dx * dx + dy * dy + dz * dz).max(1);
+        let spd = speed.max(1);
+        let total_ticks = ((d + spd - 1) / spd).clamp(1, 120) as u32;
+        self.projectiles.insert(
+            id,
+            Projectile {
+                id,
+                army,
+                start: Vec2 { x: start.0, y: start.1 },
+                pos: Vec2 { x: start.0, y: start.1 },
+                target: Vec2 { x: target.0, y: target.1 },
+                speed,
+                damage,
+                splash_radius: 0,
+                arc_height: 0,
+                ticks_lived: 0,
+                total_ticks,
+                is_overcharge: false,
+                is_missile: false,
+                is_nuke: false,
+                target_air: false,
+                direct: true,
+                shooter,
+                z: start.2,
+                start_z: start.2,
+                target_z: target.2,
+                stun_ticks: 0,
+                stun_radius: 0,
+            },
+        );
+    }
+
+    /// Phase 29: advances direct-fire shell `pid` one tick. The shell hits the first thing on
+    /// its path this tick — terrain (more than [`LOF_CLEARANCE`] below the ground) or a
+    /// non-allied surface unit whose hit box (footprint radius × height) it passes through,
+    /// walls included — and otherwise flies on; reaching its aim point without a hit is a miss.
+    fn step_direct_projectile(&mut self, pid: u32, shield_ids: &[UnitId]) {
+        let Some(p) = self.projectiles.get(&pid).cloned() else { return };
+        let tt = p.total_ticks.max(1);
+        let t1 = (p.ticks_lived + 1).min(tt);
+        let lerp = |a: i64, b: i64| a + ((b - a) as i128 * t1 as i128 / tt as i128) as i64;
+        let a = (p.pos.x, p.pos.y, p.z);
+        let b = (lerp(p.start.x, p.target.x), lerp(p.start.y, p.target.y), lerp(p.start_z, p.target_z));
+        let last = t1 >= tt;
+        let (sx, sy, sz) = ((b.0 - a.0) as i128, (b.1 - a.1) as i128, (b.2 - a.2) as i128);
+        let seg2 = sx * sx + sy * sy;
+        let seg = isqrt(seg2);
+
+        // Terrain: parameter along the segment in 1/1000ths.
+        let skip_start = if p.ticks_lived == 0 { SCALE } else { 0 };
+        let skip_end = if last { SCALE * 3 / 2 } else { 0 };
+        let ground = self.terrain.segment_hit(a, b, LOF_CLEARANCE, skip_start, skip_end).map(|h| {
+            let along = isqrt(dist_sq((a.0, a.1), (h.0, h.1)));
+            (along as i128 * 1000 / (seg as i128).max(1), h)
+        });
+
+        // Units: closest approach of the segment to each candidate's centre, from the
+        // spatial snapshot (positions as of this tick's weapons pass). Candidates are tried in
+        // (t, id) order and the first one still alive takes the hit.
+        let mid = ((a.0 + b.0) / 2, (a.1 + b.1) / 2);
+        let team = self.armies.get(p.army as usize).map(|a| a.team).unwrap_or(p.army);
+        let terrain = &self.terrain;
+        let snap = &self.spatial_snap;
+        let mut hits: Vec<(i128, UnitId)> = Vec::new();
+        self.spatial.for_each_enemy_in_radius(mid.0, mid.1, seg / 2 + DIRECT_HIT_REACH, team, |idx| {
+            let u = &snap[idx as usize];
+            if u.team == team || u.domain == NavDomain::Air || u.id == p.shooter {
+                return;
+            }
+            let (px, py) = ((u.x - a.0) as i128, (u.y - a.1) as i128);
+            let t = if seg2 == 0 { 1000 } else { ((px * sx + py * sy) * 1000 / seg2).clamp(0, 1000) };
+            let c = (a.0 + (sx * t / 1000) as i64, a.1 + (sy * t / 1000) as i64);
+            let r = u.radius as i128;
+            if dist_sq(c, (u.x, u.y)) > r * r {
+                return;
+            }
+            let z = a.2 + (sz * t / 1000) as i64;
+            let base = terrain.height_at(u.x, u.y);
+            if z > base + u.height + LOF_CLEARANCE || z + SCALE < base {
+                return;
+            }
+            hits.push((t, u.id));
+        });
+        hits.sort_unstable();
+        let best = hits
+            .into_iter()
+            .find(|&(_, id)| self.units.get(&id).is_some_and(|u| u.alive && u.carried_by.is_none()));
+
+        match (best, ground) {
+            (Some((tu, uid)), g) if g.is_none_or(|(tg, _)| tu <= tg) => {
+                self.projectiles.remove(&pid);
+                let shooter = self.units.contains_key(&p.shooter).then_some(p.shooter);
+                self.apply_shield_and_damage(uid, p.damage, p.army, shooter, shield_ids);
+                if p.stun_ticks > 0 {
+                    let up = self.units.get(&uid).map_or((b.0, b.1), |u| (u.pos.x, u.pos.y));
+                    self.apply_stun(p.army, up, p.stun_radius, p.stun_ticks);
+                }
+            }
+            (_, Some(_)) => {
+                self.projectiles.remove(&pid);
+            }
+            _ if last => {
+                self.projectiles.remove(&pid);
+            }
+            _ => {
+                let q = self.projectiles.get_mut(&pid).unwrap();
+                q.ticks_lived = t1;
+                q.pos = Vec2 { x: b.0, y: b.1 };
+                q.z = b.2;
             }
         }
     }
@@ -5357,7 +7126,12 @@ impl Skirmish {
             .collect();
         let mut site_used = vec![false; def_sites.len()];
 
-        let pids: Vec<u32> = self.projectiles.keys().copied().collect();
+        // Phase 29: direct-fire shells fly and collide on their own.
+        let direct: Vec<u32> = self.projectiles.values().filter(|p| p.direct).map(|p| p.id).collect();
+        for pid in direct {
+            self.step_direct_projectile(pid, &shield_ids);
+        }
+        let pids: Vec<u32> = self.projectiles.values().filter(|p| !p.direct).map(|p| p.id).collect();
         let mut exploded = Vec::new();
         let mut intercepted = Vec::new();
         for pid in pids {
@@ -5451,6 +7225,141 @@ impl Skirmish {
                     self.apply_shield_and_damage(uid, p.damage, p.army, None, &shield_ids);
                 }
             }
+            if p.stun_ticks > 0 {
+                self.apply_stun(p.army, (p.target.x, p.target.y), p.stun_radius, p.stun_ticks);
+            }
+        }
+    }
+
+    /// Phase 33: stuns every non-allied mobile surface unit within `radius` of `p` for
+    /// `ticks` (FA `Buffs.Stun`, `TargetAllow = 'MOBILE'`). Ascending id; never shortens.
+    fn apply_stun(&mut self, army: ArmyId, p: (i64, i64), radius: i64, ticks: u32) {
+        if ticks == 0 {
+            return;
+        }
+        let lim = (radius.max(SCALE) as i128).pow(2);
+        let ids: Vec<UnitId> = self
+            .units
+            .values()
+            .filter(|u| {
+                u.alive
+                    && u.speed > 0
+                    && !u.role.is_structure()
+                    && u.domain != NavDomain::Air
+                    && u.carried_by.is_none()
+                    && !self.are_allies(army, u.army)
+                    && dist_sq(p, (u.pos.x, u.pos.y)) <= lim
+            })
+            .map(|u| u.id)
+            .collect();
+        for id in ids {
+            let u = self.units.get_mut(&id).unwrap();
+            u.stunned = u.stunned.max(ticks);
+            u.path.clear();
+            u.path_goal = None;
+        }
+    }
+
+    /// Phase 33: area damage at `p` (`radius` + target hit box) to surface units — enemies of
+    /// `army` only, or everyone when `friendly_fire` (death explosions). Ascending id.
+    #[allow(clippy::too_many_arguments)]
+    fn splash_damage(
+        &mut self,
+        army: ArmyId,
+        p: (i64, i64),
+        radius: i64,
+        damage: i64,
+        attacker: Option<UnitId>,
+        friendly_fire: bool,
+        shield_ids: &[UnitId],
+    ) {
+        let hits: Vec<UnitId> = self
+            .units
+            .values()
+            .filter(|u| {
+                u.alive
+                    && u.hp > 0
+                    && Some(u.id) != attacker
+                    && u.carried_by.is_none()
+                    && !u.untargetable
+                    && u.altitude <= 4 * SCALE
+                    && (friendly_fire || !self.are_allies(army, u.army))
+                    && dist_sq(p, (u.pos.x, u.pos.y)) <= ((radius + u.radius) as i128).pow(2)
+            })
+            .map(|u| u.id)
+            .collect();
+        for uid in hits {
+            self.apply_shield_and_damage(uid, damage, army, attacker, shield_ids);
+        }
+    }
+
+    /// Phase 36 ferries (ascending transport id): at the pick-up point an empty-ish
+    /// transport loads idle own land units within [`FERRY_RADIUS`] (ascending id, capacity
+    /// checked) and leaves as soon as it carries anyone; at the drop-off point it unloads
+    /// in formation and heads back. The route repeats until another order replaces it.
+    fn step_ferries(&mut self) {
+        type Route = (UnitId, (i64, i64), (i64, i64));
+        let ferries: Vec<Route> = self
+            .units
+            .values()
+            .filter(|u| u.alive && u.carried_by.is_none())
+            .filter_map(|u| match u.orders.front() {
+                Some(UnitOrder::Ferry { from, to }) => Some((u.id, *from, *to)),
+                _ => None,
+            })
+            .collect();
+        for (tid, from, to) in ferries {
+            let (tpos, army, cargo) = {
+                let t = &self.units[&tid];
+                ((t.pos.x, t.pos.y), t.army, t.cargo.clone())
+            };
+            if cargo.is_empty() && tpos == from {
+                let lim = (FERRY_RADIUS as i128).pow(2);
+                let waiting: Vec<UnitId> = self
+                    .units
+                    .values()
+                    .filter(|u| {
+                        u.alive
+                            && u.army == army
+                            && u.domain != NavDomain::Air
+                            && u.carried_by.is_none()
+                            && u.orders.is_empty()
+                            && u.build.is_none()
+                            && dist_sq((u.pos.x, u.pos.y), from) <= lim
+                    })
+                    .map(|u| u.id)
+                    .collect();
+                for pid in waiting {
+                    if !self.can_board(pid, tid) {
+                        continue;
+                    }
+                    let p = self.units.get_mut(&pid).unwrap();
+                    p.carried_by = Some(tid);
+                    p.path.clear();
+                    p.path_goal = None;
+                    p.moving = false;
+                    self.units.get_mut(&tid).unwrap().cargo.push(pid);
+                }
+            } else if !cargo.is_empty() && tpos == to {
+                let n = cargo.len();
+                for (i, &c) in cargo.iter().enumerate() {
+                    let (sx, sy) = Self::formation_slot(i, n, to.0, to.1);
+                    let (sx, sy) = self.walkable_near(c, self.clamp_to_map(sx, sy));
+                    if let Some(u) = self.units.get_mut(&c) {
+                        u.carried_by = None;
+                        u.pos = Vec2 { x: sx, y: sy };
+                        u.altitude = 0;
+                        u.orders.clear();
+                        u.path.clear();
+                        u.path_goal = None;
+                    }
+                }
+                let t = self.units.get_mut(&tid).unwrap();
+                t.cargo.clear();
+                t.path.clear();
+                t.path_goal = None;
+                self.emit_event(SimEvent::BuildSpark { pos: (to.0, to.1, SCALE), army });
+            }
         }
     }
 
@@ -5474,6 +7383,7 @@ impl Skirmish {
             }
         }
         let mut dead_commanders = Vec::new();
+        let mut death_fx: Vec<DeathFx> = Vec::new();
         let ids: Vec<UnitId> = self.units.keys().copied().collect();
         for id in &ids {
             let (army, killer, killer_unit, role, pos, type_id, died) = {
@@ -5496,6 +7406,12 @@ impl Skirmish {
                 }
             };
             if died {
+                if let Some(t) = self.catalog.get(&type_id) {
+                    let stun = t.ext.stun.filter(|s| s.3).map(|s| (s.0, s.1));
+                    if t.ext.death_damage > 0 || stun.is_some() {
+                        death_fx.push((army, (pos.x, pos.y), t.ext.death_damage, t.ext.death_radius, stun));
+                    }
+                }
                 self.armies[army as usize].units_lost += 1;
                 if let Some(k) = killer {
                     self.armies[k as usize].kills += 1;
@@ -5552,6 +7468,20 @@ impl Skirmish {
                 }
             }
         }
+        // Phase 33: death weapons hit everything around the wreck (chain deaths resolve next
+        // tick); on-death EMP stuns enemy mobiles.
+        if !death_fx.is_empty() {
+            let shield_ids = self.shield_candidates();
+            for (army, p, dmg, radius, stun) in death_fx {
+                if dmg > 0 {
+                    self.splash_damage(army, p, radius, dmg, None, true, &shield_ids);
+                    self.emit_event(SimEvent::Explosion { pos: (p.0, p.1, SCALE), radius: radius.max(2 * SCALE), is_nuke: radius >= 15 * SCALE });
+                }
+                if let Some((ticks, r)) = stun {
+                    self.apply_stun(army, p, r, ticks);
+                }
+            }
+        }
         // Phase 18 victory conditions: supremacy (structures + engineers) / annihilation.
         let victory = self.options.victory;
         if matches!(victory, VictoryCondition::Supremacy | VictoryCondition::Annihilation) {
@@ -5563,6 +7493,7 @@ impl Skirmish {
                 let holds_on = self.units.values().any(|u| {
                     u.alive
                         && u.army == army
+                        && u.role != Role::Wall
                         && (victory == VictoryCondition::Annihilation || u.role.is_structure() || u.role.is_builder())
                 });
                 if !holds_on {
@@ -5593,6 +7524,9 @@ impl Skirmish {
             {
                 self.hydro_claims[i] = None;
             }
+        }
+        if self.units.values().any(|u| !u.alive && u.role.is_structure()) {
+            self.walls_dirty = true;
         }
         self.units.retain(|_, u| u.alive);
         let live: Vec<UnitId> = self.units.keys().copied().collect();
@@ -5641,6 +7575,14 @@ impl Skirmish {
         m(&mut h, &self.next_projectile_id.to_le_bytes());
         m(&mut h, &self.shots_fired.to_le_bytes());
         m(&mut h, &self.kills.to_le_bytes());
+        m(&mut h, &(self.props.len() as u64).to_le_bytes());
+        if let Some(ms) = &self.mission {
+            m(&mut h, &ms.digest().to_le_bytes());
+        }
+        for p in self.props.values() {
+            m(&mut h, &p.mass.to_le_bytes());
+            m(&mut h, &p.energy.to_le_bytes());
+        }
         for a in &self.armies {
             m(&mut h, &[a.id, a.team, a.defeated as u8]);
             for v in [a.mass, a.energy, a.mass_cap, a.energy_cap, a.damage_dealt] {
@@ -5665,6 +7607,12 @@ impl Skirmish {
                 m(&mut h, &v.to_le_bytes());
             }
             m(&mut h, &u.silo_missiles.to_le_bytes());
+            m(&mut h, &u.fuel.to_le_bytes());
+            m(&mut h, &[u8::from(u.auto_refuel)]);
+            m(&mut h, &u.drone_of.unwrap_or(0).to_le_bytes());
+            m(&mut h, &u.pod_timer.to_le_bytes());
+            m(&mut h, &u.stunned.to_le_bytes());
+            m(&mut h, &[u.fire_state.code(), u8::from(u.build_paused)]);
             m(&mut h, &(u.orders.len() as u32).to_le_bytes());
             m(&mut h, &(u.production.len() as u32).to_le_bytes());
             m(&mut h, &(u.path.len() as u32).to_le_bytes());
@@ -5762,6 +7710,13 @@ pub(crate) mod tests {
                     anti_surface: role != Role::AntiAir,
                     turret_yaw_bone: None,
                     turret_pitch_bone: None,
+                    turret_yaw_speed: 0,
+                    firing_tolerance: 35,
+                    beam: true,
+                    lead_target: true,
+                    emp: false,
+                    kamikaze: false,
+                    stun: None,
                 }]
             } else {
                 vec![]
@@ -5806,6 +7761,7 @@ pub(crate) mod tests {
             missile_damage: if role == Role::MissileSilo { 1000 * SCALE } else { 0 },
             missile_splash: if role == Role::MissileSilo { 4 * SCALE } else { 0 },
             missile_range: if role == Role::MissileSilo { 200 * SCALE } else { 0 },
+            missile_stun: None,
             intercept_radius: if role == Role::MissileDefense { 30 * SCALE } else { 0 },
             radius: if role.is_structure() { 3 * SCALE } else { SCALE / 2 },
             size: [SCALE; 3],
@@ -5953,6 +7909,776 @@ pub(crate) mod tests {
         let f = w.unit(fighter).unwrap();
         assert!(f.pos.x > 160 * SCALE, "air unit flies cleanly over blocked wall");
         assert_eq!(f.altitude, 16 * SCALE);
+    }
+
+    /// Phase 28 fixture: open 256 m map (64×64 cells of 4 m) with a 1 m wall type `RWALL`.
+    fn wall_world() -> Skirmish {
+        let mut cat = test_catalog();
+        let mut wall = ty("RWALL", Role::Wall, 4000, 0, 0, 0);
+        wall.radius = SCALE / 2;
+        cat.types.insert("RWALL".into(), wall);
+        Skirmish::new(
+            cat,
+            PathGrid::new(64, 64, 4 * SCALE),
+            (256 * SCALE, 256 * SCALE),
+            vec![],
+            &[
+                ArmySetup { name: "A".into(), faction: 0, start: (20 * SCALE, 20 * SCALE), team: 0 },
+                ArmySetup { name: "B".into(), faction: 1, start: (236 * SCALE, 20 * SCALE), team: 1 },
+            ],
+            11,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn wall_line_blocks_land_pathing_until_destroyed() {
+        let mut w = wall_world();
+        // A 1 m-spaced wall line along x = 128 m, from z = 40 m to z = 200 m.
+        let mut walls = Vec::new();
+        for z in 40..200 {
+            walls.push(w.spawn_unit(0, "RWALL", (128 * SCALE + SCALE / 2, z * SCALE + SCALE / 2)).unwrap());
+        }
+        let tank = w.spawn_unit(0, "RT", (100 * SCALE, 120 * SCALE)).unwrap();
+        w.step();
+        assert_eq!(w.wall_cell_count(), 40, "160 sections stamp a 40-cell line");
+        assert!(w.grid().is_blocked(32, 30));
+        w.issue(0, Command::Move { units: vec![tank], x: 156 * SCALE, y: 120 * SCALE, queue: false });
+        let mut max_detour = 0i64;
+        for _ in 0..1200 {
+            w.step();
+            let u = w.unit(tank).unwrap();
+            assert!(!w.is_wall_cell((u.pos.x, u.pos.y)), "tank entered a wall cell at {:?}", u.pos);
+            max_detour = max_detour.max((u.pos.y - 120 * SCALE).abs());
+            if u.orders.is_empty() {
+                break;
+            }
+        }
+        let u = w.unit(tank).unwrap();
+        assert_eq!((u.pos.x, u.pos.y), (156 * SCALE, 120 * SCALE), "tank reaches the far side");
+        assert!(max_detour >= 70 * SCALE, "tank walks around the wall end (detour {max_detour})");
+
+        // Destroying the walls re-opens the grid and frees the cells.
+        for id in &walls {
+            w.units.get_mut(id).unwrap().hp = 0;
+        }
+        w.step();
+        w.step();
+        assert_eq!(w.wall_cell_count(), 0);
+        assert!(!w.grid().is_blocked(32, 30));
+        w.issue(0, Command::Move { units: vec![tank], x: 100 * SCALE, y: 120 * SCALE, queue: false });
+        for _ in 0..200 {
+            w.step();
+            let u = w.unit(tank).unwrap();
+            assert!((u.pos.y - 120 * SCALE).abs() <= 2 * SCALE, "straight line once walls are gone");
+        }
+    }
+
+    #[test]
+    fn wall_spawned_on_unit_evicts_it_and_large_groups_reroute() {
+        let mut w = wall_world();
+        let tank = w.spawn_unit(0, "RT", (50 * SCALE + 200, 50 * SCALE + 200)).unwrap();
+        w.spawn_unit(0, "RWALL", (50 * SCALE + SCALE / 2, 50 * SCALE + SCALE / 2)).unwrap();
+        w.step();
+        let u = w.unit(tank).unwrap();
+        assert!(!w.is_wall_cell((u.pos.x, u.pos.y)), "tank pushed off the new wall cell");
+
+        // A flow-field group (>= 6 movers) also respects a wall line built mid-route.
+        let mut w = wall_world();
+        let group: Vec<UnitId> = (0..8)
+            .map(|i| w.spawn_unit(0, "RT", (90 * SCALE + i * 2 * SCALE, 120 * SCALE)).unwrap())
+            .collect();
+        w.issue(0, Command::Move { units: group.clone(), x: 170 * SCALE, y: 120 * SCALE, queue: false });
+        w.run(5);
+        for z in 60..180 {
+            w.spawn_unit(0, "RWALL", (130 * SCALE + SCALE / 2, z * SCALE + SCALE / 2)).unwrap();
+        }
+        for _ in 0..1500 {
+            w.step();
+            for id in &group {
+                let u = w.unit(*id).unwrap();
+                assert!(!w.is_wall_cell((u.pos.x, u.pos.y)), "group member {id} crossed the wall");
+            }
+        }
+        assert!(group.iter().all(|id| w.unit(*id).unwrap().pos.x > 150 * SCALE), "group gets around the wall");
+    }
+
+    #[test]
+    fn walls_are_last_resort_targets_and_do_not_hold_off_defeat() {
+        let mut w = wall_world();
+        let pd = w.spawn_unit(0, "RPD", (120 * SCALE, 150 * SCALE)).unwrap();
+        let wall = w.spawn_unit(1, "RWALL", (124 * SCALE + SCALE / 2, 150 * SCALE + SCALE / 2)).unwrap();
+        let tank = w.spawn_unit(1, "BT", (140 * SCALE, 150 * SCALE)).unwrap();
+        w.run(20);
+        assert!(w.unit(tank).is_none_or(|t| t.hp < t.max_hp), "PD shoots the tank first");
+        assert_eq!(w.unit(wall).unwrap().hp, w.unit(wall).unwrap().max_hp, "wall ignored while a tank is in range");
+        let _ = pd;
+
+        // Annihilation: an army that only has walls left is defeated.
+        let mut w = wall_world().with_options(GameOptions { victory: VictoryCondition::Annihilation, ..GameOptions::default() });
+        w.spawn_unit(1, "RWALL", (200 * SCALE + SCALE / 2, 200 * SCALE + SCALE / 2)).unwrap();
+        let blue_acu = w.commander_of(1).unwrap().id;
+        w.units.get_mut(&blue_acu).unwrap().hp = 0;
+        w.run(3);
+        assert!(w.army(1).unwrap().defeated, "walls alone do not keep an army alive");
+        assert_eq!(w.result(), Some(GameResult::Victory(0)));
+    }
+
+    #[test]
+    fn walls_place_flush_but_other_structures_keep_their_margin() {
+        let mut w = wall_world();
+        w.spawn_unit(0, "RWALL", (100 * SCALE + SCALE / 2, 100 * SCALE + SCALE / 2)).unwrap();
+        assert!(w.site_is_free("RWALL", 101 * SCALE + SCALE / 2, 100 * SCALE + SCALE / 2), "adjacent wall section");
+        assert!(!w.site_is_free("RWALL", 100 * SCALE + SCALE / 2, 100 * SCALE + SCALE / 2), "same spot");
+        // PD (3 m half-size) may touch a wall but not overlap it.
+        assert!(w.site_is_free("RPD", 104 * SCALE + SCALE / 2, 100 * SCALE + SCALE / 2));
+        assert!(!w.site_is_free("RPD", 103 * SCALE, 100 * SCALE + SCALE / 2));
+        w.spawn_unit(0, "RPD", (60 * SCALE, 60 * SCALE)).unwrap();
+        assert!(!w.site_is_free("RPD", 66 * SCALE + SCALE / 2, 60 * SCALE), "PDs keep the 1 m margin");
+    }
+
+    /// Phase 29 fixture: `wall_world` plus a static projectile gun `RGUN` (25 dmg, 26 m,
+    /// 3 m/tick shells, fixed mount) and an optional 10 m ridge along x = 128 m.
+    fn ballistic_world(ridge: bool, gun: impl Fn(&mut WeaponType)) -> Skirmish {
+        let mut w = wall_world();
+        let mut g = ty("RGUN", Role::Mobile, 500, 0, 25, 26);
+        g.weapons[0].beam = false;
+        g.weapons[0].muzzle_velocity = 3 * SCALE;
+        gun(&mut g.weapons[0]);
+        w.catalog.types.insert("RGUN".into(), g);
+        if ridge {
+            let n = 257usize;
+            let mut h = vec![0i64; n * n];
+            for z in 0..n {
+                h[z * n + 128] = 10 * SCALE;
+            }
+            w.set_terrain(HeightField::from_samples(256, 256, SCALE, h));
+        }
+        w
+    }
+
+    #[test]
+    fn ridge_soaks_shells_and_beams_but_open_ground_does_not() {
+        for beam in [false, true] {
+            for ridge in [true, false] {
+                let mut w = ballistic_world(ridge, |wt| wt.beam = beam);
+                w.spawn_unit(0, "RGUN", (116 * SCALE, 150 * SCALE)).unwrap();
+                let target = w.spawn_unit(1, "BT", (139 * SCALE, 150 * SCALE)).unwrap();
+                w.run(60);
+                assert!(w.shots_fired() > 0, "gun fires (beam={beam}, ridge={ridge})");
+                let t = w.unit(target);
+                let hurt = t.is_none_or(|t| t.hp < t.max_hp);
+                assert_eq!(hurt, !ridge, "beam={beam} ridge={ridge}: target hurt={hurt}");
+            }
+        }
+    }
+
+    #[test]
+    fn turrets_slew_before_firing_within_tolerance() {
+        // 50 mrad/tick: turning from +z (yaw 0) to face -z (yaw π) takes ~63 ticks.
+        let mut w = ballistic_world(false, |wt| {
+            wt.turret_yaw_speed = 50;
+            wt.firing_tolerance = 35;
+        });
+        let gun = w.spawn_unit(0, "RGUN", (100 * SCALE, 150 * SCALE)).unwrap();
+        w.spawn_unit(1, "BT", (100 * SCALE, 130 * SCALE)).unwrap();
+        w.run(55);
+        assert_eq!(w.shots_fired(), 0, "still slewing");
+        assert!(combat::wrap_mrad(w.unit(gun).unwrap().weapons[0].yaw).abs() > 2_500, "turned most of the way");
+        w.run(20);
+        assert!(w.shots_fired() > 0, "fires once aimed");
+    }
+
+    #[test]
+    fn shells_hit_the_first_enemy_on_their_path_and_lead_movers() {
+        let mut w = ballistic_world(false, |_| {});
+        w.spawn_unit(0, "RGUN", (100 * SCALE, 150 * SCALE)).unwrap();
+        let wall = w.spawn_unit(1, "RWALL", (110 * SCALE, 150 * SCALE)).unwrap();
+        let tank = w.spawn_unit(1, "BT", (120 * SCALE, 150 * SCALE)).unwrap();
+        w.run(40);
+        let wl = w.unit(wall).unwrap();
+        assert!(wl.hp < wl.max_hp, "wall in the line of fire soaks the shells");
+        let t = w.unit(tank).unwrap();
+        assert_eq!(t.hp, t.max_hp, "tank behind the wall is untouched");
+
+        // A crossing target is still hit thanks to target leading; without leading the
+        // slow shells land behind it.
+        let mut hits = [0i64; 2];
+        for (i, lead) in [true, false].into_iter().enumerate() {
+            let mut w = ballistic_world(false, |wt| {
+                wt.lead_target = lead;
+                wt.muzzle_velocity = SCALE;
+            });
+            w.spawn_unit(0, "RGUN", (100 * SCALE, 100 * SCALE)).unwrap();
+            let runner = w.spawn_unit(1, "BT", (120 * SCALE, 85 * SCALE)).unwrap();
+            w.issue(1, Command::Move { units: vec![runner], x: 120 * SCALE, y: 200 * SCALE, queue: false });
+            w.run(70);
+            hits[i] = w.unit(runner).map_or(i64::MAX, |u| u.max_hp - u.hp);
+        }
+        assert!(hits[0] > hits[1], "leading lands more damage ({} vs {})", hits[0], hits[1]);
+    }
+
+    #[test]
+    fn structures_block_pathing_and_factories_roll_units_off() {
+        let mut w = wall_world();
+        let fac = w.spawn_unit(0, "RF", (128 * SCALE, 120 * SCALE)).unwrap();
+        w.step();
+        assert!(w.is_wall_cell((128 * SCALE, 120 * SCALE)), "factory footprint blocks its centre cell");
+        let tank = w.spawn_unit(0, "RT", (110 * SCALE, 120 * SCALE)).unwrap();
+        w.issue(0, Command::Move { units: vec![tank], x: 146 * SCALE, y: 120 * SCALE, queue: false });
+        for _ in 0..400 {
+            w.step();
+            let u = w.unit(tank).unwrap();
+            assert!(!w.is_wall_cell((u.pos.x, u.pos.y)), "tank walked into the factory at {:?}", u.pos);
+        }
+        assert_eq!(w.unit(tank).unwrap().pos, Vec2 { x: 146 * SCALE, y: 120 * SCALE });
+
+        // Wall the factory's exit side; the produced unit still rolls off onto open ground.
+        for x in 120..137 {
+            w.spawn_unit(0, "RWALL", (x * SCALE + SCALE / 2, 125 * SCALE + SCALE / 2)).unwrap();
+        }
+        w.armies[0].mass = 10_000 * SCALE;
+        w.armies[0].energy = 100_000 * SCALE;
+        w.issue(0, Command::Produce { factory: fac, unit_type: "RT".into(), count: 1 });
+        let before: Vec<UnitId> = w.units().map(|u| u.id).collect();
+        w.run(60);
+        let fresh: Vec<&Unit> = w.units().filter(|u| !before.contains(&u.id) && u.role == Role::Mobile).collect();
+        assert_eq!(fresh.len(), 1, "one tank produced");
+        assert!(!w.is_wall_cell((fresh[0].pos.x, fresh[0].pos.y)), "rolled off onto an open cell");
+    }
+
+    /// Phase 30 fixture: `wall_world` with a 10 s-fuel fighter (`RAIR`, 12 m/s) and an air
+    /// staging platform `RSTAGE` (2 slots).
+    fn staging_world() -> Skirmish {
+        let mut w = wall_world();
+        let air = w.catalog.types.get_mut("RAIR").unwrap();
+        air.ext.fuel_ticks = 100;
+        air.ext.fuel_recharge_milli = 5_000;
+        let mut st = ty("RSTAGE", Role::AirStaging, 500, 0, 0, 0);
+        st.ext.staging = Some(StagingSpec {
+            slots: 2,
+            refuel_multiplier: 2,
+            repair_permille: 100,
+            repair_energy: 5 * SCALE,
+            repair_mass: SCALE / 2,
+            scan_radius: 300 * SCALE,
+        });
+        w.catalog.types.insert("RSTAGE".into(), st);
+        w.armies[0].mass = 1_000 * SCALE;
+        w.armies[0].energy = 10_000 * SCALE;
+        w
+    }
+
+    #[test]
+    fn aircraft_burn_fuel_and_fly_at_half_speed_when_empty() {
+        let mut w = staging_world();
+        let f = w.spawn_unit(0, "RAIR", (40 * SCALE, 120 * SCALE)).unwrap();
+        w.issue(0, Command::SetAutoRefuel { units: vec![f], enabled: false });
+        w.issue(0, Command::Patrol { units: vec![f], x: 220 * SCALE, y: 120 * SCALE, queue: false });
+        let full = w.unit(f).unwrap().speed;
+        w.run(50);
+        assert_eq!(w.unit(f).unwrap().fuel, 50);
+        assert_eq!(w.unit(f).unwrap().speed, full);
+        w.run(60);
+        let u = w.unit(f).unwrap();
+        assert_eq!(u.fuel, 0);
+        assert_eq!(u.speed, full / 2, "out of fuel: half speed");
+    }
+
+    #[test]
+    fn low_fuel_aircraft_dock_refuel_repair_and_resume() {
+        let mut w = staging_world();
+        let st = w.spawn_unit(0, "RSTAGE", (60 * SCALE, 60 * SCALE)).unwrap();
+        let f = w.spawn_unit(0, "RAIR", (60 * SCALE, 90 * SCALE)).unwrap();
+        w.issue(0, Command::Move { units: vec![f], x: 200 * SCALE, y: 200 * SCALE, queue: false });
+        w.issue(0, Command::Move { units: vec![f], x: 60 * SCALE, y: 200 * SCALE, queue: true });
+        w.step();
+        w.units.get_mut(&f).unwrap().hp /= 2;
+        let energy0 = w.armies[0].energy;
+        let (mut docked, mut ticks) = (false, 0);
+        while ticks < 400 {
+            w.step();
+            ticks += 1;
+            let u = w.unit(f).unwrap();
+            if u.carried_by == Some(st) {
+                docked = true;
+                assert_eq!(u.pos, w.unit(st).unwrap().pos);
+            } else if docked {
+                break;
+            }
+        }
+        assert!(docked, "low-fuel fighter docked at the platform");
+        let u = w.unit(f).unwrap();
+        assert_eq!((u.fuel, u.hp), (100, u.max_hp), "undocks refuelled and repaired");
+        assert!(w.armies[0].energy < energy0, "repair costs energy");
+        assert!(matches!(u.orders.front(), Some(UnitOrder::Move { .. })), "resumes its orders: {:?}", u.orders);
+    }
+
+    #[test]
+    fn staging_slots_are_limited_and_dead_platforms_release_aircraft() {
+        let mut w = staging_world();
+        let st = w.spawn_unit(0, "RSTAGE", (60 * SCALE, 60 * SCALE)).unwrap();
+        let fs: Vec<UnitId> = (0..3).map(|i| w.spawn_unit(0, "RAIR", (60 * SCALE + i * SCALE, 70 * SCALE)).unwrap()).collect();
+        for &f in &fs {
+            w.units.get_mut(&f).unwrap().hp = 10 * SCALE;
+        }
+        w.issue(0, Command::Dock { units: fs.clone(), staging: st, queue: false });
+        w.run(10);
+        let docked = fs.iter().filter(|f| w.unit(**f).unwrap().carried_by == Some(st)).count();
+        assert_eq!(docked, 2, "only two docking slots");
+        assert!(!w.apply_command_direct(1, Command::Dock { units: vec![], staging: st, queue: false }), "enemy cannot dock");
+
+        w.units.get_mut(&st).unwrap().hp = 0;
+        w.run(2);
+        for &f in &fs {
+            let u = w.unit(f).unwrap();
+            assert!(u.alive && u.carried_by.is_none(), "aircraft released when the platform dies");
+            assert!(!matches!(u.orders.front(), Some(UnitOrder::Dock(_))));
+        }
+    }
+
+    /// Phase 31 fixture: a Hive-like station `RHIVE` (works itself, 15 m radius) and a
+    /// Kennel-like `RKEN` with one pod drone `RPOD` (upgrades to `RKEN2` with two pods).
+    fn station_world() -> Skirmish {
+        let mut w = wall_world();
+        let mut hive = ty("RHIVE", Role::EngStation, 500, 0, 0, 0);
+        hive.build_rate = 20;
+        hive.build_range = 15 * SCALE;
+        hive.radius = SCALE / 2;
+        let mut pod = ty("RPOD", Role::Engineer, 6, 10, 0, 0);
+        pod.domain = NavDomain::Air;
+        pod.elevation = SCALE;
+        pod.build_rate = 20;
+        pod.build_range = 4 * SCALE;
+        pod.cost_mass = 25 * SCALE;
+        pod.build_work = 800;
+        let mut ken = hive.clone();
+        ken.id = "RKEN".into();
+        ken.ext.pods = vec!["RPOD".into()];
+        ken.upgrades_to = Some("RKEN2".into());
+        let mut ken2 = ken.clone();
+        ken2.id = "RKEN2".into();
+        ken2.tier = 3;
+        ken2.upgrades_to = None;
+        ken2.ext.pods = vec!["RPOD".into(), "RPOD".into()];
+        for t in [hive, pod, ken, ken2] {
+            w.catalog.types.insert(t.id.clone(), t);
+        }
+        w.catalog.types.get_mut("RT").unwrap().build_work = 2_000;
+        w.armies[0].mass = 5_000 * SCALE;
+        w.armies[0].energy = 50_000 * SCALE;
+        w
+    }
+
+    /// Ticks until factory `fac` (with `RT` queued) rolls out a new unit.
+    fn ticks_to_produce(w: &mut Skirmish, fac: UnitId) -> u64 {
+        let before: Vec<UnitId> = w.units().map(|u| u.id).collect();
+        w.issue(0, Command::Produce { factory: fac, unit_type: "RT".into(), count: 1 });
+        for t in 1..=600 {
+            w.step();
+            if w.units().any(|u| !before.contains(&u.id) && u.role == Role::Mobile) {
+                return t;
+            }
+        }
+        panic!("factory never finished");
+    }
+
+    #[test]
+    fn hive_assists_construction_and_repairs_in_its_radius() {
+        let mut alone = station_world();
+        let f1 = alone.spawn_unit(0, "RF", (100 * SCALE, 100 * SCALE)).unwrap();
+        let solo = ticks_to_produce(&mut alone, f1);
+
+        let mut w = station_world();
+        let fac = w.spawn_unit(0, "RF", (100 * SCALE, 100 * SCALE)).unwrap();
+        let hive = w.spawn_unit(0, "RHIVE", (108 * SCALE, 100 * SCALE)).unwrap();
+        let helped = ticks_to_produce(&mut w, fac);
+        assert!(helped * 10 < solo * 8, "hive speeds up production ({helped} vs {solo} ticks)");
+
+        // Repairs the nearest damaged ally in range, ignores one outside it.
+        let near = w.spawn_unit(0, "RPD", (112 * SCALE, 110 * SCALE)).unwrap();
+        let far = w.spawn_unit(0, "RPD", (160 * SCALE, 100 * SCALE)).unwrap();
+        for id in [near, far] {
+            let u = w.units.get_mut(&id).unwrap();
+            u.hp = u.max_hp / 2;
+        }
+        w.run(200);
+        assert_eq!(w.unit(near).unwrap().hp, w.unit(near).unwrap().max_hp, "near PD repaired");
+        assert_eq!(w.unit(far).unwrap().hp, w.unit(far).unwrap().max_hp / 2, "far PD untouched");
+        assert!(w.unit(hive).unwrap().pos == Vec2 { x: 108 * SCALE, y: 100 * SCALE }, "hive never moves");
+    }
+
+    #[test]
+    fn kennel_pods_fly_out_to_work_return_rebuild_and_die_with_the_station() {
+        let mut w = station_world();
+        let ken = w.spawn_unit(0, "RKEN", (100 * SCALE, 100 * SCALE)).unwrap();
+        let pods = w.pods_of(ken);
+        assert_eq!(pods.len(), 1, "station spawns with its pod");
+        let pod = pods[0];
+        assert_eq!(w.unit(pod).unwrap().drone_of, Some(ken));
+
+        let hurt = w.spawn_unit(0, "RPD", (110 * SCALE, 108 * SCALE)).unwrap();
+        w.units.get_mut(&hurt).unwrap().hp = 100 * SCALE;
+        let mut flew = false;
+        for _ in 0..300 {
+            w.step();
+            let p = w.unit(pod).unwrap();
+            flew |= dist_sq((p.pos.x, p.pos.y), (100 * SCALE, 100 * SCALE)) > (4 * SCALE as i128).pow(2);
+        }
+        assert!(flew, "pod flew out to the damaged PD");
+        assert_eq!(w.unit(hurt).unwrap().hp, w.unit(hurt).unwrap().max_hp, "pod repaired it");
+        let p = w.unit(pod).unwrap();
+        assert!(dist_sq((p.pos.x, p.pos.y), (100 * SCALE, 100 * SCALE)) <= (2 * SCALE as i128).pow(2), "pod returned home");
+
+        // A destroyed pod is rebuilt (paid), the upgrade adds a second one.
+        w.units.get_mut(&pod).unwrap().hp = 0;
+        let mass0 = w.armies[0].mass;
+        w.run(30);
+        assert!(w.pods_of(ken).is_empty(), "rebuild takes time");
+        w.run(20);
+        assert_eq!(w.pods_of(ken).len(), 1, "pod rebuilt");
+        assert!(w.armies[0].mass <= mass0 - 25 * SCALE + 100 * SCALE, "rebuild paid");
+        w.issue(0, Command::Upgrade { unit: ken, target_type: "RKEN2".into() });
+        w.run(400);
+        assert_eq!(w.unit(ken).unwrap().type_id, "RKEN2");
+        assert_eq!(w.pods_of(ken).len(), 2, "upgraded station keeps two pods");
+
+        let all = w.pods_of(ken);
+        w.units.get_mut(&ken).unwrap().hp = 0;
+        w.run(3);
+        assert!(all.iter().all(|p| w.unit(*p).is_none()), "pods die with their station");
+    }
+
+    /// Phase 32 fixture: a Fatboy-like mobile factory + air staging `RFAT`, a Megalith-like
+    /// mobile builder `RMEGA` and an egg `REGG` that hatches into an engineer.
+    fn mobile_factory_world() -> Skirmish {
+        let mut w = staging_world();
+        let mut fat = ty("RFAT", Role::Experimental, 5_000, 2, 0, 0);
+        fat.build_rate = 40;
+        fat.radius = 3 * SCALE;
+        fat.ext.mobile_factory = true;
+        fat.ext.staging = Some(StagingSpec { slots: 2, refuel_multiplier: 1, repair_permille: 0, repair_energy: 0, repair_mass: 0, scan_radius: 300 * SCALE });
+        let mut mega = ty("RMEGA", Role::Experimental, 5_000, 2, 0, 0);
+        mega.build_rate = 40;
+        mega.build_range = SCALE;
+        mega.ext.mobile_builder = true;
+        let mut egg = ty("REGG", Role::Factory, 10, 0, 0, 0);
+        egg.radius = SCALE / 2;
+        egg.ext.hatch = Some("RENG".into());
+        for t in [fat, mega, egg] {
+            w.catalog.types.insert(t.id.clone(), t);
+        }
+        w.catalog.extra_buildable.resize(2, Vec::new());
+        w.catalog.extra_buildable[0].push("REGG".into());
+        w
+    }
+
+    #[test]
+    fn mobile_factories_produce_on_the_move_and_dock_aircraft() {
+        let mut w = mobile_factory_world();
+        let fat = w.spawn_unit(0, "RFAT", (60 * SCALE, 60 * SCALE)).unwrap();
+        assert!(w.is_producer(w.unit(fat).unwrap()));
+        w.issue(0, Command::Move { units: vec![fat], x: 160 * SCALE, y: 60 * SCALE, queue: false });
+        w.issue(0, Command::Produce { factory: fat, unit_type: "RT".into(), count: 1 });
+        let before: Vec<UnitId> = w.units().map(|u| u.id).collect();
+        let mut made = None;
+        for _ in 0..100 {
+            w.step();
+            if let Some(u) = w.units().find(|u| !before.contains(&u.id) && u.type_id == "RT") {
+                made = Some((u.pos, w.unit(fat).unwrap().pos));
+                break;
+            }
+        }
+        let (tank, fat_pos) = made.expect("the moving factory produced a tank");
+        assert!(fat_pos.x > 60 * SCALE, "it was moving");
+        assert!(dist_sq((tank.x, tank.y), (fat_pos.x, fat_pos.y)) <= (8 * SCALE as i128).pow(2), "tank rolls off next to it");
+
+        // Mobile air staging: a docked fighter rides along.
+        let f = w.spawn_unit(0, "RAIR", (fat_pos.x, fat_pos.y + 5 * SCALE)).unwrap();
+        w.units.get_mut(&f).unwrap().hp = SCALE;
+        w.issue(0, Command::Dock { units: vec![f], staging: fat, queue: false });
+        w.run(5);
+        assert_eq!(w.unit(f).unwrap().carried_by, Some(fat));
+        w.run(10);
+        assert_eq!(w.unit(f).unwrap().pos, w.unit(fat).unwrap().pos, "docked fighter follows the platform");
+    }
+
+    #[test]
+    fn mobile_builders_lay_eggs_that_hatch_into_units() {
+        let mut w = mobile_factory_world();
+        let mega = w.spawn_unit(0, "RMEGA", (80 * SCALE, 80 * SCALE)).unwrap();
+        assert!(w.is_constructor(w.unit(mega).unwrap()));
+        assert!(w.apply_command_direct(0, Command::Build { builder: mega, unit_type: "REGG".into(), x: 84 * SCALE, y: 80 * SCALE, queue: false }));
+        w.run(40);
+        assert!(w.units().all(|u| u.type_id != "REGG"), "the egg never lingers as a structure");
+        let hatched: Vec<&Unit> = w.units().filter(|u| u.type_id == "RENG" && u.army == 0).collect();
+        assert_eq!(hatched.len(), 1, "egg hatched into an engineer");
+        assert!(dist_sq((hatched[0].pos.x, hatched[0].pos.y), (84 * SCALE, 80 * SCALE)) <= (2 * SCALE as i128).pow(2));
+    }
+
+    #[test]
+    fn emp_hits_stun_targets_and_they_cannot_move_or_fire() {
+        let mut w = wall_world();
+        let mut emp = ty("REMP", Role::Mobile, 500, 0, 5, 20);
+        emp.weapons[0].stun = Some((30, 3 * SCALE));
+        emp.weapons[0].reset = 200;
+        w.catalog.types.insert("REMP".into(), emp);
+        w.spawn_unit(0, "REMP", (100 * SCALE, 100 * SCALE)).unwrap();
+        let tank = w.spawn_unit(1, "BT", (115 * SCALE, 100 * SCALE)).unwrap();
+        w.issue(1, Command::Move { units: vec![tank], x: 115 * SCALE, y: 200 * SCALE, queue: false });
+        w.step();
+        let stunned = w.unit(tank).unwrap().stunned;
+        assert!(stunned > 20, "EMP hit stuns the tank ({stunned})");
+        let p0 = w.unit(tank).unwrap().pos;
+        let shots0 = w.shots_fired();
+        w.run(20);
+        assert_eq!(w.unit(tank).unwrap().pos, p0, "stunned tank does not move");
+        assert_eq!(w.shots_fired(), shots0, "nobody fires: the emitter is reloading, the tank is stunned");
+        w.run(20);
+        assert!(w.unit(tank).unwrap().pos.y > p0.y, "moves again once the stun wears off");
+    }
+
+    #[test]
+    fn death_weapons_hit_friend_and_foe_and_kamikazes_detonate_once() {
+        let mut w = wall_world();
+        let mut boom_t = ty("RBOOM", Role::Generator, 100, 0, 0, 0);
+        boom_t.ext.death_damage = 100 * SCALE;
+        boom_t.ext.death_radius = 6 * SCALE;
+        w.catalog.types.insert("RBOOM".into(), boom_t);
+        let boom = w.spawn_unit(0, "RBOOM", (100 * SCALE, 100 * SCALE)).unwrap();
+        let own = w.spawn_unit(0, "RENG", (104 * SCALE, 100 * SCALE)).unwrap();
+        let foe = w.spawn_unit(1, "BENG", (100 * SCALE, 104 * SCALE)).unwrap();
+        let far = w.spawn_unit(1, "BENG", (100 * SCALE, 120 * SCALE)).unwrap();
+        w.units.get_mut(&boom).unwrap().hp = 0;
+        w.step();
+        let dmg = |w: &Skirmish, id| w.unit(id).map_or(i64::MAX, |u| u.max_hp - u.hp);
+        assert_eq!(dmg(&w, own), 100 * SCALE, "friendly unit caught in the blast");
+        assert_eq!(dmg(&w, foe), 100 * SCALE, "enemy unit caught in the blast");
+        assert_eq!(dmg(&w, far), 0, "outside the radius");
+
+        let mut w = wall_world();
+        let mut beetle = ty("RBEETLE", Role::Mobile, 100, 4, 400, 3);
+        beetle.weapons[0].kamikaze = true;
+        beetle.weapons[0].splash_radius = 3 * SCALE;
+        beetle.weapons[0].reset = 1;
+        w.catalog.types.insert("RBEETLE".into(), beetle);
+        let b = w.spawn_unit(0, "RBEETLE", (100 * SCALE, 100 * SCALE)).unwrap();
+        let victim = w.spawn_unit(1, "BPD", (110 * SCALE, 100 * SCALE)).unwrap();
+        w.issue(0, Command::Attack { units: vec![b], target: victim, queue: false });
+        w.run(40);
+        assert!(w.unit(b).is_none(), "the kamikaze died in its own blast");
+        let v = w.unit(victim).unwrap();
+        assert_eq!(v.max_hp - v.hp, 400 * SCALE, "exactly one detonation");
+    }
+
+    #[test]
+    fn orbital_centre_launches_an_untargetable_satellite_that_dies_with_it() {
+        let mut w = wall_world();
+        let mut sat = ty("RSAT", Role::Mobile, 100, 10, 75, 30);
+        sat.domain = NavDomain::Air;
+        sat.elevation = 25 * SCALE;
+        sat.ext.untargetable = true;
+        let mut novax = ty("RNOVAX", Role::Orbital, 9_000, 0, 0, 0);
+        novax.ext.satellite = Some("RSAT".into());
+        w.catalog.types.insert("RSAT".into(), sat);
+        w.catalog.types.insert("RNOVAX".into(), novax);
+        let centre = w.spawn_unit(0, "RNOVAX", (60 * SCALE, 60 * SCALE)).unwrap();
+        let sats = w.pods_of(centre);
+        assert_eq!(sats.len(), 1, "satellite launched");
+        let s = sats[0];
+        assert!(w.unit(s).unwrap().untargetable);
+
+        // Enemy AA right below never engages it, and explicit attacks are refused.
+        let aa = w.spawn_unit(1, "BAIR", (60 * SCALE, 60 * SCALE)).unwrap();
+        w.units.get_mut(&aa).unwrap().speed = 0;
+        let hp0 = w.unit(s).unwrap().hp;
+        w.issue(1, Command::Attack { units: vec![aa], target: s, queue: false });
+        w.run(30);
+        assert_eq!(w.unit(s).unwrap().hp, hp0, "satellite untouched");
+
+        w.units.get_mut(&centre).unwrap().hp = 0;
+        w.run(3);
+        assert!(w.unit(s).is_none(), "satellite falls with its launch centre");
+    }
+
+    #[test]
+    fn engineers_reclaim_trees_and_rocks_for_mass_and_energy_deterministically() {
+        let run = |reclaim: bool| {
+            let mut w = wall_world();
+            w.set_props(vec![
+                MapProp { pos: (100 * SCALE, 100 * SCALE), mass: 4 * SCALE, energy: 40 * SCALE, src_xz: (1, 2) },
+                MapProp { pos: (104 * SCALE, 100 * SCALE), mass: 5 * SCALE, energy: 0, src_xz: (3, 4) },
+                MapProp { pos: (200 * SCALE, 200 * SCALE), mass: 5 * SCALE, energy: 0, src_xz: (5, 6) },
+            ]);
+            w.armies[0].mass = 0;
+            w.armies[0].energy = 0;
+            let eng = w.spawn_unit(0, "RENG", (90 * SCALE, 100 * SCALE)).unwrap();
+            assert_eq!(w.prop_at((101 * SCALE, 100 * SCALE), PROP_SNAP).map(|p| p.0), Some(0));
+            let (m0, e0) = (w.armies[0].mass, w.armies[0].energy);
+            if reclaim {
+                w.issue(0, Command::Reclaim { units: vec![eng], x: 100 * SCALE, y: 100 * SCALE, queue: false });
+                w.issue(0, Command::Reclaim { units: vec![eng], x: 104 * SCALE, y: 100 * SCALE, queue: true });
+            }
+            w.run(120);
+            (w.armies[0].mass - m0, w.armies[0].energy - e0, w.props().count(), w.props_gone().to_vec(), w.state_hash())
+        };
+        let (dm, de, left, gone, h1) = run(true);
+        let (cm, ce, ..) = run(false);
+        assert_eq!(dm - cm, 9 * SCALE, "exactly both props' mass on top of income");
+        assert_eq!(de - ce, 40 * SCALE, "exactly the tree's energy on top of income");
+        assert_eq!(left, 1, "the far rock still stands");
+        assert_eq!(gone, vec![(1, 2), (3, 4)], "reclaimed props reported in order for the renderer");
+        assert_eq!(run(true).4, h1, "prop reclaim is deterministic");
+    }
+
+    #[test]
+    fn observer_apm_and_army_summary_track_commands_without_touching_the_hash() {
+        let mut a = test_world(7);
+        let mut b = test_world(7);
+        let army = a.armies()[0].id;
+        let unit = a.units().find(|u| u.army == army && !u.role.is_structure()).map(|u| u.id).unwrap();
+        for k in 0..30 {
+            a.apply_command_direct(army, Command::Move { units: vec![unit], x: (100 + k) * SCALE, y: 100 * SCALE, queue: false });
+            b.apply_command_direct(army, Command::Move { units: vec![unit], x: (100 + k) * SCALE, y: 100 * SCALE, queue: false });
+            a.step();
+            b.step();
+        }
+        assert_eq!(a.state_hash(), b.state_hash());
+        // 30 commands in 30 ticks: the window floor is 10 s, so 30 actions over 10 s -> 180 APM.
+        assert_eq!(a.apm(army), 180);
+        assert_eq!(a.apm(army + 1), 0);
+        let (mobile, _s, value) = a.army_summary(army);
+        let expect: i64 = a
+            .units()
+            .filter(|u| u.alive && u.army == army && !u.role.is_structure() && u.role != Role::Commander)
+            .map(|u| a.catalog().get(&u.type_id).unwrap().cost_mass)
+            .sum();
+        assert!(mobile >= 1);
+        assert_eq!(value, expect / SCALE, "army value excludes the commander");
+        // Old entries age out of the one-minute window.
+        for _ in 0..(APM_WINDOW_TICKS + 5) {
+            a.step();
+        }
+        assert_eq!(a.apm(army), 0);
+    }
+
+    #[test]
+    fn engineers_reclaim_live_walls_for_their_mass_cost() {
+        let mut w = wall_world();
+        w.catalog.types.get_mut("RWALL").unwrap().cost_mass = 20 * SCALE;
+        let wall = w.spawn_unit(0, "RWALL", (100 * SCALE + SCALE / 2, 100 * SCALE + SCALE / 2)).unwrap();
+        let eng = w.spawn_unit(0, "RENG", (94 * SCALE, 100 * SCALE)).unwrap();
+        w.step();
+        assert!(w.is_wall_cell((100 * SCALE, 100 * SCALE)));
+        w.armies[0].mass = 0;
+        let mut control = w.clone();
+        w.issue(0, Command::Reclaim { units: vec![eng], x: 100 * SCALE + SCALE / 2, y: 100 * SCALE + SCALE / 2, queue: false });
+        w.run(30);
+        control.run(30);
+        assert!(w.unit(wall).is_none(), "wall reclaimed away");
+        assert!(w.wrecks().next().is_none(), "reclaimed units leave no wreck");
+        assert_eq!(w.armies[0].mass - control.armies[0].mass, 20 * SCALE, "refunds the wall's mass cost");
+        assert!(!w.is_wall_cell((100 * SCALE, 100 * SCALE)), "path grid re-opened");
+        assert!(w.unit(eng).unwrap().orders.is_empty());
+    }
+
+    #[test]
+    fn fire_states_hold_return_and_fire_at_will() {
+        let setup = |a_state: FireState, b_state: FireState| {
+            let mut w = wall_world();
+            let a = w.spawn_unit(0, "RT", (100 * SCALE, 100 * SCALE)).unwrap();
+            let b = w.spawn_unit(1, "BT", (112 * SCALE, 100 * SCALE)).unwrap();
+            w.issue(0, Command::SetFireState { units: vec![a], state: a_state });
+            w.issue(1, Command::SetFireState { units: vec![b], state: b_state });
+            w.step();
+            (w, a, b)
+        };
+        let hurt = |w: &Skirmish, id: UnitId| w.unit(id).is_none_or(|u| u.hp < u.max_hp);
+        let (mut w, a, b) = setup(FireState::HoldFire, FireState::HoldFire);
+        w.run(30);
+        assert!(!hurt(&w, a) && !hurt(&w, b), "both holding fire");
+        let (mut w, a, b) = setup(FireState::ReturnFire, FireState::HoldFire);
+        w.run(30);
+        assert!(!hurt(&w, b), "return-fire waits to be shot at");
+        w.issue(1, Command::Attack { units: vec![b], target: a, queue: false });
+        w.run(30);
+        assert!(hurt(&w, a) && hurt(&w, b), "attacked, it shoots back");
+        let (mut w, _a, b) = setup(FireState::FireAtWill, FireState::HoldFire);
+        w.run(30);
+        assert!(hurt(&w, b), "fire at will engages on its own");
+    }
+
+    #[test]
+    fn ground_fire_hits_what_stands_at_the_point_even_when_holding_fire() {
+        let mut w = wall_world();
+        let arty = w.spawn_unit(0, "RA", (100 * SCALE, 100 * SCALE)).unwrap();
+        let target = w.spawn_unit(1, "BENG", (120 * SCALE, 100 * SCALE)).unwrap();
+        w.issue(0, Command::SetFireState { units: vec![arty], state: FireState::HoldFire });
+        w.run(10);
+        assert_eq!(w.shots_fired(), 0);
+        w.issue(0, Command::AttackGround { units: vec![arty], x: 120 * SCALE, y: 100 * SCALE, queue: false });
+        w.run(40);
+        assert!(w.shots_fired() >= 1, "ground fire shoots");
+        assert!(w.unit(target).is_none_or(|u| u.hp < u.max_hp), "the shell lands on the unit at the point");
+        assert!(matches!(w.unit(arty).unwrap().orders.front(), Some(UnitOrder::AttackGround { .. })), "ground fire persists");
+    }
+
+    #[test]
+    fn guards_follow_and_defend_and_paused_factories_stop() {
+        let mut w = wall_world();
+        let vip = w.spawn_unit(0, "RENG", (60 * SCALE, 60 * SCALE)).unwrap();
+        let guard = w.spawn_unit(0, "RT", (50 * SCALE, 60 * SCALE)).unwrap();
+        w.issue(0, Command::Guard { units: vec![guard], target: vip, queue: false });
+        w.issue(0, Command::Move { units: vec![vip], x: 140 * SCALE, y: 60 * SCALE, queue: false });
+        w.run(250);
+        let (g, v) = (w.unit(guard).unwrap().pos, w.unit(vip).unwrap().pos);
+        assert!(dist_sq((g.x, g.y), (v.x, v.y)) <= (12 * SCALE as i128).pow(2), "guard kept up ({g:?} vs {v:?})");
+        let raider = w.spawn_unit(1, "BENG", (v.x + 10 * SCALE, v.y)).unwrap();
+        w.run(60);
+        assert!(w.unit(raider).is_none_or(|u| u.hp < u.max_hp), "guard engaged the threat");
+
+        let mut w = wall_world();
+        let fac = w.spawn_unit(0, "RF", (100 * SCALE, 100 * SCALE)).unwrap();
+        w.catalog.types.get_mut("RT").unwrap().build_work = 2_000;
+        w.issue(0, Command::Produce { factory: fac, unit_type: "RT".into(), count: 1 });
+        w.run(20);
+        let p1 = w.unit(fac).unwrap().build.as_ref().unwrap().project.progress;
+        w.issue(0, Command::SetBuildPaused { units: vec![fac], paused: true });
+        w.run(30);
+        let p2 = w.unit(fac).unwrap().build.as_ref().unwrap().project.progress;
+        assert!(p2 <= p1 + 20, "paused factory makes no progress ({p1} -> {p2})");
+        w.issue(0, Command::SetBuildPaused { units: vec![fac], paused: false });
+        w.run(20);
+        assert!(w.unit(fac).unwrap().build.as_ref().is_none_or(|b| b.project.progress > p2), "resumes");
+    }
+
+    #[test]
+    fn ferries_shuttle_idle_land_units_between_two_points() {
+        let mut w = wall_world();
+        let mut tr = ty("RTRANS", Role::Mobile, 300, 10, 0, 0);
+        tr.domain = NavDomain::Air;
+        tr.elevation = 8 * SCALE;
+        tr.ext.transport = Some(TransportSpec { small: 6, medium: 2, large: 1, class2_size: 2, class3_size: 4, carries_commander: false });
+        w.catalog.types.insert("RTRANS".into(), tr);
+        let t = w.spawn_unit(0, "RTRANS", (40 * SCALE, 40 * SCALE)).unwrap();
+        let pax: Vec<UnitId> = (0..3).map(|i| w.spawn_unit(0, "RT", (60 * SCALE + i * 2 * SCALE, 60 * SCALE)).unwrap()).collect();
+        let busy = w.spawn_unit(0, "RT", (61 * SCALE, 62 * SCALE)).unwrap();
+        w.issue(0, Command::Move { units: vec![busy], x: 30 * SCALE, y: 200 * SCALE, queue: false });
+        w.issue(0, Command::Ferry { transports: vec![t], from: (60 * SCALE, 60 * SCALE), to: (180 * SCALE, 160 * SCALE), queue: false });
+        let mut delivered = false;
+        for _ in 0..400 {
+            w.step();
+            if pax.iter().all(|p| {
+                let u = w.unit(*p).unwrap();
+                u.carried_by.is_none() && dist_sq((u.pos.x, u.pos.y), (180 * SCALE, 160 * SCALE)) <= (10 * SCALE as i128).pow(2)
+            }) {
+                delivered = true;
+                break;
+            }
+        }
+        assert!(delivered, "all idle units at the pick-up point were ferried across");
+        assert!(w.unit(busy).unwrap().pos.y > 70 * SCALE, "a unit with its own orders was not picked up");
+        assert!(matches!(w.unit(t).unwrap().orders.front(), Some(UnitOrder::Ferry { .. })), "the route repeats");
     }
 
     #[test]

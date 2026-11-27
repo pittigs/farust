@@ -112,6 +112,9 @@ cargo run --release -- play SCMP_001 --mute               # F3 mute, F4/F5 volum
 cargo run --release -- view-unit URL0402 --anim walk --anim-time 0.7
 cargo run --release -- host 127.0.0.1:15000 SCMP_001 --players 2 --play   # + join 127.0.0.1:15000 --play
 cargo run --release -- host 127.0.0.1:15000 SCMP_001 --players 3 --headless-ticks 600
+cargo run --release -- host 127.0.0.1:15000 SCMP_001 --players 2 --observers 1 --play  # 3rd joiner spectates
+cargo run --release -- host 127.0.0.1:15000 SCMP_001 --players 2 --play --rejoin-grace 30  # dropped players may reconnect
+cargo run --release -- join 127.0.0.1:15000 --rejoin 1 --play        # reconnect as army 1 (or --rejoin observer)
 cargo run --release -- audio render-mix fa-unpack/audio/mix.wav SCMP_001 --from 7200 --ticks 1200
 ```
 
@@ -176,4 +179,191 @@ cargo run --release -- roster
 cargo run --release -- roster --verify SCMP_009
 cargo run --release -- mods
 cargo run --release -- --mod MyMod skirmish SCMP_001
+```
+
+## Steps 26–27 — done: online invite codes + relay & classic FA UI theme
+
+- **Invite Codes & TCP Relay** (`src/rendezvous.rs`, `src/net_lobby.rs`, `src/net.rs`):
+  Host and join using `XXXX-XXXX` invite codes via a lightweight self-hosted
+  `farust rendezvous` server (tries direct TCP first, falls back to bi-directional
+  TCP relay through the rendezvous server without port-forwarding). Supports
+  Steam-compatible `+connect_lobby <CODE>` CLI launch args.
+- **Classic FA Layout & Faction Skins** (`src/settings.rs`, `src/ui_kit.rs`, `src/hud.rs`):
+  Toggle `UI Theme` in Options (`modern` / `classic`, or `FARUST_UI_THEME=classic`)
+  for the old-school top-left split Mass/Energy console, open sky, bottom-left minimap +
+  orders + build card + bottom-right unit portrait dock, and faction-colored beveled chrome.
+
+```sh
+cargo run --release -- rendezvous 0.0.0.0:15050
+cargo run --release -- host --code SCMP_001 --rendezvous 127.0.0.1:15050 --play
+cargo run --release -- join --code XXXX-XXXX --rendezvous 127.0.0.1:15050 --play
+FARUST_UI_THEME=classic cargo run --release -- play SCMP_001
+```
+
+## Step 40 — done: FA effect blueprints
+
+- **Effect blueprint parser & Lua mapping** (`src/effects.rs`, `src/blueprint.rs`, `src/fuzz.rs`):
+  Parses all 2,827 `.bp` files in `effects.scd` (`EmitterBlueprint`, `BeamBlueprint`,
+  `TrailEmitterBlueprint`) and maps weapons via `lua/EffectTemplates.lua` + unit/projectile
+  Lua class chains (`404/404 = 100.0%` weapon coverage, `368` exact Lua + `2` name match +
+  `34` faction/category FA fallback).
+- **Curve-driven GPU particle & beam pool** (`src/vfx.rs`, `src/viewer.rs`, `src/render_prep.rs`):
+  Evaluates FA emitter curves and DDS color ramps into a `128×128` GPU `texture_2d_array`
+  with single-pass premultiplied alpha/additive blending for muzzle flashes, impacts, explosions,
+  nukes, shield hits, projectile trails, and faction build beams. Render-only; sim hashes unchanged.
+
+```sh
+cargo run --release -- effects --check
+cargo run --release -- effects --coverage
+cargo run --release -- play SCMP_001 --snapshot fa-unpack/renders/phase40_battle.png --snapshot-ticks 7200
+```
+
+## Step 50 — done: map authoring tools
+
+- **`.scmap` v2.60 writer & round-trip** (`src/scmap.rs`, `src/map_author.rs`): byte-exact
+  `parse → write → parse` identity verified on all 61 stock maps (`825.55 MiB`), plus
+  world-space raise/lower/smooth heightmap brushes and prop placement/deletion.
+- **`_save.lua` & `_scenario.lua` writers** (`src/scenario.rs`): regenerate start spots
+  (`ARMY_n`), `Mass`, and `Hydrocarbon` markers while preserving other markers and Lua
+  verbatim; writes full map bundles to `$XDG_DATA_HOME/farust/maps/<NEW_ID>/` (never
+  modifying the read-only game install).
+- **Interactive GPU map editor** (`src/map_author.rs`, `src/viewer.rs`, `src/ui_kit.rs`):
+  heightmap brush (`1`), smooth brush (`2`), mass (`3`), hydrocarbon (`4`), start spot (`5`),
+  and prop (`6`) tools with a `ui_kit` toolbar (`Ctrl+S` saves to user maps).
+
+```sh
+cargo run --release -- map-roundtrip --all
+cargo run --release -- map-edit SCMP_001 MY_MAP --raise 512,512,60,12 --add-mass 512,512 --move-start 1,180,180
+cargo run --release -- map-editor SCMP_001 --out MY_MAP
+cargo run --release -- skirmish MY_MAP
+```
+
+## Step 37 — done: localization & tooltips
+
+- **FA `loc` parser & help tables** (`src/loc.rs`, `src/fuzz.rs`): parses `gamedata/loc_<LANG>.scd` (`strings_db.lua`/`usdb.lua`), loose `loc/<LANG>/`, and `lua.scd` (`unitdescription.lua`, `tooltips.lua`), with fallback to built-in German/English tables → US English → inline `<LOC key>Fallback`.
+- **Language selection & Latin-1/Cyrillic TrueType HUD** (`src/settings.rs`, `src/menu.rs`, `src/ttf.rs`, `src/ui_kit.rs`, `src/viewer.rs`, `src/hud.rs`, `src/command_card.rs`, `src/controls.rs`): `language=<code>` in `settings.ini` + `FARUST_LANG` override + Options `Language` selector, Latin-1 umlauts (`äöüÄÖÜß`) and Cyrillic in the TrueType glyph atlas, localized unit names in the stats card, and TrueType hover tooltips on every command-card, order, queue, upgrade, and enhancement button. Render/UI only: sim hashes unchanged.
+
+```sh
+cargo run --release -- loc --check
+cargo run --release -- loc uel0001_desc --lang de
+cargo run --release -- loc --unit UEL0201 --lang de
+FARUST_LANG=de cargo run --release -- menu --screen options --snapshot fa-unpack/renders/options_de.png
+FARUST_LANG=de FARUST_SNAPSHOT_SELECT=acu FARUST_SNAPSHOT_HOVER=card:0 cargo run --release -- play SCMP_001 --snapshot fa-unpack/renders/tooltip_de.png --snapshot-ticks 10
+```
+
+## Step 43 — done: announcer, map ambience & adaptive music
+
+- **Tactical & Economy Announcer** (`src/xact.rs`, `src/audio_play.rs`): Recursive `sounds/` scan indexes `Voice/US/XGG.xsb` (89 wavebanks, 3,163 cues, plus direct `"Bank#Index"` wave playback). Render-side detection drives a single-voice priority queue with 10–60 s per-event cooldowns for the focus army & shared allied intel (nuke launch/inbound/intercepted, commander under attack, 12 unit-specific experimental callouts, 15 directional/domain/tier base-under-attack callouts, 8 structure-lost callouts, shield down, mass/energy low/empty, unit cap, transport full; SupCom 1 storage-full cues reported `MISSING` on standalone FA).
+- **Per-Map Biome Ambience & Adaptive Music** (`src/audio_play.rs`, `src/play.rs`): `.scmap` terrain strata + water fraction select `Temperate` / `Oceanic` / `Volcanic` / `Arid` / `Tundra` dual-layer ambient loops scaled by strategic zoom; smoothed camera-weighted combat intensity crossfades `Base_Building` ↔ `Battle` playlists with hysteresis (`0.45` / `0.15`, 18 s calm hold) and ducks under announcer VO without touching sim hashes.
+
+```sh
+cargo run --release -- audio coverage
+cargo run --release -- audio cues --all
+cargo run --release -- audio render-mix fa-unpack/audio/phase43_mix.wav SCMP_001 --from 11800 --ticks 1800
+```
+
+## Step 44 — done: UDP lockstep, NAT hole punching & adaptive input delay
+
+- **Reliable-ordered UDP & Netem shim** (`src/udp_transport.rs`, `std::net::UdpSocket` only):
+  multiplexed UDP channel with sequence numbers, cumulative + 64-bit SACK, fast retransmit,
+  Karn/Jacobson RTT/RTO estimation with backoff, duplicate suppression, MTU-safe fragmentation,
+  keepalive/graceful FIN, and a seeded loss/duplicate/reorder/delay shim (`--netem`).
+- **UDP lockstep, hole punching & adaptive delay** (`src/net.rs`, `src/rendezvous.rs`, `src/main.rs`):
+  protocol v14 runs lockstep identically over TCP or UDP (`PeerStream`); the host adapts
+  `input_delay` from measured RTT + jitter and announces changes at agreed turn boundaries
+  (`NetControl::InputDelay`); `farust rendezvous` listens on TCP+UDP to observe public UDP
+  endpoints and coordinate simultaneous NAT hole punches with automatic TCP direct/relay fallback.
+
+```sh
+cargo run --release -- host 127.0.0.1:15000 SCMP_001 --udp --netem loss=5,dup=2,reorder=3 --headless-ticks 600
+cargo run --release -- join 127.0.0.1:15000 --udp --netem loss=5,dup=2,reorder=3
+cargo run --release -- rendezvous 0.0.0.0:15050
+cargo run --release -- host --code --udp SCMP_001 --rendezvous 127.0.0.1:15050
+cargo run --release -- join --code XXXX-XXXX --udp --rendezvous 127.0.0.1:15050
+```
+
+## Step 42 — done: HDR, bloom, unit glow, AA & gamma
+
+- **HDR & Bloom Pipeline** (`src/viewer.rs`, `src/play.rs`, `src/perf_cmds.rs`, `src/map_author.rs`): Renders the 3D scene into `Rgba16Float`, runs a 5-mip Karis bright-pass + Jimenez downsample + additive tent upsample bloom chain scaled by `.scmap` `Bloom`, applies Narkowicz ACES filmic tonemapping with exposure from `.scmap` `LightingMultiplier` plus user gamma (`0.80..1.40`), and supports `off` / `fxaa` / `msaa4` anti-aliasing (auto-fallback to FXAA when `Rgba16Float` MSAA 4× is unsupported) before compositing the 2D HUD in LDR.
+- **Data-Driven Unit Glow** (`src/dds_decode.rs`, `src/scene.rs`, `src/play.rs`, `src/render_prep.rs`): Extracts `*_SpecTeam.dds` specular (`G`) and glow (`B`) masks into a linear `Rg8Unorm` texture so glowing visors, cores, and vents bloom alongside additive VFX and shield hits.
+- **Graphics Settings** (`src/settings.rs`, `src/menu.rs`, `src/loc.rs`): `bloom=on|off`, `aa=off|fxaa|msaa4`, and `gamma=0.80..1.40` in `settings.ini` + Options (lock-free atomic cache; `FARUST_BLOOM` / `FARUST_AA` / `FARUST_GAMMA` overrides). Render-only: sim hashes unchanged.
+
+```sh
+cargo run --release -- play SCMP_001 --snapshot fa-unpack/renders/hdr_battle.png --snapshot-ticks 7200
+FARUST_BLOOM=off cargo run --release -- play SCMP_001 --snapshot fa-unpack/renders/hdr_nobloom.png --snapshot-ticks 7200
+FARUST_AA=fxaa cargo run --release -- bench-render SCMP_001 --units 4096,8192 --frames 30 --no-sim
+cargo run --release -- view-unit UAL0001 --snapshot fa-unpack/renders/ual0001_glow.png
+```
+
+## Step 47 — done: replay vault, bookmarks & sharing
+
+- **Replay Vault Index & Thumbnails** (`src/vault.rs`, `src/menu.rs`, `src/main.rs`):
+  incremental `index.farust-idx` cache (metadata, winner, mods/mission, rules-version
+  compatibility badge, `160×160` map+start-spot PNG thumbnails) with free-text and
+  qualifier search (`map:`, `player:`, `faction:`, `winner:`, `from:`, `to:`).
+- **Event Bookmarks** (`src/vault.rs`, `src/controls.rs`, `src/hud.rs`, `src/play.rs`):
+  headless re-sim detects ACU deaths, experimental completions, nuke launches, and major
+  kill bursts; replay timeline displays colored bookmark markers, `<BM`/`BM>` navigation,
+  and jumps both time and camera to the event.
+- **Rendezvous Replay Sharing** (`src/rendezvous.rs`):
+  backward-compatible v1 upload/download endpoints (8 MiB per-replay cap, total storage
+  quota, `FARPL1` parse validation, content-hash `XXXX-XXXX` share codes) integrated into
+  both the CLI and the Replays menu screen.
+
+```sh
+cargo run --release -- replay index --search "map:SCMP_009 winner:uef"
+cargo run --release -- rendezvous 0.0.0.0:15050 --replay-dir /path/to/replays
+cargo run --release -- replay upload match.farust-replay --rendezvous 127.0.0.1:15050
+cargo run --release -- replay download XXXX-XXXX --rendezvous 127.0.0.1:15050
+cargo run --release -- menu --screen replays
+```
+
+## Step 51 — done: mod manager & lobby mod sync
+
+- **Mod manager** (main menu → MODS, `src/menu.rs`, `src/mods.rs`): enable/disable mods
+  (persisted in `settings.ini`), blueprint/load conflict detection.
+- **Automatic mod transfer** (`src/net.rs`): peers missing a host mod receive it as a
+  hash-verified bundle into the per-user cache before the match starts.
+- **Data-driven weapons/abilities**: see `examples/mods/heavy_strikers`.
+
+```sh
+cargo run --release -- mods enable examples/mods/heavy_strikers
+cargo run --release -- mods conflicts
+cargo run --release -- host 127.0.0.1:15000 SCMP_001 --players 2 --mod examples/mods/heavy_strikers
+FARUST_MODS_DIR=/tmp/empty-mods cargo run --release -- join 127.0.0.1:15000   # receives the mod
+```
+
+## Step 49 — done: first campaign operation (X1CA_001)
+
+- `missions/x1ca_001.farust-mission`: three acts, six primary and two secondary
+  objectives, voice-cue captions, on the original `X1CA_001` map (main menu → CAMPAIGN).
+
+```sh
+cargo run --release -- play --mission missions/x1ca_001.farust-mission
+cargo run --release -- mission missions/x1ca_001.farust-mission --human-ai hard --trace 5
+```
+
+## Step 56 — ports (code): platform dirs, FA discovery, native audio
+
+- `src/platform.rs`: per-OS config/data/cache dirs and Steam/GOG/retail FA discovery.
+- Native audio sinks: WinMM (Windows), CoreAudio AudioQueue (macOS); Linux unchanged.
+- Golden cross-platform hash test; `zip` without C codecs so cross builds need no C compiler.
+
+```sh
+cargo run --release -- platform
+cargo check --release --target x86_64-pc-windows-gnu    # also *-apple-darwin, aarch64-unknown-linux-gnu
+```
+
+## Step 57 — CI, packaging & crash reports
+
+- CI on Linux (x86_64/aarch64), Windows and macOS (`.github/workflows/ci.yml`); tagged
+  releases build archives + AppImage and draft a GitHub release (`release.yml`).
+- `packaging/package.sh` builds the release archive locally; Flatpak manifest in
+  `packaging/flatpak/`.
+- Crash reports in `<data>/crashes/` (with the latest desync dump); 1.0 checklist in
+  `docs/RELEASE.md`.
+
+```sh
+cargo run --release -- version
+bash packaging/package.sh            # -> dist/farust-<version>-<os>-<arch>.tar.gz
 ```

@@ -39,7 +39,8 @@ const DEFEND_RADIUS: i64 = 70 * U;
 const GATHER_DIST: i64 = 28 * U;
 const ACU_LEASH: i64 = 60 * U;
 const ACU_MEX_RANGE: i64 = 60 * U;
-const ROLES: usize = 18;
+/// Number of [`Role`] codes (`Role::code` is 0..ROLES).
+const ROLES: usize = 22;
 /// Raids start after 4 minutes of game time.
 const RAID_START: u64 = 2_400;
 /// Air units at least this fast (milli per tick) are used for strikes, otherwise kept home.
@@ -62,6 +63,8 @@ pub enum Difficulty {
     Hard,
     /// Starts as `normal`, then plays harder while losing and softer while winning.
     Adaptive,
+    /// Phase 52: the Phase 19 `hard` profile, frozen as an arena benchmark (`hard19`).
+    Hard19,
 }
 
 impl Difficulty {
@@ -80,6 +83,7 @@ impl Difficulty {
             Difficulty::Normal => "normal",
             Difficulty::Hard => "hard",
             Difficulty::Adaptive => "adaptive",
+            Difficulty::Hard19 => "hard19",
         }
     }
 
@@ -91,6 +95,7 @@ impl Difficulty {
             Difficulty::Normal => "faction openings, threat-map targeting, scouting, retreats",
             Difficulty::Hard => "fast APM, tight queued openings, raids, overcharge & focus-fire micro",
             Difficulty::Adaptive => "normal that plays harder while losing and softer while winning",
+            Difficulty::Hard19 => "the Phase 19 hard AI, kept as a benchmark",
         }
     }
 }
@@ -106,6 +111,7 @@ impl FromStr for Difficulty {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.trim().to_ascii_lowercase().as_str() {
             "legacy" | "old" => Ok(Difficulty::Legacy),
+            "hard19" => Ok(Difficulty::Hard19),
             "easy" => Ok(Difficulty::Easy),
             "normal" | "medium" => Ok(Difficulty::Normal),
             "hard" => Ok(Difficulty::Hard),
@@ -115,6 +121,101 @@ impl FromStr for Difficulty {
             )),
         }
     }
+}
+
+/// Phase 53: play style layered over a difficulty profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum Personality {
+    #[default]
+    Balanced,
+    /// Early, frequent attacks with T1 mass; little teching.
+    Rush,
+    /// Point defenses, shields and a large home guard; attacks only with overwhelming power.
+    Turtle,
+    /// Air factories early and scaled with income.
+    Air,
+    /// Tech push and early experimentals.
+    Tech,
+}
+
+impl Personality {
+    pub const ALL: [Personality; 5] = [Personality::Balanced, Personality::Rush, Personality::Turtle, Personality::Air, Personality::Tech];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Personality::Balanced => "balanced",
+            Personality::Rush => "rush",
+            Personality::Turtle => "turtle",
+            Personality::Air => "air",
+            Personality::Tech => "tech",
+        }
+    }
+
+    pub fn parse(s: &str) -> Result<Self, String> {
+        let s = s.trim().to_ascii_lowercase();
+        Self::ALL
+            .into_iter()
+            .find(|p| p.name() == s)
+            .ok_or_else(|| format!("unknown AI personality '{s}' (balanced, rush, turtle, air, tech)"))
+    }
+
+    /// The profile `p` played in this style.
+    pub fn apply(self, p: Profile) -> Profile {
+        match self {
+            Personality::Balanced => p,
+            Personality::Rush => Profile {
+                min_attack_power: (p.min_attack_power / 3).max(250),
+                attack_ratio: p.attack_ratio.min(90),
+                max_land_fac: p.max_land_fac + 2,
+                fac_per_income: (p.fac_per_income - 1).max(2),
+                tech: false,
+                fac_upgrade: false,
+                guards: 0,
+                ..p
+            },
+            Personality::Turtle => Profile { attack_ratio: p.attack_ratio.max(170), min_attack_power: p.min_attack_power * 3, guards: 6, turtle: true, ..p },
+            Personality::Air => Profile { air_focus: true, air: true, ..p },
+            Personality::Tech => Profile { tech_push: true, tech: true, fac_upgrade: true, exp_income: 45, ..p },
+        }
+    }
+}
+
+/// Parses `rush` (every army) or a per-army list `rush,turtle` (cycled to `armies`).
+pub fn parse_personality_list(s: &str, armies: usize) -> Result<Vec<Personality>, String> {
+    let list: Vec<Personality> = s.split(',').filter(|x| !x.trim().is_empty()).map(Personality::parse).collect::<Result<_, _>>()?;
+    if list.is_empty() {
+        return Err("empty --personality list".into());
+    }
+    Ok((0..armies).map(|i| list[i % list.len()]).collect())
+}
+
+/// Phase 52: Elo ladder over arena results `(left, right, winner side)` (draws = ½).
+/// Batch Elo: 40 passes over the games with a shrinking K so the ratings do not depend
+/// on game order; everyone starts at 1500.
+pub fn elo_ratings(games: &[(Difficulty, Difficulty, Option<u8>)]) -> std::collections::BTreeMap<Difficulty, f64> {
+    let mut r: std::collections::BTreeMap<Difficulty, f64> = std::collections::BTreeMap::new();
+    for &(a, b, _) in games {
+        r.entry(a).or_insert(1500.0);
+        r.entry(b).or_insert(1500.0);
+    }
+    for pass in 0..40 {
+        let k = 32.0 / (1.0 + pass as f64 * 0.5);
+        for &(a, b, w) in games {
+            if a == b {
+                continue;
+            }
+            let (ra, rb) = (r[&a], r[&b]);
+            let ea = 1.0 / (1.0 + 10f64.powf((rb - ra) / 400.0));
+            let sa = match w {
+                Some(0) => 1.0,
+                Some(_) => 0.0,
+                None => 0.5,
+            };
+            *r.get_mut(&a).unwrap() += k * (sa - ea);
+            *r.get_mut(&b).unwrap() -= k * (sa - ea);
+        }
+    }
+    r
 }
 
 /// Parses `hard` (every army) or a per-army list `hard,normal` (cycled to `armies`).
@@ -180,6 +281,14 @@ pub struct Profile {
     pub tech: bool,
     pub air: bool,
     pub naval: bool,
+    /// Phase 52: reserve a busy factory for its tech upgrade (stop feeding it, upgrade as
+    /// soon as it falls idle) instead of waiting for an idle one that never comes.
+    pub tech_push: bool,
+    /// Phase 53 personalities: extra defenses, air-heavy production, experimental timing
+    /// (mass income per second that starts experimentals; 0 = difficulty default).
+    pub turtle: bool,
+    pub air_focus: bool,
+    pub exp_income: i64,
 }
 
 impl Profile {
@@ -218,6 +327,10 @@ impl Profile {
             tech: true,
             air: true,
             naval: true,
+            tech_push: false,
+            turtle: false,
+            air_focus: false,
+            exp_income: 0,
         };
         match d {
             Difficulty::Easy => Self {
@@ -251,7 +364,25 @@ impl Profile {
                 naval: false,
                 ..normal
             },
+            // Phase 52: hard keeps hard19's economy / APM but fights like a committed
+            // normal (Phase 19 hard over-retreated and bled units into raids).
             Difficulty::Hard => Self {
+                attack_ratio: 110,
+                retreat_ratio: 180,
+                min_attack_power: 900,
+                raids: 1,
+                mex_danger: 150,
+                tech_push: true,
+                mex_parallel: 2,
+                eng_max: 14,
+                max_land_fac: 8,
+                eng_parallel: 3,
+                energy_ratio: 5,
+                max_pgen_batch: 2,
+                energy_margin: 100,
+                ..Self::of(Difficulty::Hard19)
+            },
+            Difficulty::Hard19 => Self {
                 think: 10,
                 max_cmds: 40,
                 reorder: 20,
@@ -308,6 +439,24 @@ impl ScriptedAi {
             d => Brain::Smart(Box::new(Smart::new(army, d))),
         };
         Self { army, difficulty, brain }
+    }
+
+    /// Phase 53: same as [`Self::with_difficulty`] played in `personality` (ignored by the
+    /// legacy AI).
+    pub fn with_personality(army: ArmyId, difficulty: Difficulty, personality: Personality) -> Self {
+        let mut ai = Self::with_difficulty(army, difficulty);
+        if let Brain::Smart(s) = &mut ai.brain {
+            s.personality = personality;
+        }
+        ai
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn personality(&self) -> Personality {
+        match &self.brain {
+            Brain::Smart(s) => s.personality,
+            Brain::Legacy(_) => Personality::Balanced,
+        }
     }
 
     /// Difficulty currently in effect (differs from `difficulty` only for `adaptive`).
@@ -380,6 +529,28 @@ fn splitmix(x: u64) -> u64 {
 
 fn has(w: &Skirmish, id: &str) -> bool {
     !id.is_empty() && w.catalog().get(id).is_some()
+}
+
+/// One structure want: role, blueprint, wanted count, site anchor, search ring.
+type WantRow<'a> = (Role, &'a String, u32, Option<(i64, i64)>, i64);
+
+/// Phase 30: the air staging platform faction `f` can build (data-driven roster).
+fn staging_type(w: &Skirmish, f: &Faction) -> Option<String> {
+    let cat = w.catalog();
+    let fi = cat.factions.iter().position(|x| x.key == f.key)?;
+    cat.types
+        .values()
+        .filter(|t| t.role == Role::AirStaging && cat.roster.playable.get(fi).is_some_and(|p| p.contains(&t.id)))
+        .map(|t| t.id.clone())
+        .min()
+}
+
+/// Whether builder `b` may place `ty` (fixed faction structures, or a roster option of its
+/// own blueprint — the same test `Command::Build` applies).
+fn builder_may_build(w: &Skirmish, f: &Faction, b: &Unit, ty: &str) -> bool {
+    let cat = w.catalog();
+    cat.factions.iter().position(|x| x.key == f.key).is_some_and(|fi| cat.faction_can_build(fi, ty))
+        || cat.builder_can_build(&b.type_id, ty)
 }
 
 fn role_of(w: &Skirmish, id: &str) -> Option<Role> {
@@ -582,6 +753,8 @@ struct Wants {
     shield: u32,
     tml: u32,
     exp: u32,
+    /// Phase 30: air staging platforms.
+    staging: u32,
     eng: usize,
 }
 
@@ -695,6 +868,13 @@ struct Smart {
     base_hit_tick: u64,
     base_hit_peak: i32,
     last_adapt: u64,
+    /// Phase 52 tech push: factory held back for its upgrade.
+    upgrade_reserve: Option<UnitId>,
+    /// Phase 53 play style and the newest ally ping already handled `(tick, army)`.
+    personality: Personality,
+    ping_seen: (u64, ArmyId),
+    /// Engineers lent to an ally after a move ping, until the given tick.
+    lent: BTreeMap<UnitId, u64>,
 }
 
 impl Smart {
@@ -730,6 +910,10 @@ impl Smart {
             base_hit_tick: 0,
             base_hit_peak: 0,
             last_adapt: 0,
+            upgrade_reserve: None,
+            personality: Personality::Balanced,
+            ping_seen: (0, 0),
+            lent: BTreeMap::new(),
         }
     }
 
@@ -828,7 +1012,7 @@ impl Smart {
             self.initialize(w);
         }
         self.adapt(w);
-        let p = Profile::of(self.eff);
+        let p = self.personality.apply(Profile::of(self.eff));
         self.prune(w, tick);
         let mut v = self.view(w, f, p);
         self.update_intel(&mut v);
@@ -838,6 +1022,7 @@ impl Smart {
         let mut out = Out { cmds: Vec::new(), budget: p.max_cmds };
 
         self.plan_acu(&mut v, &bt, &mut out);
+        self.answer_pings(&v, &mut out);
         self.plan_army(&v, &bt, &mut out);
         self.plan_factories(&mut v, &mut out);
         self.plan_engineers(&mut v, &mut out);
@@ -926,7 +1111,8 @@ impl Smart {
         };
         let cat = w.catalog();
         for u in w.units() {
-            if u.army == me {
+            // Phase 31: pod drones are driven by their engineering station, not the AI.
+            if u.army == me && u.drone_of.is_none() {
                 v.have[u.role.code() as usize] += 1;
                 match u.role {
                     Role::Commander => v.acu = Some(u),
@@ -1172,6 +1358,22 @@ impl Smart {
         if p.naval && self.naval_home.is_some() && has(w, &f.naval_factory) && inc >= 10 && lands >= 2 {
             want.naval = 1 + u32::from(p.micro && inc >= 30);
         }
+        if p.air_focus && p.air && has(w, &f.air_factory) && lands >= 1 && inc >= 6 {
+            want.air = want.air.max((1 + (inc / 20) as u32).min(4));
+        }
+        // Phase 52 map awareness: when no enemy base is reachable by land (island maps),
+        // scale air / naval production with income.
+        let island = p.tech_push
+            && !v.enemy_starts.is_empty()
+            && self.land.as_ref().is_some_and(|r| v.enemy_starts.iter().all(|(_, s)| !r.near(*s, 2)));
+        if island {
+            if p.air && has(w, &f.air_factory) && lands >= 1 {
+                want.air = (2 + (inc / 30) as u32).min(5);
+            }
+            if p.naval && self.naval_home.is_some() && has(w, &f.naval_factory) && lands >= 1 {
+                want.naval = (2 + (inc / 30) as u32).min(5);
+            }
+        }
         if has(w, &f.point_defense) {
             let attacked = self.base_hit_tick > 0 && v.tick < self.base_hit_tick + 1_500;
             let base_inc = if p.micro { 10 } else if p.tech { 8 } else { 5 };
@@ -1180,6 +1382,9 @@ impl Smart {
                 pd += 1 + (self.base_hit_peak / 300) as u32;
             }
             want.pd = pd.min(if p.tech { 5 } else { 2 });
+            if p.turtle && inc >= 6 {
+                want.pd = (want.pd + 2 + (inc / 20) as u32).min(10);
+            }
         }
         if has(w, &f.anti_air) && self.enemy_air_seen > 0 && inc >= 3 {
             want.aa = (1 + self.enemy_air_seen as u32 / 250).min(if p.tech { 5 } else { 1 });
@@ -1190,13 +1395,24 @@ impl Smart {
         if p.overcharge && v.inc_e >= 6_000 && has(w, &f.energy_storage) {
             want.estor = 1;
         }
-        if p.tech && inc >= 30 && has(w, &f.shield) {
+        if p.turtle && inc >= 15 && has(w, &f.shield) {
+            want.shield = 1 + u32::from(inc >= 35);
+        } else if p.tech && inc >= 30 && has(w, &f.shield) {
             want.shield = 1 + u32::from(inc >= 60);
         }
         if p.micro && p.tech && inc >= 35 && has(w, &f.tac_missile) {
             want.tml = 1;
         }
-        if p.tech && has(w, &f.experimental) && inc >= if p.micro { 70 } else { 90 } && v.mass_float() {
+        // Phase 30: one staging platform (two with a big air force) once aircraft fly.
+        let aircraft = w
+            .units()
+            .filter(|u| u.army == self.army && u.alive && u.domain == NavDomain::Air && u.speed > 0)
+            .count() as u32;
+        if aircraft >= 4 && inc >= 8 && staging_type(w, v.f).is_some() {
+            want.staging = 1 + u32::from(aircraft >= 20);
+        }
+        let exp_inc = if p.exp_income > 0 { p.exp_income } else if p.micro { 70 } else { 90 };
+        if p.tech && has(w, &f.experimental) && inc >= exp_inc && v.mass_float() {
             want.exp = v.have[Role::Experimental.code() as usize] + 1;
         }
         let free = self.free_mex_count(v);
@@ -1472,7 +1688,8 @@ impl Smart {
         // 3. Structures by priority.
         let pd_anchor = self.forward(v, 22 * U);
         let pg_anchor = self.pgen_anchor(v);
-        let wants: [(Role, &String, u32, Option<(i64, i64)>, i64); 10] = [
+        let staging_ty = staging_type(w, f).unwrap_or_default();
+        let wants: [WantRow; 11] = [
             (Role::Factory, &f.factory, v.want.land, Some(v.start), 14),
             (Role::AntiAir, &f.anti_air, v.want.aa, Some(v.start), 10),
             (Role::PointDefense, &f.point_defense, v.want.pd, Some(pd_anchor), 8),
@@ -1483,6 +1700,7 @@ impl Smart {
             (Role::Shield, &f.shield, v.want.shield, Some(v.start), 10),
             (Role::MissileSilo, &f.tac_missile, v.want.tml, Some(v.start), 12),
             (Role::Experimental, &f.experimental, v.want.exp, Some(v.start), 14),
+            (Role::AirStaging, &staging_ty, v.want.staging, Some(v.start), 14),
         ];
         for (role, ty, want, anchor, ring) in wants {
             let Some(anchor) = anchor else { continue };
@@ -1499,6 +1717,10 @@ impl Smart {
             if is_acu && matches!(role, Role::Experimental | Role::NavalFactory) {
                 continue;
             }
+            // Roster-derived types (e.g. air staging) need a builder of the right tech tier.
+            if !builder_may_build(w, f, b, ty) {
+                continue;
+            }
             if let Some(s) = self.find_site(v, ty, anchor, ring) {
                 return Some(Work::Build(vec![(ty.clone(), s)]));
             }
@@ -1506,7 +1728,7 @@ impl Smart {
         // 4. Reclaim battlefield wrecks.
         if !is_acu
             && v.mass * 10 < v.mass_cap * 6
-            && let Some((_, wp)) = w.wreck_at(bp, 45 * U)
+            && let Some(wp) = w.reclaimable_mass_near(bp, 45 * U)
             && self.tm().surface_threat(wp, U) <= v.p.mex_danger
         {
             return Some(Work::Reclaim(wp));
@@ -1826,7 +2048,7 @@ impl Smart {
 
     fn pick_factory_upgrade(&self, v: &View) -> Option<(UnitId, String)> {
         let p = v.p;
-        if !p.fac_upgrade || v.factories.iter().any(|f| upgrading(f)) || v.want.pgens > 0 {
+        if !p.fac_upgrade || v.factories.iter().any(|f| upgrading(f)) || (v.want.pgens > 0 && !p.tech_push) {
             return None;
         }
         let inc = v.inc_m_s();
@@ -1841,7 +2063,7 @@ impl Smart {
         let mut cands: Vec<&&Unit> = v
             .factories
             .iter()
-            .filter(|f| is_idle(f) && f.production.is_empty())
+            .filter(|f| p.tech_push || (is_idle(f) && f.production.is_empty()))
             .filter(|f| match (f.role, f.tier) {
                 (Role::Factory, 1) => inc >= 15,
                 (Role::Factory, 2) => inc >= 35,
@@ -1859,7 +2081,22 @@ impl Smart {
         let tick = v.tick;
         let p = v.p;
         let op = ai_build::opening(&v.f.key, p.sloppy_opening);
-        let upgrade = self.pick_factory_upgrade(v);
+        let mut upgrade = self.pick_factory_upgrade(v);
+        if p.tech_push {
+            // Keep one reserved factory until it has upgraded (or died).
+            let still = self.upgrade_reserve.and_then(|id| v.factories.iter().find(|f| f.id == id && !upgrading(f)).map(|f| f.id));
+            match (still, &upgrade) {
+                (Some(id), _) => {
+                    let f = v.factories.iter().find(|f| f.id == id).unwrap();
+                    upgrade = upgrade_target(v.w, f).map(|t| (id, t));
+                    if upgrade.is_none() {
+                        self.upgrade_reserve = None;
+                    }
+                }
+                (None, Some((id, _))) => self.upgrade_reserve = Some(*id),
+                (None, None) => self.upgrade_reserve = None,
+            }
+        }
         let first_land = v.factories.iter().filter(|f| f.role == Role::Factory).map(|f| f.id).min();
         let mut eng_total = v.have[Role::Engineer.code() as usize] as usize + v.eng_queued;
         let mut eng_now = v.eng_queued;
@@ -1887,6 +2124,7 @@ impl Smart {
             {
                 if out.push(Command::Upgrade { unit: fac.id, target_type: ty.clone() }) {
                     self.mark(&[fac.id], tick);
+                    self.upgrade_reserve = None;
                 }
                 continue;
             }
@@ -1997,6 +2235,9 @@ impl Smart {
         }
         let mut assist: BTreeMap<UnitId, Vec<UnitId>> = BTreeMap::new();
         for e in engs {
+            if self.lent.contains_key(&e.id) {
+                continue;
+            }
             if !out.room() {
                 break;
             }
@@ -2127,6 +2368,63 @@ impl Smart {
             }
         }
         None
+    }
+
+    /// Phase 53 co-op: react to the newest ping of an allied army (within 30 s): attack →
+    /// push the army there, alert → defend there, move → lend two engineers that assist
+    /// the ally's nearest builder. Only AIs that coordinate with their team listen.
+    fn answer_pings(&mut self, v: &View, out: &mut Out) {
+        let tick = v.tick;
+        let p = v.p;
+        self.lent.retain(|id, until| *until > tick && v.w.unit(*id).is_some());
+        if !p.team_coord {
+            return;
+        }
+        let newest = v
+            .w
+            .pings()
+            .filter(|(t, a, ..)| *a != self.army && v.w.are_allies(*a, self.army) && tick.saturating_sub(*t) <= 300)
+            .filter(|(t, a, ..)| (*t, *a) > self.ping_seen)
+            .max_by_key(|(t, a, ..)| (*t, *a))
+            .copied();
+        let Some((pt, pa, kind, at)) = newest else { return };
+        self.ping_seen = (pt, pa);
+        match kind {
+            2 => {
+                self.set_phase(Phase::Attack, tick);
+                self.target = Some(at);
+                self.attack_power = 1;
+                let ids: Vec<UnitId> = self.task_units(v, Task::Army).iter().map(|u| u.id).collect();
+                self.push_group(out, ids, at, 0, tick);
+            }
+            0 => {
+                self.set_phase(Phase::Defend, tick);
+                self.target = Some(at);
+                let ids: Vec<UnitId> = self.task_units(v, Task::Army).iter().map(|u| u.id).collect();
+                self.push_group(out, ids, at, 0, tick);
+            }
+            _ => {
+                let mut engs: Vec<&&Unit> = v.engineers.iter().filter(|e| !self.lent.contains_key(&e.id)).collect();
+                engs.sort_by_key(|e| (d2(pos(e), at), e.id));
+                let helper = v
+                    .w
+                    .units()
+                    .filter(|u| u.army == pa && u.alive && (u.role.is_builder() || u.role.is_factory()))
+                    .min_by_key(|u| (d2((u.pos.x, u.pos.y), at), u.id))
+                    .map(|u| u.id);
+                for e in engs.into_iter().take(2) {
+                    let cmd = match helper {
+                        Some(h) => Command::Assist { units: vec![e.id], target: h, queue: false },
+                        None => Command::Move { units: vec![e.id], x: at.0, y: at.1, queue: false },
+                    };
+                    if out.push(cmd) {
+                        self.lent.insert(e.id, tick + 1_200);
+                        self.jobs.remove(&e.id);
+                        self.mark(&[e.id], tick);
+                    }
+                }
+            }
+        }
     }
 
     fn plan_army(&mut self, v: &View, bt: &BaseThreat, out: &mut Out) {
@@ -2622,6 +2920,27 @@ mod tests {
         w
     }
 
+    /// Phase 56: pinned hashes for the platform-independence contract. The sim is integer
+    /// only (blueprint floats are quantized with IEEE-exact `*`/`round`; the two runtime
+    /// `sqrt`s are correctly rounded everywhere), so these must match bit for bit on
+    /// x86_64, aarch64, Windows, macOS and Linux. A change here is a rules change.
+    #[test]
+    fn golden_hashes_pin_cross_platform_determinism() {
+        let (_, rep) = crate::sim::run_selftest(10_000, crate::sim::DEFAULT_SEED);
+        assert_eq!(rep.hash, 0x35db_8f2b_d7a6_faf2, "Phase 4 synthetic sim");
+        let w = play(4242, [Difficulty::Hard, Difficulty::Normal], 3_000);
+        assert_eq!(w.state_hash(), 0x3c9c_66c0_199c_c7fb, "AI match on the test catalog: {:016x}", w.state_hash());
+        let atan: Vec<i64> = [(1, 0), (0, 1), (-7, 3), (12345, -6789), (-1, -1)]
+            .iter()
+            .map(|&(y, x)| crate::combat::atan2_mrad(y, x))
+            .collect();
+        assert_eq!(atan, vec![1571, 0, -1166, 2074, -2356], "{atan:?}");
+        let roots: Vec<i64> = [0i128, 1, 2, 99, 10_000_000_000_007, (1i128 << 62) + 12345].iter().map(|&v| crate::skirmish::isqrt(v)).collect();
+        assert_eq!(roots, vec![0, 1, 1, 9, 3_162_277, 2_147_483_648], "{roots:?}");
+        let q: Vec<i64> = [0.1f64, 2.675, -1.0005, 1e9 / 3.0, 0.3 * 3.0].iter().map(|&v| crate::sim::quantize(v)).collect();
+        assert_eq!(q, vec![100, 2675, -1001, 333_333_333_333, 900], "{q:?}");
+    }
+
     #[test]
     fn difficulty_parses_displays_and_lists() {
         for d in Difficulty::ALL {
@@ -2641,6 +2960,107 @@ mod tests {
         assert_eq!(parse_difficulty_list("legacy", 2).unwrap(), vec![Difficulty::Legacy; 2]);
         assert!(parse_difficulty_list("", 2).is_err());
         assert!(parse_difficulty_list("hard,nope", 2).is_err());
+    }
+
+    /// 2v1: human army 0 and AI army 1 (team 0) against army 2.
+    fn coop_world() -> Skirmish {
+        use crate::pathfinding::PathGrid;
+        use crate::skirmish::ArmySetup;
+        Skirmish::new(
+            crate::skirmish::tests::test_catalog(),
+            PathGrid::new(64, 64, 4 * U),
+            (256 * U, 256 * U),
+            vec![(40 * U, 40 * U), (60 * U, 40 * U)],
+            &[
+                ArmySetup { name: "H".into(), faction: 0, start: (40 * U, 40 * U), team: 0 },
+                ArmySetup { name: "AI".into(), faction: 0, start: (60 * U, 200 * U), team: 0 },
+                ArmySetup { name: "E".into(), faction: 1, start: (220 * U, 220 * U), team: 1 },
+            ],
+            5,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn allied_ai_answers_pings_within_30_seconds() {
+        let mut w = coop_world();
+        let tanks: Vec<UnitId> = (0..6).map(|i| w.spawn_unit(1, "RT", (60 * U + i * 2 * U, 190 * U)).unwrap()).collect();
+        let engs: Vec<UnitId> = (0..3).map(|i| w.spawn_unit(1, "RENG", (70 * U + i * 2 * U, 200 * U)).unwrap()).collect();
+        let mut ai = ScriptedAi::with_difficulty(1, Difficulty::Normal);
+        for _ in 0..40 {
+            for c in ai.decide(&w) {
+                w.issue(1, c);
+            }
+            w.step();
+        }
+        // Attack ping: the army heads for it within 30 s.
+        let target = (140 * U, 120 * U);
+        w.issue(0, Command::Ping { kind: 2, x: target.0, y: target.1 });
+        let d0: i128 = tanks.iter().filter_map(|t| w.unit(*t)).map(|u| d2(pos(u), target)).sum();
+        for _ in 0..300 {
+            for c in ai.decide(&w) {
+                w.issue(1, c);
+            }
+            w.step();
+        }
+        let d1: i128 = tanks.iter().filter_map(|t| w.unit(*t)).map(|u| d2(pos(u), target)).sum();
+        assert!(d1 * 2 < d0, "army closed in on the ping ({d0} -> {d1})");
+
+        // Move ping: two engineers are lent to assist the pinging ally's builder.
+        let acu = w.commander_of(0).unwrap().id;
+        w.issue(0, Command::Ping { kind: 1, x: 40 * U, y: 40 * U });
+        for _ in 0..40 {
+            for c in ai.decide(&w) {
+                w.issue(1, c);
+            }
+            w.step();
+        }
+        let helping = engs
+            .iter()
+            .filter(|e| matches!(w.unit(**e).and_then(|u| u.orders.front()), Some(UnitOrder::Assist(t)) if *t == acu))
+            .count();
+        assert_eq!(helping, 2, "two engineers sent to help");
+
+        // Alert ping: the army defends there.
+        let alert = (60 * U, 60 * U);
+        w.issue(0, Command::Ping { kind: 0, x: alert.0, y: alert.1 });
+        for _ in 0..300 {
+            for c in ai.decide(&w) {
+                w.issue(1, c);
+            }
+            w.step();
+        }
+        let near = tanks.iter().filter_map(|t| w.unit(*t)).filter(|u| d2(pos(u), alert) <= sq(40 * U)).count();
+        assert!(near >= 3, "army came to defend the alert ({near})");
+    }
+
+    #[test]
+    fn personalities_shape_the_profile() {
+        let base = Profile::of(Difficulty::Normal);
+        let rush = Personality::Rush.apply(base);
+        assert!(rush.min_attack_power < base.min_attack_power && !rush.tech);
+        let turtle = Personality::Turtle.apply(base);
+        assert!(turtle.turtle && turtle.attack_ratio >= 170);
+        assert!(Personality::Air.apply(base).air_focus);
+        assert!(Personality::Tech.apply(base).tech_push);
+        assert_eq!(parse_personality_list("rush,turtle", 3).unwrap(), vec![Personality::Rush, Personality::Turtle, Personality::Rush]);
+        assert!(Personality::parse("sneaky").is_err());
+        assert_eq!(ScriptedAi::with_personality(0, Difficulty::Hard, Personality::Air).personality(), Personality::Air);
+    }
+
+    #[test]
+    fn elo_ladder_ranks_the_stronger_side_higher() {
+        let mut games = Vec::new();
+        for i in 0..100u32 {
+            let hard_wins = i % 10 < 7;
+            let (l, r) = if i % 2 == 0 { (Difficulty::Hard, Difficulty::Hard19) } else { (Difficulty::Hard19, Difficulty::Hard) };
+            let hard_side = if l == Difficulty::Hard { 0 } else { 1 };
+            games.push((l, r, Some(if hard_wins { hard_side } else { 1 - hard_side })));
+        }
+        let e = elo_ratings(&games);
+        let gap = e[&Difficulty::Hard] - e[&Difficulty::Hard19];
+        assert!((100.0..200.0).contains(&gap), "70% wins ≈ +147 Elo, got {gap}");
+        assert!((e[&Difficulty::Hard] + e[&Difficulty::Hard19] - 3000.0).abs() < 1e-6, "zero-sum");
     }
 
     #[test]

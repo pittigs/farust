@@ -208,10 +208,655 @@ Game dir (default, override with `FA_PATH`):
 - Sim determinism hashes unchanged (`35db8f2bd7a6faf2` / `192e89b083b978cb`);
   252/252 tests pass (including 30/30 on `net_lobby` loopback test). Done.
 
-### Known gaps / next candidates
-- 18 roster units excluded for unmodelled mechanics (walls, air staging,
-  engineering stations, orbital satellite, crab eggs — see `farust roster`).
-- FAF network/replay compatibility (see Risks).
+### Phase 26 — Online play with friends (done)
+- **Invite codes & zero-dependency TCP rendezvous + relay** (`src/rendezvous.rs`):
+  unambiguous 8-character codes (`XXXX-XXXX`), `RendezvousServer` (`farust rendezvous [BIND_ADDR]`),
+  host control channel expiring codes automatically on match start or close, and
+  client resolution trying direct addresses first before falling back cleanly to a
+  server-spliced TCP reverse tunnel when behind NAT.
+- **Lockstep & lobby integration** (`src/net_lobby.rs`, `src/net.rs`, `src/menu.rs`, `src/main.rs`):
+  `farust host --code` / `farust join --code` / `--relay` / `+connect_lobby <CODE>`,
+  Multiplayer Hub (`HOST WITH INVITE CODE` toggle, rendezvous server field, `HOST ADDRESS OR INVITE CODE`),
+  and Multiplayer Lobby `[COPY CODE]` header + `[R]`/`[D]` relay status indicators.
+
+### Phase 27 — Old-school FA layout & visual theme (done)
+- **Persistent theme toggle** (`src/settings.rs`, `src/menu.rs`): `ui_theme=modern|classic`
+  (plus `FARUST_UI_THEME` env override and Options `UI Theme` selector; defaults to `modern`).
+- **Authentic Classic FA HUD & Faction Skins** (`src/ui_kit.rs`, `src/hud.rs`):
+  4 faction palettes (`UEF` steel-blue, `Aeon` emerald/gold, `Cybran` crimson/charcoal, `Seraphim`
+  obsidian/amber), classic FA `.scd` menu backdrops (`background-colossus_bmp.dds` /
+  `background-paint01_bmp.dds`), top-left split Mass/Energy console + open top-center sky +
+  top-right tactical clock pod, bottom-left minimap + `[Orders | Command Card | Queue | Enhancements]`
+  bottom console, and bottom-right unit portrait/vitals panel.
+
+## Roadmap — Phases 28–57 (planned)
+
+Ordered so each arc builds on the previous one. Every sim-touching phase
+bumps `SIM_VERSION`, re-baselines golden hashes deliberately, and keeps
+`1t == Nt` parity; render/audio phases must leave sim hashes unchanged.
+
+### Arc A — Close the simulation gaps (28–35)
+
+### Phase 28 — Walls & structure footprints (done)
+- `Role::Wall` (`src/skirmish.rs`, `src/roster.rs`): blueprint `WALL` structures are
+  playable for all four factions (roster excluded 18 → 14; `roster --verify SCMP_009`
+  builds 356/356). Walls sit flush against each other and other structures.
+- Wall overlay: live wall footprints are stamped onto terrain-only base grids
+  (`sync_walls`, land + amphibious; naval and air unaffected). On change, flow fields
+  and cached paths are dropped so movers re-route, ground units on a new wall cell are
+  pushed to the nearest open cell, separation never shoves units into walls, and goals
+  inside a wall are approached from the nearest open cell. Dead walls re-open the cells.
+- Walls are last-resort auto-targets and do not keep an army alive under
+  supremacy/annihilation (FA's `ALLUNITS - WALL`).
+- LMB-drag wall lines (`controls::drag_wall_sites`): snapped to the 1 m grid, gap-free
+  8-connected chains, up to 96 sections per drag.
+- Lockstep protocol v5 (older peers would reject wall `Build` commands).
+- Exit: walled-corridor detour, mid-route re-route for flow-field groups, eviction,
+  target priority, defeat and placement tests pass (263/263). Games without walls are
+  bit-identical: `sim-run` `35db8f2bd7a6faf2`, `skirmish SCMP_001` `192e89b083b978cb`,
+  `bench-scale --units 2048` `69975978586139a0` (`1t == 20t`). Done.
+- Deferred: reclaiming live walls (moves to Phase 34 with prop reclaim) and
+  structures other than walls blocking pathing (moves to Phase 29).
+
+### Phase 29 — Ballistics & line of fire (done)
+- Integer terrain heightfield in the sim (`src/terrain.rs`, quantized once from the
+  `.scmap` heightmap; bilinear, `segment_hit` line-of-fire sampling) attached by the new
+  `Skirmish::attach_map` at every map-based world construction.
+- Surface direct fire is a 3-D shell (`MuzzleVelocity`) aimed at the target's centre and
+  led by its last-tick velocity (`LeadTarget`); per tick it hits the first thing on its
+  path — terrain, or any non-allied surface unit/wall it passes through — or misses at its
+  aim point. Instant/beam weapons (`BeamLifetime`, `ContinuousBeam`, no muzzle velocity)
+  are terrain-checked; anti-air stays hitscan, artillery keeps its ballistic AoE arc.
+- Turrets slew at `TurretYawSpeed` and fire only within `FiringTolerance`; yaw uses a new
+  integer CORDIC `combat::atan2_mrad` (no floats in sim state). Real data: 189 projectile
+  vs 27 beam/instant surface weapons, 156 turreted.
+- Every structure footprint blocks pathing (Phase 28 overlay; cells whose centre lies in
+  the footprint, walls keep full-cover), naval grid included; only paths near newly
+  blocked cells are re-routed; factory-built units roll off onto open ground.
+- `RULES_VERSION` 2 recorded in replay v5 headers; replays/saves from other rules are
+  refused with a clear error. Lockstep protocol v6.
+- Exit: ridge soaks shells and beams, turret slew delay, wall soaks shots aimed past it,
+  leading beats no-leading, structure detour + roll-off and replay-rules tests pass
+  (271/271). `bench-scale --units 2048`: 181 ticks/s 1t, 346 ticks/s 20t, exact `1t == 20t`
+  (`3325c3259e0e6e74`); 46% of shells miss (half overkill on dead targets, half dodged),
+  4% hit terrain. `skirmish SCMP_009 --record` → `replay verify` OK; 12-game `ai-arena`
+  all decisive. Done.
+- Deferred: turret yaw *range* limits and hull-facing fixed weapons (needs hull facing,
+  Phase 35); render still draws direct shells at ground + 1.2 m, not their sim height.
+
+### Phase 30 — Air fuel, staging & repair (done)
+- Aircraft burn `Physics.FuelUseTime` while airborne and fly at half speed when empty.
+- `Role::AirStaging` (all four platforms playable; roster excluded 14 → 10; `roster
+  --verify SCMP_009` 360/360): `Transport.DockingSlots`, refuel at `FuelRechargeRate ×
+  AI.RefuelingMultiplier`, repair at `Transport.RepairRate` paid per second
+  (`AI.RepairConsume*`), slot limits, aircraft released when the platform dies, undock
+  and resume queued orders when full (`step_staging`, docked aircraft reuse `carried_by`).
+- Orders: `Command::Dock` (RMB an own platform with aircraft selected), `UnitOrder::Dock`,
+  `Command::SetAutoRefuel`; auto-refuel (default on) queues a dock at the nearest platform
+  with a free slot within `AI.StagingPlatformScanRadius` below 20% fuel. Replay tags 21/22,
+  fuel hashed, rules v3.
+- AI: wants a staging platform once it fields ≥ 4 aircraft; AI build jobs now respect the
+  builder's tech tier for roster-derived structures (previously T1 engineers retried
+  rejected T2 builds forever). Fixed the AI role-count array (`ROLES` 18 → 20), which
+  would have panicked on an AI-owned wall (Phase 28) or platform.
+- Exit: fuel burn/half speed, auto-dock → refuel → repair (energy cost) → resume, slot
+  limit, enemy-dock refusal and platform-death release tests pass (283/283);
+  `bench-scale --units 2048` 180 / 330 ticks/s, exact `1t == 20t`. Done.
+- Limitation: today's AI rarely has a T2 engineer before ~40 min, so it seldom builds
+  staging in practice (tech pacing is Phase 52); staging HUD (fuel bar, auto-refuel
+  toggle button) is not on the command card yet.
+
+### Phase 31 — Engineering stations & drones (done)
+- `Role::EngStation` (UEF Kennels `XEB0104`/`XEB0204`, Cybran Hives `XRB0104`→`0204`→`0304`;
+  roster excluded 10 → 5, `roster --verify SCMP_009` 365/365): stationary, never-moving
+  workers that every second pick the nearest allied construction (builder site, factory,
+  in-place upgrade) in their radius (`MaxBuildDistance` / `AI.GuardScanRadius`), else the
+  nearest damaged surface ally, and assist / repair it with their `BuildRate`.
+- Pod drones: stations with `Economy.EngineeringPods` spawn their `PodUnitID` drones
+  (loaded into the catalog even though nothing builds them); pods fly out to the work,
+  return home when idle, die with their station, are rebuilt at the station's rate
+  (`BuildTime / BuildRate`, paid in full) and upgrades grow the pod count. Pods burn no
+  fuel and are invisible to the AIs and the idle-engineer cycle. Rules v4.
+- Exit: Hive speeds up a factory by > 20 % and repairs only inside its radius; Kennel pod
+  flies out, repairs, returns, is rebuilt (paid), upgrade → two pods, pods die with the
+  station (308/308). `bench-scale --units 2048` 176 / 318 ticks/s, exact `1t == 20t`. Done.
+- Not modelled: ACU/SCU shoulder-pod enhancements (no `PodUnitID` in their blueprint data),
+  station reclaim/capture, AI building stations.
+
+### Phase 32 — Mobile factories, carriers & eggs (done)
+- Roster: mobile `FACTORY` units (Fatboy, Atlantis, CZAR, Tempest, T3 carriers) get
+  `Produce` options for any domain; mobile `CONSTRUCTION` non-engineers (Megalith) get
+  `Build` options. The sim derives `mobile_factory` / `mobile_builder` from those options
+  (`Skirmish::is_producer` / `is_constructor`), so `Produce`/`Rally`/`SetRepeat`/
+  `CancelProduce`/`Build` and the HUD accept them; units roll off behind the moving factory.
+- Crab eggs: structures with `Economy.BuildUnit` hatch into it the moment they finish
+  (hatchlings loaded into the catalog). Roster excluded 5 → 1 (only the Novax satellite);
+  `roster --verify SCMP_009` 369/369 (hatchlings count as completions).
+- `AIRSTAGINGPLATFORM` mobiles (Fatboy, Atlantis, CZAR) are air staging platforms; docked
+  aircraft ride along. Rules v5.
+- Exit: produce-while-moving + mobile docking and egg-laying → hatch tests pass (310/310);
+  `bench-scale --units 2048` 176 / 315 ticks/s, exact `1t == 20t`. Done.
+- Not modelled: carrier aircraft storage (`StorageSlots`) and launch, AI use of mobile
+  factories / Megalith eggs.
+
+### Phase 33 — Experimental & special-ability completeness (done)
+- Novax: `Role::Orbital` launch centres (`ORBITALSYSTEM`) put their faction's `SATELLITE`
+  blueprint (`XEA0002`) into orbit on completion; `UNTARGETABLE` units are never acquired
+  or attackable; the satellite falls with its centre. Roster excluded 1 → 0: all 374 units
+  of the FA skirmish tree are playable (`roster --verify SCMP_009` 370/370).
+- EMP stun: weapon `Buffs` STUN entries, unit `Buffs.Stun` (on EMP impact / on death) and
+  silo missiles (Cybran nukes) stun enemy surface mobiles — no moving, firing or building.
+- Death weapons (`DeathWeapon`/`DeathImpact`/`Death`/`FireOnDeath`, incl. ACU and Paragon
+  death nukes) damage every surface unit in radius, friend or foe; chain deaths resolve the
+  next tick. Kamikaze weapons (Fire Beetle) detonate once and kill their carrier (they
+  previously re-fired a 4,500-damage shot every reload).
+- `farust roster --abilities [--missing]`: every `Display.Abilities` entry of the playable
+  roster with unit count, status and data coverage: 26 modelled (data 39/39 death, 5/5
+  stun, 2/2 kamikaze, 8/8 factory, 6/6 staging), 7 partial (sonar, torpedo, depth charge,
+  submersible, carrier storage, massive, missile deflection), 3 not modelled (anti-torpedo,
+  deploy, sacrifice), 1 n/a (not capturable). Rules v6.
+- Exit: EMP stun, friend-and-foe death blast, single kamikaze detonation and untargetable
+  satellite tests pass (313/313); `bench-scale --units 2048` 173 / 317 ticks/s, exact
+  `1t == 20t`; 12-game `ai-arena` all decisive. Done — the "no unmodelled flags" goal is
+  not met: the 3 not-modelled and 7 partial abilities above remain.
+
+### Phase 34 — Map prop reclaim & live-unit reclaim (done)
+- Reclaimable props: `MapContext::load_props` reads every `.scmap` prop's blueprint from
+  `env.scd` (`Economy.ReclaimMassMax` / `ReclaimEnergyMax`, cached per blueprint) — e.g.
+  `SCMP_009` 5,182 props / 32,597 mass / 283,280 energy, `SCMP_001` 10,939 / 53,532 /
+  293,932 (`farust map NAME` prints the totals). Props are sim state (`Skirmish::props`,
+  hashed); reclaim orders take a wreck (16 m snap), else a prop (3 m), else a live unit.
+- Reclaim drains props at the wreck rate (energy ×10) and removes them; live units (walls,
+  structures, land units; never commanders or aircraft) drain back into their mass cost
+  and vanish without wreck or kill credit, re-opening the path grid. Area reclaim
+  (Ctrl+RMB) and the AI's reclaim job include props. Rules v7.
+- Render: reclaimed props disappear (instances filtered by their `.scmap` position bits,
+  re-uploaded at most once a second; a backward replay seek restores them).
+- Exit: exact tree/rock yields vs. a control run + determinism, wall reclaim refund and
+  render-filter tests pass (316/316); an AI game on `SCMP_009` (which now harvests props)
+  records and `replay verify`s. Done.
+- Not modelled: falling / burning tree animation, prop destruction by weapons, reclaim
+  time from `ReclaimTime` (props use the wreck rate).
+
+### Phase 35 — Fire states & unit behaviours (done)
+- `FireState` (fire at will / return fire / hold fire, `Command::SetFireState`): return
+  fire only engages the unit's last attacker; hold fire never auto-engages; units not
+  firing at will no longer stop to fight on attack-move / patrol.
+- Ground fire (`Command::AttackGround` → `UnitOrder::AttackGround`): ready weapons in range
+  fire at the map position — artillery arcs, direct shells into the ground (hitting
+  whatever is in the way), until another order; works under hold fire.
+- Guard (`Command::Guard` → `UnitOrder::Guard`): follow a friendly unit and engage threats
+  around it; the command card's Guard on a mobile now issues it (was a plain move).
+- Build pause (`Command::SetBuildPaused`): builders / factories stop progressing and
+  spending until resumed.
+- Command card: GROUND (targeted), FIRE (cycles, lit unless firing at will), HOLD BLD
+  (toggle) with EN/DE tooltips. Replay tags 23–26, rules v8.
+- Exit: every new command round-trips in the replay codec test; fire-state, ground-fire,
+  guard and pause tests pass (319/319); `skirmish SCMP_009 --record` → `replay verify` OK.
+  `bench-scale --units 2048` 170 / 305 ticks/s (gradual drift from 181 / 346 since Phase 29
+  as each sim phase adds per-tick work — target of Phase 54). Done.
+- Not modelled: blueprint `TargetPriorities`, air dive/hover, stop-and-shoot.
+
+### Arc B — Controls & UX (36–39)
+
+### Phase 36 — Build templates, hotbuild, waypoint editing & ferries (done)
+- Build templates (`src/templates.rs`): `Alt+S` saves the selected own structures as a
+  layout (blueprint + offset from the lowest-id anchor) to
+  `$XDG_CONFIG_HOME/farust/templates.txt`; `Alt+T` enters / cycles placement; LMB queues
+  every free site as ordinary `Command::Build`s on the best builder, so a placed template
+  replays exactly. Malformed lines and non-id blueprints are rejected on load.
+- Hotbuild: `Alt+F` / `Alt+D` / `Alt+E` / `Alt+R` cycle the selected builder's factory /
+  defense / economy / intel roster options into build mode (rebindable in Options).
+- Waypoint editing: an LMB drag that starts on a queued Move / AttackMove / Patrol point of
+  the selection moves it (`Command::MoveWaypoint`) instead of box-selecting.
+- Ferries: FERRY order (pick-up click, drop-off click) → `UnitOrder::Ferry` loops: load idle
+  own land units within 12 m of the pick-up point, fly, unload in formation, return.
+  Replay tags 27/28, rules v9. EN/DE tooltips.
+- Exit: template layout → identical queued builds, waypoint drag, ferry delivery and the
+  replay codec (every command) tests pass (322/322); keymap defaults stay conflict-free;
+  `skirmish SCMP_009 --record` → `replay verify` OK. Done.
+- Not done: ghost preview of a template before placing, cross-faction template mapping.
+
+### Phase 37 — Localization & tooltips (done)
+- Never-panic FA `loc` parser (`src/loc.rs`, fuzzed via `Kind::Loc` in `src/fuzz.rs`):
+  loads `gamedata/loc_<LANG>.scd` (`strings_db.lua`/`usdb.lua`), loose `loc/<LANG>/`
+  and `$XDG_DATA_HOME/farust/loc/<LANG>/`, plus `lua.scd` `unitdescription.lua`
+  (448 entries) & `tooltips.lua` (463 entries) and blueprint enhancement metadata
+  (150 entries), with fallback chain active lang → built-in UI/DE fallback → US →
+  inline `<LOC key>Fallback`. CLI: `farust loc --check`, `farust loc <KEY> [--lang]`,
+  `farust loc --unit <ID> [--lang]`.
+- `language=<code>` in `settings.ini` (`src/settings.rs`), `FARUST_LANG` env override,
+  and live-previewing `Language` / `Sprache` selector in Options (`src/menu.rs`).
+- Latin-1 Supplement (`0xA0..=0xFF`, incl. German `äöüÄÖÜß`), typographic punctuation,
+  and Cyrillic (`0x0401`, `0x0410..=0x0451`) glyphs baked into the TrueType atlas
+  (`src/ttf.rs`) and rendered via a dedicated `hud_ttf` pass (`src/viewer.rs`,
+  `src/ui_kit.rs`, `src/hud.rs`) for crisp tooltips and localized unit stats cards
+  (`src/controls.rs`), with tooltips on every command-card slot, tab, category chip,
+  page, queue, upgrade, enhancement, and order button (`src/command_card.rs`).
+- Exit: `farust loc --check` verifies 6,413 `loc_US.scd` entries + German lookups;
+  German Options & in-match tooltip snapshots (`FARUST_LANG=de`) render localized
+  unit names, descriptions, and umlauts cleanly; 273/273 tests pass (incl. `Loc`
+  fuzzing); sim hashes unchanged (`sim-run` `35db8f2bd7a6faf2`, `skirmish SCMP_001`
+  `192e89b083b978cb`). Done.
+
+### Phase 38 — Observer & caster tools (done: live observers + observer HUD)
+- `host … --players N --observers K` (K ≤ 8): after the N players the host accepts K more
+  peers as live observers (army ids from `net::OBSERVER_ARMY_BASE` = 200). They receive
+  every lockstep turn and hash-check like players, but their (empty) command slots are
+  ignored by the sim, so they cannot influence the match. `join … --play` as an observer
+  spectates with fog off and no local AIs. Handshake wire format unchanged.
+- Observer HUD (any spectate session — live observer, `play --spectate`, replays): a
+  top-right panel listing every army's mass/energy income, unit count, army value (mass
+  cost of living mobile units, commander excluded) and APM over a rolling minute
+  (`Skirmish::apm`, a presentation-only command log that is never hashed).
+- Exit met: `host --players 2 --observers 1` with a player and an observer joined: all
+  three peers end on hash `4f868f25ff409113`, identical to the same match with no observer
+  (`live_observer_follows_a_2_player_match_without_desync_or_influence` covers it in tests).
+- Not done: army-value graph over time, follow-unit camera, picture-in-picture minimap.
+
+### Phase 39 — Onboarding & accessibility (done)
+- Tutorial: `missions/tutorial.farust-mission` (built into the binary, main menu → TUTORIAL)
+  walks a UEF opening one objective at a time — move the Commander, mass extractor, power
+  generator, land factory, three Strikers, destroy scripted Cybran scouts. Mission
+  conditions gained `COND and COND …` (`Cond::All`) to chain steps.
+- Accessibility (`settings.ini` + Options checkboxes): `colorblind` (Okabe–Ito palette per
+  army slot instead of faction colours, also `FARUST_COLORBLIND=1`), `mouse_swap` (left /
+  right buttons swapped in matches), `subtitles` (default on: every announcer voice line
+  is captioned in the status banner, EN/DE caption texts).
+- Exit: `farust mission missions/tutorial.farust-mission --human-ai normal` completes all
+  six objectives → `Victory(0)` at 3:21 and its replay verifies; main menu shows TUTORIAL,
+  Options shows the three toggles; 325/325 tests. Done.
+- Not done: UI scale factor, controller input, captions while audio is disabled.
+
+### Arc C — Visual & audio fidelity III (40–43)
+
+### Phase 40 — FA effect blueprints (done)
+- `src/effects.rs` + `src/blueprint.rs`: Lua long-bracket string (`[[...]]`) and nesting-depth
+  parser support; parses all 2,827 `.bp` files in `effects.scd` (2,437 `EmitterBlueprint`,
+  103 `BeamBlueprint`, 184 `TrailEmitterBlueprint`, 103 other) with 0 failures (`farust effects --check`)
+  and `Kind::EffectBp` mutation fuzzing (`src/fuzz.rs`).
+- Data-driven `EffectTemplates.lua` + weapon/projectile/collision-beam Lua mapping (`farust effects --coverage`):
+  404/404 (100.0%) weapons mapped to FA emitters (368 exact Lua chain, 2 name match, 34 faction/category
+  FA fallback; 789 templates, 2,724 valid effect blueprints).
+- `src/vfx.rs` + `src/viewer.rs` + `src/render_prep.rs`: evaluates FA emitter curves (emit rate,
+  lifetime, size, velocity, acceleration, rotation, sprite-sheet strips/frames, 4-stop DDS color ramps,
+  additive/alpha premultiplied blending) into a `128x128` GPU `texture_2d_array` (up to 256 layers)
+  with a hard 4,096-particle cap driving muzzle flashes, impacts, explosions, ACU nukes, shield hits,
+  projectile poly-trails, and faction build beams. Render-only.
+- Exit: 404/404 (100.0%) weapons use FA emitters (≥ 90% target); `cargo test --release` 271/271 passed;
+  sim hashes unchanged (`sim-run` `35db8f2bd7a6faf2`, `skirmish SCMP_001` `192e89b083b978cb`);
+  `bench-render` at 8,192 units stays at ~5.7 ms p50 frame / 252 draws. Done.
+
+### Phase 41 — Dynamic decals & terrain marks (done)
+- `src/decals.rs` `DecalTracker` (render-only, observes the world while frames are
+  prepared and during snapshot warm-up): craters under new wrecks, scorch marks where
+  splash shells land, tank treads every 2.5 m behind moving land units, footprints under
+  live structures. FA textures (`env/Common/decals/Scorch_001` / `crater01`,
+  `textures/tilesets/_global/tank_treads` / `scorch_mark`), terrain-draped 3×3 quads.
+- Fixed budgets per kind (256 scorch / 128 crater / 384 tread / 512 footprint, oldest
+  recycled) and fade-out lifetimes (3 min / 5 min / 15 s / while the structure stands);
+  a backward replay seek clears the marks. GPU geometry is rebuilt only when the tracker
+  revision changes; the decal shader now honours vertex alpha (map decals use 1.0).
+- Exit: budget/expiry and live-battle tracker tests pass (327/327); a 12-minute `SCMP_001`
+  battle holds 28 scorch / 68 crater / 384 tread / 87 footprint marks. `bench-render
+  --no-sim` 8,192 units: frame p50 7.36 ms (7.33 ms before), decals 0.03 ms/frame avg.
+  Bisecting the frame time also found and fixed a Phase 39 regression (per-unit settings
+  clone: 21.6 ms → 7.4 ms). Done.
+
+### Phase 42 — HDR, bloom & glow (done)
+- `Rgba16Float` HDR 3-D scene target (`src/viewer.rs`, `src/play.rs`, `src/perf_cmds.rs`,
+  `src/map_author.rs`) with a 5-level half-res bright-pass (Karis anti-firefly + soft knee) →
+  Jimenez 13-tap downsample → additive 3×3 tent upsample bloom mip chain driven by `.scmap`
+  `Bloom` (skipped when off or 0), Narkowicz ACES filmic tonemap with exposure from `.scmap`
+  `LightingMultiplier`, relative gamma (`0.8..1.4`), optional FXAA 3.11 or MSAA 4× (auto-falls
+  back to FXAA if `Rgba16Float` 4× MSAA is unsupported), and LDR 2-D HUD composited on top
+  after tonemapping/AA.
+- Data-driven unit glow & specular maps (`SpecGlowMap` in `src/dds_decode.rs`, `src/scene.rs`,
+  `src/play.rs`, `src/render_prep.rs`): extracts FA's `*_SpecTeam.dds` `G` (specular) and `B`
+  (emissive/glow mask per `effects/mesh.fx`) into a linear `Rg8Unorm` texture for units
+  (both `view-unit` and instanced LOD0/LOD1 skirmish meshes; disabled on wrecks) so glowing
+  visors/cores/vents and additive VFX/shield hits bloom naturally.
+- Settings & Options UI (`src/settings.rs`, `src/menu.rs`, `src/loc.rs`): `bloom=on|off`,
+  `aa=off|fxaa|msaa4`, `gamma=0.80..1.40` (plus `FARUST_BLOOM` / `FARUST_AA` / `FARUST_GAMMA`
+  overrides) backed by a lock-free `AtomicU32` cache (`settings::render_post`) so per-frame
+  reads never clone `Settings`. Render-only.
+- Exit: 331/331 tests pass (incl. tonemap/gamma curve, bloom mip chain, AA fallback, settings
+  round-trip & atomic cache); determinism hashes unchanged (`sim-run --ticks 10000`
+  `35db8f2bd7a6faf2`, `skirmish SCMP_001` `0fe934990406d829`); `bench-render --no-sim` at
+  8,192 units: frame p50 `8.00 ms` MSAA4 / `7.97 ms` FXAA (`gpu` `1.93 ms` / `1.66 ms`,
+  `gpu.post_pass` `0.077–0.097 ms`, within +15% of baseline); battle, `UEL0001`/`UAL0001`,
+  `view-map`, and Options snapshots verified visually with bloom on/off and FXAA. Done.
+
+### Phase 43 — Announcer, ambience & adaptive music (done)
+- Recursive SoundBank/WaveBank scan & direct `"Bank#Index"` wave playback
+  (`src/xact.rs`, `src/main.rs`): indexes nested `sounds/Voice/<lang>/XGG.xsb`
+  (89 `.xwb` wavebanks, 3,163 cues, 3,043/3,043 waves decoded) and raises
+  `MAX_STREAM_VOICES` to 6 so music crossfades and dual-layer ambience never
+  evict each other. `farust audio cues --all` dumps every indexed cue.
+- Render-side announcer (`AnnouncerEvent`, `AnnouncerQueue`, `EconWatch` in
+  `src/audio_play.rs`): 16 tactical/economy events derived from sim events,
+  army economy, unit damage/shields/transports/cap and shared allied intel for
+  the focus army, with priority ordering, single-voice playback (0.35 s breath
+  gap, 12 s staleness expiry), and 10–60 s per-event cooldowns. Maps 14/16 to
+  authentic `XGG.xsb` cues (including 12 per-experimental `XGG_HQ_GD1_04179..04190`,
+  15 domain/tier/compass inbound `04142..04172`, and 8 structure-lost `04213..04221`
+  variants); `mass_storage_full` / `energy_storage_full` target SupCom 1's
+  `UEFComputer_Resources_01313`/`01312` and honestly report `MISSING` on
+  standalone FA installs where `COMPUTER_*_VO` is absent.
+- Per-map biome ambience (`MapBiome`, `MapAmbience` in `src/audio_play.rs`,
+  `src/play.rs`): classifies `.scmap` stratum paths, skybox and heightmap water
+  fraction into `Temperate` / `Oceanic` / `Volcanic` / `Arid` / `Tundra` dual
+  looping streams (`AMB_Planet_Rumble_zoom` + surface water/fire/tundra/arid
+  detail) cross-scaled by camera zoom.
+- Adaptive music (`MusicDirector` in `src/audio_play.rs`): camera- and
+  focus-army-weighted combat impulse with asymmetric EMA smoothing (2.5 s
+  attack / 8.0 s release), Schmitt-trigger hysteresis (`0.45` enter / `0.15`
+  exit, 10 s min battle dwell, 18 s calm hold), crossfades `Base_Building` ↔
+  `Battle`, and ducks to `0.62×` under announcer VO.
+- Exit: `farust audio coverage` reports all 16 announcer events (`14/16` mapped,
+  `2 MISSING` on standalone FA) plus biome ambience & music playlists;
+  `audio render-mix` on `SCMP_001` (`--from 11800 --ticks 1800`) voices 13
+  announcer callouts, oceanic dual-layer ambience and `Base_Building` → `Battle`
+  transition with `identical` state hash (`6c2f941aef13f77b`). 268/268 unit
+  tests pass; `sim-run --ticks 10000` `35db8f2bd7a6faf2`, `skirmish SCMP_001`
+  `192e89b083b978cb`. Done.
+
+### Arc D — Netcode & online (44–47)
+
+### Phase 44 — UDP lockstep & NAT hole punching (done)
+- Reliable-ordered UDP transport (`src/udp_transport.rs`, `std::net::UdpSocket` only):
+  shared `UdpMux` + `UdpChannel` with sequence numbers, cumulative + 64-bit SACK,
+  fast retransmit, Karn/Jacobson SRTT/RTTVAR/RTO (with Karn Part 2 RTO backoff),
+  duplicate suppression, MTU-safe fragmentation (`1180` B chunks, up to 2 MiB frames),
+  keepalive/idle timeout, graceful FIN drain, and a seeded in-process `NetemSocket`
+  impairment shim (`loss`, `dup`, `reorder`, `delay`, `jitter`, `seed`).
+- Transport abstraction & adaptive input delay (`src/net.rs`, protocol v14): `PeerStream`
+  runs `LockstepHost` / `LockstepClient` over TCP or UDP identically; `AdaptiveDelayController`
+  samples worst-peer `(srtt, rttvar)` and emits `NetControl::InputDelay` (`SYSTEM_SENDER`,
+  clamped `2..=8` turns with down-step hysteresis) so all peers switch `input_delay` on the
+  exact same turn boundary. CLI: `--udp` and `--netem loss=5,dup=2,reorder=3` on `host`/`join`.
+- NAT hole punching (`src/rendezvous.rs`): `RendezvousServer` binds TCP+UDP on the same port,
+  observes peer public UDP endpoints (`PKT_RV_REG`/`PKT_RV_ACK`), and coordinates simultaneous
+  punches (`ClientPunch`/`HostPunch`/`PunchInfo`, backward-compatible v1 extensions); punch
+  failure or `--relay` falls back seamlessly to direct TCP / TCP relay.
+- Exit: 336/336 release tests pass (2- and 3-peer UDP loopback with 5% loss / 2% dup / reorder 3
+  matches TCP hash, high-RTT adaptive delay syncs identically across peers, rendezvous UDP punch
+  and TCP fallback pass); localhost 2-peer `SCMP_001` 600-tick runs over TCP, clean UDP, lossy
+  `--netem` UDP (46 drops / 17 dups / 282 reorders), and rendezvous `--code --udp --netem`
+  (`udp-punch`, 48 drops / 13 dups / 291 reorders) all end on identical hash `4f868f25ff409113`;
+  `sim-run --ticks 10000` `35db8f2bd7a6faf2` and `skirmish SCMP_001` `0fe934990406d829` unchanged. Done.
+- Not done: menu lobby (`net_lobby.rs`) still runs its pre-game handshake over TCP; symmetric-NAT
+  port prediction (falls back to TCP relay).
+
+### Phase 45 — Reconnect & late join (done, direct TCP hosts)
+- Direct TCP hosts keep listening for the whole match (protocol v17). A peer that connects
+  with `MSG_REJOIN` receives the handshake (`join_turn`) plus every turn bundle so far and
+  re-simulates them (the "snapshot" is the deterministic turn history; every re-simulated
+  turn is still hash-verified against the recorded hashes, including its own old ones).
+  Packets before `join_turn` are produced but never sent, so a headless peer's local AI
+  rebuilds exactly the state it had.
+- `host --rejoin-grace SECS` (default 20 s with `--play`, 0 headless, max 30 s): when a
+  player drops, the host holds the turn for it to reconnect; if it does, the match goes on
+  as if nothing happened. After the grace the AI takes over as before (Phase 21).
+- Late return after the takeover: the host announces `NetControl::Rejoined { army, turn }`
+  `input_delay + 1` turns ahead; every peer hands the army back from the AI at that turn.
+- `join ADDR --rejoin ARMY|observer`: reconnect as a player, or join a running match as a
+  new live observer. `join --play --rejoin` re-simulates at full speed before the window
+  opens (`NetHandle::start_rejoined`). Live observers keep the observer HUD.
+- Exit met: `host 127.0.0.1:15612 SCMP_001 --players 2 --headless-ticks 24000 --rejoin-grace 20`,
+  client killed with `kill -9` at turn 2032, restarted with `join … --rejoin 1`: both peers
+  end at tick 12272 on `1c15072179b37e4e`, identical to the uninterrupted run. A late
+  `--rejoin observer` (turn 2353) ends on the same hash. Tests:
+  `killed_peer_rejoins_within_grace_and_ends_on_the_uninterrupted_hash`,
+  `late_rejoin_takes_control_back_from_the_ai_and_a_late_observer_follows`.
+- Limits: invite-code / UDP / menu-lobby hosts do not accept rejoins yet; the host's
+  recording of a rejoined interactive client starts at the rejoin turn; the interactive
+  rejoin path is covered by the shared `catch_up` logic but was not exercised in a window.
+
+### Phase 46 — Steamworks lobby & friend invites (planned, blocked)
+- Formerly the Phase 28 candidate. Needs a dedicated Steam Direct App ID;
+  `CreateLobby` stores the Phase 26 invite code in lobby metadata,
+  `GameLobbyJoinRequested_t` and `+connect_lobby` join directly. Behind a
+  `steam` cargo feature so the default build stays dependency-light.
+- Exit: a friend invite from the Steam overlay lands in the FARust lobby.
+
+### Phase 47 — Replay vault & sharing (done)
+- Replay vault index (`src/vault.rs`, `index.farust-idx` `FARVX1` v1 alongside recorded
+  replays, override with `--vault` / `FARUST_VAULT_DIR`): caches map id/name, date,
+  duration, armies (names/factions/teams), winner, sim `RULES_VERSION` (flags older
+  replays as "needs older build"), mods, mission title, size, share code, and
+  `160×160` PNG thumbnails (`thumbs/*.png`, `.scmap` preview + start spots + winner
+  ring) with incremental `(mtime, size)` rebuilds and free-text / qualifier search
+  (`map:`, `player:`, `faction:`, `winner:`, `from:`, `to:`).
+- Event bookmarks (`BookmarkKind`: `ACU` deaths, `EXP` completions, `NUKE` launches,
+  top `CLASH` kill bursts with tick + world position) collected via headless re-sim
+  during indexing without changing the `FARPL1` replay format; shown on the replay
+  timeline with clickable pips, hover labels, `<BM`/`BM>` buttons, and camera jump
+  (`src/controls.rs`, `src/hud.rs`, `src/play.rs`).
+- Sharing (`src/rendezvous.rs`, backward-compatible v1 messages `19..=22`): server-side
+  replay upload/download capped at 8 MiB per replay and configurable total quota (default
+  256 MiB), validated with `FARPL1` magic + `Replay::from_bytes`, content-hash
+  deduplicated into unambiguous `XXXX-XXXX` codes stored strictly inside the configured
+  storage dir; CLI `farust replay <index|upload|download>` (`src/main.rs`) and upgraded
+  Replays vault screen with search, thumbnails, clickable bookmarks, and Share /
+  Download-by-code (`src/menu.rs`).
+- Exit: 344/344 release tests pass (index round-trip, incremental sync, search filters,
+  headless ACU-death/winner extraction, bookmark seek, menu vault UI, and loopback
+  upload/download + invalid/oversized/quota rejection); `SCMP_009` replay recorded →
+  uploaded (`5K4B-DK6D`) → downloaded into a second vault (`FARUST_VAULT_DIR`) →
+  `replay verify` verified (`74eb2ae300b25619`); `menu --screen replays --snapshot`
+  renders real map thumbnails and bookmarks; determinism unchanged (`sim-run`
+  `35db8f2bd7a6faf2`, `skirmish SCMP_001` `0fe934990406d829`). Done.
+
+### Arc E — Content & authoring (48–51)
+
+### Phase 48 — Scenario scripting engine (done)
+- `src/mission.rs`: line-based `*.farust-mission` scripts — `mission`, `map`, `victory`,
+  `army N faction F [team T] human|ai DIFF|ai none`, `objective ID primary|secondary
+  "TEXT"`, `when COND do ACTION; ACTION…`. Conditions: `at m:ss`, `every m:ss from m:ss
+  [until m:ss]`, `dead commander A`, `no units A`, `count A TYPE|any in X,Z rR OP N`,
+  `objective ID complete|failed`. Actions: `say`, `spawn A TYPE xN at X,Z [attack|move
+  X,Z]`, `objective ID complete|fail`, `win A`, `lose A`, `camera X,Z [zoom D]`. Parse
+  errors carry line numbers; unknown objectives and gappy army indices are rejected.
+- The runtime is deterministic world state: evaluated after every tick's cleanup in file
+  order, hashed, cloned with the world (seek / saves), and its source travels in replay
+  v6 headers (`ReplayHeader::apply_mission` on verify, playback and save loading).
+- `farust mission FILE [--human-ai DIFF] [--record OUT]` (headless) and
+  `farust play --mission FILE` (messages and objective changes in the status banner,
+  scripted camera moves). Example: `missions/hold_the_line.farust-mission` (SCMP_009,
+  10-minute defence against scripted Cybran waves).
+- Exit: with `--human-ai normal` the example ends `Victory(0)` at 10:00 with both primary
+  objectives complete and its recorded replay verifies; with an idle player the ACU falls
+  at ~8:19 → defeat. Parser + runtime/determinism tests pass (324/324). Done.
+- Not done: mission editor, dialogue portraits / voice, multiplayer missions.
+
+### Phase 49 — First campaign operation (done: X1CA_001 "Operation: Black Day")
+- `missions/x1ca_001.farust-mission` re-creates the first Forged Alliance operation on the
+  user's `X1CA_001` map in the mission DSL: 7 armies (player LZ, Fletcher's Fort Clarke and
+  Seabring, two Order forward bases, the Seabring assault base, Gari, Shun-Ullevash),
+  3 acts, 6 primary + 2 secondary objectives and the `X01_*` voice cues as captions.
+  Main menu → CAMPAIGN starts it; `farust play --mission …` too.
+- Engine support: named markers & areas from the map's `_save.lua`
+  (`MapContext::marker/area`, `at <MarkerName>`, `in area <Name>`), `no_acu` armies,
+  start units with `hp N%`, mission-only blueprints (civilian structures) loaded from
+  `units.scd`, pre-placed extractors snapped to mass points.
+- `farust mission … --trace MIN` prints per-army income, energy, units, structures, army
+  value and AI command counts every MIN minutes (read-only, same hash as without).
+- Tuning found with the trace: the player LZ and Fort Clarke start with mass fabricators
+  but no power (−7000 E/s, nothing could ever be built) → T3 power generators added; the
+  Seabring air factory sat outside the AI's sight so the assault base could never be
+  cleared → moved into the base.
+- Exit met: `farust mission missions/x1ca_001.farust-mission --human-ai hard` → all 6
+  primaries complete, `Victory(0)` after 12104 ticks (20:10), hash `f1130450f49e4677`,
+  recorded replay verifies. Also won with `--human-ai normal` (15618 ticks) and hard on
+  seeds 7 / 99 / 1234; `--human-ai easy` loses (Seabring/Fort Clarke fall).
+- Started by an Antigravity delegate that ran out of quota; finished and tuned here.
+
+### Phase 50 — Map authoring tools (done)
+- Byte-exact `.scmap` v2.60 writer (`src/scmap.rs`): retains header unknowns, raw
+  C-strings, and post-water tail verbatim (`write(parse(b)) == b`), with world-space
+  raise/lower/smooth heightmap brush (`apply_brush`), bilinear `sample_height`, and
+  prop-slice re-serialization (`add_prop` / `remove_prop_near`) when props change.
+  Embedded DXT5 normal-map DDS in the tail is preserved as-is; geometric terrain
+  normals recompute from the edited heightmap.
+- Scenario & save writers (`src/scenario.rs`): case-insensitive `rewrite_map_id`,
+  `rewrite_scenario_for_clone` (`map`/`save`/`script` VFS paths + title), and
+  comment/string-aware `rewrite_save_markers` regenerating start spots (`ARMY_n`),
+  `Mass`, and `Hydrocarbon` markers while keeping all other markers and Lua outside
+  `Markers` verbatim.
+- CLI & interactive GPU map editor (`src/map_author.rs`, `src/viewer.rs`,
+  `src/ui_kit.rs`, `src/scene.rs`): `farust map-roundtrip [--all | MAP]`,
+  `farust map-edit <SRC> <NEW_ID> [--raise|--lower|--smooth|--add-mass|--del-mass|--add-hydro|--del-hydro|--move-start|--add-prop|--del-prop]`,
+  and `farust map-editor <MAP> [--out NEW_ID] [--snapshot OUT.png]` with a `ui_kit`
+  toolbar, heightmap/smooth brushes, mass/hydro/start/prop editing, and safe saves
+  to `$XDG_DATA_HOME/farust/maps/<NEW_ID>/` (never writing to the game install).
+- Exit: `map-roundtrip --all` passes 61/61 stock maps byte-identically (825.55 MiB,
+  61/61 reparse ok); `map-edit SCMP_001 FARUST_TEST01` produces a map that plays to
+  completion via `skirmish FARUST_TEST01` and renders via `view-map` and `map-editor`;
+  272/272 tests pass; golden hashes unchanged (`sim-run` `35db8f2bd7a6faf2`,
+  `skirmish SCMP_001` `192e89b083b978cb`). Done.
+
+### Phase 51 — Mod manager & lobby mod sync (done)
+- Mod manager (main menu → MODS; `farust mods [enable SPEC | disable SPEC | conflicts]`):
+  discovered mods with name/uid/version/author/description/blueprint count, enable/disable
+  persisted as `mods=` in `settings.ini`, conflicts shown (two enabled mods overriding the
+  same blueprint, or a mod that fails to load).
+- Lobby/handshake mod sync (protocol v16, now v17 together with Phase 45): the handshake
+  carries the host's mod identities; a peer missing one requests it, the host streams a
+  `FARMD1` bundle in 512 KiB chunks (≤ 32 MiB / 4096 files per mod, relative paths only,
+  no `..`), the client verifies the content hash against the host identity before
+  installing it into the per-user cache (`$FARUST_MODS_CACHE_DIR`, else
+  `$FARUST_MODS_DIR/.downloaded`, else `~/.cache/farust/mods`, never the game install) and
+  activates it for the match. A hash mismatch aborts with an error. Works for direct,
+  invite-code, UDP and menu-lobby hosts.
+- Mod weapons/abilities as data: blueprint overrides of damage, range, rate of fire,
+  muzzle velocity, splash, EMP stun, shields and intel flow into the catalog; example mod
+  `examples/mods/heavy_strikers` (UEF Striker override).
+- Exit met: `host … --mod examples/mods/heavy_strikers` with a client whose mods dir is
+  empty → client logs `synced 1 mod(s) from host: Heavy Strikers v1 … #ce017db6d0b58146`,
+  both peers end 6000 ticks on `9d122458cf26b109` (without the mod: `0b0fd8b5080e4fc7`).
+  Tests: `loopback_mod_sync_transfers_mod_and_matches_sim_hash`, bundle path safety,
+  hash-mismatch rejection, settings persistence, conflict detection,
+  `mod_weapon_and_ability_override_changes_sim_outcome`.
+- Built by an Antigravity delegate that ran out of quota mid-way; finished here (duplicate
+  menu block removed, test fixtures fixed, merged with Phase 45 → protocol v17).
+
+### Arc F — AI III (52–53)
+
+### Phase 52 — Strategic AI planner (done)
+- New `hard` built on the Phase 19 one, which is kept frozen as the `hard19` benchmark
+  difficulty (`--ai hard19`, not in the menu):
+  - tech push: a busy land factory is reserved for its T1→T2→T3 upgrade (no new
+    production, upgrade the moment it idles) — Phase 19 only upgraded idle factories,
+    which never happened because every factory was refilled each think;
+  - map awareness: when no enemy base is land-reachable (island maps such as
+    `SCMP_005`), air and naval factories scale with income;
+  - economy: leaner power (energy ratio 5, batches of 2) — hard19 overbuilt generators
+    while starving mass — plus 2 parallel extractor jobs, 3 parallel engineers, up to 14
+    engineers / 8 land factories;
+  - committed fighting: attack at 110 %, retreat at 180 %, a single raid group.
+- `farust ai-arena` standings print a batch-Elo ladder (`skirmish_ai::elo_ratings`).
+- Exit: 100-game arena (`SCMP_001/002/005/009/014` × seeds 1–10 × both sides,
+  60 min limit): new hard 70 – 22 – 8 vs hard19; held-out seeds 11–20: 69 – 23 – 8
+  (≈ 75 % of decisive games). Ladder on a 144-game mixed arena: hard 1572, normal 1480,
+  hard19 1448. Normal AI unchanged (`skirmish SCMP_001` hash identical). Done.
+- Tried and rejected (no gain or worse): earlier tech thresholds, earlier extractor
+  upgrades, harder commitment (100 / 220 %), capping land factories on island maps.
+
+### Phase 53 — AI personalities & co-op commands (done)
+- Pings are sim commands (`Command::Ping`, replay tag 29, rules v10, protocol v15) as
+  well as chat lines, so every lockstep peer's allied AI sees the same pings. AIs that
+  coordinate with their team answer the newest ally ping within 30 s: attack → push the
+  army there, alert → defend there, move → lend two engineers that assist the ally's
+  nearest builder (released after 2 min).
+- Personalities over any difficulty (`--personality rush,turtle` per army on `skirmish` /
+  `play`, `personality X` on mission `army` lines): rush (early waves, no tech), turtle
+  (extra point defenses / shields, home guard, attacks only at 170 %), air (air
+  factories scale with income), tech (tech push, experimentals from 45 mass/s).
+- Exit: a 2v1 test where the human pings and the allied AI's army closes in on an attack
+  ping, lends two engineers on a move ping and gathers at an alert ping, all within 300
+  ticks (339/339 tests). Default skirmish hash unchanged. Done.
+- Not done: difficulty-scaled resource cheats (need a per-army replay-header option),
+  personalities in `ai-arena` matchups.
+
+### Arc G — Scale, platforms & release (54–57)
+
+### Phase 54 — Sim throughput at 10k units (done)
+- Per-unit economy cached on the unit (`eco` = mass/energy per tick, storage; refreshed on
+  upgrade) so income and storage caps are one catalog-free pass; shields only visit
+  shielded units; construction skips plain mobile units with nothing to build. All pure
+  optimisations: every hash is unchanged.
+- Exit: `bench-scale SCMP_001 --units 10000 --ticks 100 --threads 16`: 67 ticks/s
+  (60 before) with exact `1t == 16t` (`15575a588a785eda`); construction 1.68 → 0.75 ms,
+  economy 1.26 → 0.47 ms per tick. 2,048 units: 179 / 338 ticks/s (was 170 / 305). Done.
+- Next candidates (not done): parallel weapon fire decisions (they do not depend on
+  same-tick damage, so a parallel decide + ordered apply is exact; 2.9 ms at 10k units),
+  flow-field reuse across goals (4.3 ms).
+
+### Phase 55 — 10k-unit rendering (done, without GPU-driven culling)
+- Measured first: with Phase 42's HDR pipeline, 10,000 units render at frame p50 9.4 ms
+  (≈ 106 fps; GPU 2.0 ms, CPU prep 6.3 ms) at the bench camera, so the 60 fps target holds
+  without moving culling to compute shaders.
+- Fixed the real stutter: new projectiles found their shooter (for the shell / missile
+  look) by scanning every unit; shells now carry their shooter id (artillery included —
+  not hashed, no rules change), cutting `render.begin.proj` from 3.47 to 0.42 ms average
+  and the worst prep frame from 110 ms to 10 ms at 10k units.
+- Exit: `bench-render SCMP_001 --units 10000 --frames 30 --no-sim`: frame p50 9.37 ms,
+  p95 9.94 ms. Done for the target; compute-shader culling / indirect draws (the original
+  plan) are not implemented — CPU instance preparation (≈ 6 ms) is the next lever.
+
+### Phase 56 — Windows & macOS ports (code done; Windows run blocked on a linker)
+- `src/platform.rs`: per-OS user dirs (Linux XDG unchanged; Windows `%APPDATA%` /
+  `%LOCALAPPDATA%`; macOS `~/Library/Application Support` / `~/Library/Caches`) used by
+  settings, saves/replays, maps, mods; FA install discovery: `$FA_PATH`, every Steam
+  library in `libraryfolders.vdf` of the known Steam roots (native, `~/.steam`, Flatpak,
+  Snap, Windows Program Files, macOS), GOG / retail / Wine-prefix folders; native Windows
+  `Documents/My Games/…/Maps` as a user map folder. Replaces the hard-coded install path.
+  `farust platform` prints the result.
+- Native audio behind the existing fallbacks (`src/xact.rs` `PcmSink`): WinMM `waveOut`
+  ring (Windows) and CoreAudio `AudioQueue` (macOS) via plain FFI, no new crates; Linux
+  keeps `pw-cat` / `pacat` / `aplay`; no device → silent as before.
+- `zip` restricted to its `deflate` feature (FA archives are deflate/stored): drops the
+  zstd / bzip2 / lzma C builds, so the crate cross-compiles without a C toolchain.
+- Cross-platform determinism: sim audit (only load-time `f64` quantization with exact
+  IEEE `*`/`round`, two correctly rounded `sqrt`s, no `HashMap` in tick state, no FMA
+  contraction in Rust) plus `golden_hashes_pin_cross_platform_determinism` pinning the
+  Phase 4 sim, an AI match on the test catalog, `atan2_mrad`, `isqrt` and `quantize`
+  results; the test needs no game data, so it runs on any CI architecture.
+- Verified: `cargo check` clean for `x86_64-pc-windows-gnu`, `x86_64-apple-darwin`,
+  `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu` (clippy clean on the native-sink
+  code); Linux behaviour and every hash unchanged; 371 tests pass without an FA install.
+- Exit not yet run: a Linux–Windows lockstep match needs a Windows binary — this machine
+  has no MinGW linker (`mingw-w64-gcc`, needs sudo) and no aarch64 runner/qemu. With
+  the linker: `cargo build --release --target x86_64-pc-windows-gnu`, then
+  `wine farust.exe join 127.0.0.1:PORT` against a Linux host and compare hashes.
+
+### Phase 57 — CI, packaging & 1.0 (done locally; CI run needs a remote)
+- `.github/workflows/ci.yml`: on every push/PR, `cargo test --release` on Linux x86_64 +
+  aarch64, Windows, macOS arm64 + x86_64 (the suite needs no game data: 372 tests pass
+  with `FA_PATH=/nonexistent` and an empty home), the Phase 4 sim golden
+  (`35db8f2bd7a6faf2`), the parser fuzzers (`fuzz-parsers --no-real`), clippy (report
+  only) and Windows/macOS cross type checks.
+- `.github/workflows/release.yml`: tag `v*` → tests on each runner → archives
+  (Linux x86_64/aarch64 `.tar.gz` + x86_64 AppImage, Windows `.zip`, macOS arm64/x86_64
+  `.tar.gz`) → draft GitHub release. `FARUST_BUILD_ID` stamps `farust version`.
+- `packaging/package.sh` (same archive locally; AppImage when `appimagetool` exists),
+  desktop file + AppStream metainfo (`desktop-file-validate` clean), Flatpak manifest
+  (`packaging/flatpak/`, Steam/GOG folders read-only).
+- Crash reporter (`src/crash.rs`): panic hook writes `<data>/crashes/<utc>-<pid>/crash.txt`
+  with build identity, command line, panic site, backtrace and the newest desync dump's
+  `report.txt` (< 1 h old); nothing is uploaded. `farust crash-test` exercises it;
+  `farust version` prints build / rules / protocol versions.
+- `docs/RELEASE.md`: the 1.0 checklist (license and app id are maintainer decisions).
+- Verified locally: `packaging/package.sh` → `dist/farust-0.1.0-linux-x86_64.tar.gz`
+  (binary, docs, missions, example mod, FIRST-RUN.txt); the packaged binary reports
+  `build 658932e-dirty`; `farust crash-test` writes a complete report; workflow and
+  Flatpak YAML parse.
+- Exit pending: "tagged 1.0 builds produced by CI for all three platforms" needs the
+  repository pushed to GitHub (no remote is configured here) plus the license decision.
+
+### Other known gaps
+- FAF network/replay compatibility stays out of scope (see Risks).
 
 ## Risks / non-goals
 

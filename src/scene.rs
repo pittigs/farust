@@ -8,7 +8,7 @@ use bytemuck::{Pod, Zeroable};
 use crate::blueprint::{self, Value};
 use crate::camera::OrbitCamera;
 use crate::dds_decode::{
-    RgbaImage, decode_dds_cubemap_rgba8, decode_dds_rgba8, resize_rgba_bilinear,
+    RgbaImage, SpecGlowMap, decode_dds_cubemap_rgba8, decode_dds_rgba8, resize_rgba_bilinear,
 };
 use crate::jobs;
 use crate::scd;
@@ -175,6 +175,8 @@ pub struct LoadedScene {
     pub overlay_vertices: Vec<GpuVertex>,
     pub overlay_indices: Vec<u32>,
     pub albedo: RgbaImage,
+    /// Optional linear `(specular, glow)` map extracted from `*_SpecTeam.dds` (Phase 42).
+    pub spec_glow: Option<SpecGlowMap>,
     pub initial_camera: OrbitCamera,
     pub clear_color: [f64; 4],
     pub terrain_splat: Option<TerrainSplatData>,
@@ -534,6 +536,7 @@ pub fn load_unit_scene_posed(
     }
 
     let spec_team = decode_first_dds(&gamedata, &["units.scd"], &spec_candidates);
+    let spec_glow = spec_team.as_ref().map(SpecGlowMap::from_spec_team);
     let mut spec_applied = false;
     if let Some(spec_img) = spec_team
         && spec_img.width == albedo.width
@@ -551,8 +554,9 @@ pub fn load_unit_scene_posed(
                 let blended = base_c + (team_c - base_c) * mask;
                 albedo.pixels[i * 4 + c] = blended.round().clamp(0.0, 255.0) as u8;
             }
+            // FA SpecTeam.dds G channel = Phong specular intensity.
             let spec_strength =
-                ((spec_img.pixels[i * 4] as u16 * 180 / 255) + 40).min(255) as u8;
+                ((spec_img.pixels[i * 4 + 1] as u16 * 180 / 255) + 40).min(255) as u8;
             albedo.pixels[i * 4 + 3] = spec_strength;
         }
         spec_applied = true;
@@ -682,6 +686,7 @@ pub fn load_unit_scene_posed(
         overlay_vertices: Vec::new(),
         overlay_indices: Vec::new(),
         albedo,
+        spec_glow,
         initial_camera,
         clear_color: [0.055, 0.070, 0.095, 1.0],
         terrain_splat: None,
@@ -706,20 +711,42 @@ pub fn load_map_scene(game_dir: &Path, map_name: &str, aspect: f32) -> Result<Lo
         .ok_or_else(|| format!("Map '{}' has no .scmap file", map_files.id))?;
     let scmap = ScMap::parse_file(scmap_path)?;
 
-    let terrain_splat = load_terrain_splat_data(game_dir, &scmap);
-    let water = load_water_gpu_data(game_dir, &scmap);
-    let sky_cube = load_sky_cubemap(game_dir, &scmap);
-    let prop_batches = load_map_props(game_dir, &scmap);
-    let decal_batches = load_map_decals(game_dir, &scmap);
+    let title = if meta.name.trim().is_empty() {
+        meta.id.clone()
+    } else {
+        format!("{} ({})", meta.name, meta.id)
+    };
+    Ok(build_map_scene_from_parts(
+        game_dir,
+        title,
+        &scmap,
+        markers.as_ref(),
+        aspect,
+    ))
+}
+
+/// Builds a [`LoadedScene`] from an already-parsed [`ScMap`] and optional [`scenario::SaveMarkers`].
+pub fn build_map_scene_from_parts(
+    game_dir: &Path,
+    title: String,
+    scmap: &ScMap,
+    markers: Option<&scenario::SaveMarkers>,
+    aspect: f32,
+) -> LoadedScene {
+    let terrain_splat = load_terrain_splat_data(game_dir, scmap);
+    let water = load_water_gpu_data(game_dir, scmap);
+    let sky_cube = load_sky_cubemap(game_dir, scmap);
+    let prop_batches = load_map_props(game_dir, scmap);
+    let decal_batches = load_map_decals(game_dir, scmap);
 
     let baked = if terrain_splat.is_some() {
         None
     } else {
-        bake_terrain_albedo(game_dir, &scmap, 1024)
+        bake_terrain_albedo(game_dir, scmap, 1024)
     };
     let textured = terrain_splat.is_some() || baked.is_some();
     let (vertices, indices, overlay_vertices, overlay_indices) =
-        build_terrain_and_overlay_meshes_opts(&scmap, markers.as_ref(), textured, water.is_none());
+        build_terrain_and_overlay_meshes_opts(scmap, markers, textured, water.is_none());
 
     let albedo = baked.unwrap_or_else(|| RgbaImage {
         width: 1,
@@ -734,21 +761,16 @@ pub fn load_map_scene(game_dir: &Path, map_name: &str, aspect: f32) -> Result<Lo
         avg_h
     };
     let initial_camera = OrbitCamera::for_map(scmap.map_width, scmap.map_height, focus_y, aspect);
-
-    let title = if meta.name.trim().is_empty() {
-        meta.id.clone()
-    } else {
-        format!("{} ({})", meta.name, meta.id)
-    };
     let fc = scmap.lighting.fog_color;
 
-    Ok(LoadedScene {
+    LoadedScene {
         title,
         vertices,
         indices,
         overlay_vertices,
         overlay_indices,
         albedo,
+        spec_glow: None,
         initial_camera,
         clear_color: [
             f64::from(fc[0].clamp(0.05, 1.0)),
@@ -761,7 +783,7 @@ pub fn load_map_scene(game_dir: &Path, map_name: &str, aspect: f32) -> Result<Lo
         sky_cube,
         prop_batches,
         decal_batches,
-    })
+    }
 }
 
 #[allow(dead_code)]
@@ -1529,7 +1551,7 @@ pub(crate) fn sample_scmap_height(scmap: &ScMap, wx: f32, wz: f32) -> f32 {
 }
 
 #[allow(dead_code)]
-fn sample_scmap_normal(scmap: &ScMap, wx: f32, wz: f32) -> [f32; 3] {
+pub(crate) fn sample_scmap_normal(scmap: &ScMap, wx: f32, wz: f32) -> [f32; 3] {
     let hm_w = scmap.heightmap_width;
     let hm_h = scmap.heightmap_height;
     if hm_w == 0 || hm_h == 0 {
@@ -1646,7 +1668,7 @@ pub fn load_map_decals(game_dir: &Path, scmap: &ScMap) -> Vec<DecalBatch> {
                         position: [wx, wy, wz],
                         normal,
                         uv: [u, v],
-                        color: [1.0, 1.0, 1.0, 0.05],
+                        color: [1.0, 1.0, 1.0, 1.0],
                     });
                 }
             }
@@ -2379,7 +2401,19 @@ fn find_asset_in_scds(
     None
 }
 
-fn decode_first_dds(
+/// Phase 41: the FA textures of the dynamic decal kinds ([`crate::decals::TEXTURES`]).
+pub fn load_dynamic_decal_textures(game_dir: Option<&Path>) -> Vec<Option<RgbaImage>> {
+    let Some(dir) = game_dir else {
+        return vec![None; crate::decals::KINDS];
+    };
+    let gamedata = scd::gamedata_dir(dir);
+    crate::decals::TEXTURES
+        .iter()
+        .map(|p| decode_first_dds(&gamedata, &["env.scd", "textures.scd"], &[p.to_string()]))
+        .collect()
+}
+
+pub(crate) fn decode_first_dds(
     gamedata: &Path,
     archives: &[&str],
     candidates: &[String],
@@ -2710,6 +2744,8 @@ mod tests {
                 elevation_deep: 0.0,
                 elevation_abyss: 0.0,
             },
+            unknown1: 0, unknown2: 0, unknown3: 0, unknown4: 0, post_heightmap_byte: 0,
+            shader_raw: Vec::new(), background_raw: Vec::new(), sky_raw: Vec::new(), cubemaps_raw: Vec::new(), tail_bytes: Vec::new(),
             terrain_textures: Some(TerrainTextures {
                 strata_albedo: Vec::new(),
                 strata_normal: Vec::new(),
@@ -2719,6 +2755,8 @@ mod tests {
                 normal_map_dds: Vec::new(),
                 water_params: ScMapWaterParams::default(),
                 props: Vec::new(),
+                props_tail_range: None,
+                props_dirty: false,
             }),
         };
 

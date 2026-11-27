@@ -5,20 +5,27 @@ mod audio_play;
 mod blueprint;
 mod camera;
 mod chat;
+mod crash;
 mod combat;
 mod command_card;
 mod controls;
 mod dds;
 mod dds_decode;
+mod decals;
 mod economy;
+mod effects;
 mod flowfield;
 mod fuzz;
 mod hud;
 mod jobs;
 mod keymap;
 mod lobby;
+mod map_author;
+mod loc;
 mod menu;
+mod mission;
 mod mods;
+mod platform;
 mod net;
 mod net_lobby;
 mod pathfinding;
@@ -26,6 +33,7 @@ mod perf_cmds;
 mod play;
 mod profiler;
 mod render_prep;
+mod rendezvous;
 mod replay;
 mod roster;
 mod savegame;
@@ -40,9 +48,13 @@ mod sim;
 mod skirmish;
 mod skirmish_ai;
 mod spatial;
+mod templates;
+mod terrain;
 mod stats;
 mod ttf;
+mod udp_transport;
 mod ui_kit;
+mod vault;
 mod vfx;
 mod viewer;
 mod xact;
@@ -64,13 +76,20 @@ fn print_usage() {
     eprintln!("  farust unit <ID> [FILE.scd]");
     eprintln!("  farust maps [GAME_DIR] [--limit N] [--check]      (stock + user maps, with source)");
     eprintln!("  farust roster [GAME_DIR] [--faction F] [--json]   (data-driven unit roster & coverage)");
-    eprintln!("  farust mods                                       (installed blueprint mods)");
+    eprintln!("  farust loc [--check | <KEY> | --unit <ID>] [--lang CODE] [GAME_DIR] (localization tables)");
+    eprintln!("  farust version                                    (build, rules & protocol versions)");
+    eprintln!("  farust platform                                   (OS dirs + Forged Alliance install discovery)");
+    eprintln!("  farust mods [enable <SPEC> | disable <SPEC> | conflicts] (installed & persisted blueprint mods)");
     eprintln!("  global: --mod <DIR|NAME> (repeatable) enables a blueprint mod for any subcommand");
     eprintln!("  farust map <NAME> [GAME_DIR]");
+    eprintln!("  farust map-roundtrip [--all | <MAP>] [GAME_DIR]   (.scmap v2.60 byte-exact round-trip check)");
+    eprintln!("  farust map-edit <SRC_MAP> <NEW_ID> [GAME_DIR] [--name TITLE] [--raise X,Z,R,H] [--lower X,Z,R,H] [--smooth X,Z,R,S] [--add-mass X,Z] [--del-mass X,Z,R] [--add-hydro X,Z] [--move-start N,X,Z] [--add-prop BP,X,Z[,S]] [--del-prop X,Z,R]");
+    eprintln!("  farust map-editor <MAP> [GAME_DIR] [--out NEW_ID] [--size WxH] [--snapshot OUT.png]");
     eprintln!("  farust meshes [FILE.scd] [--limit N] [--check]");
     eprintln!("  farust mesh <PATH> [FILE.scd]");
     eprintln!("  farust textures [FILE.scd] [--limit N] [--check]");
     eprintln!("  farust dds <PATH> [FILE.scd]");
+    eprintln!("  farust effects [GAME_DIR] [--check] [--coverage]  (FA emitter/beam/trail blueprints & weapon coverage)");
     eprintln!("  farust anim <list|UNIT_ID> [GAME_DIR] [--limit N] [--check]");
     eprintln!("  farust audio <list|info|export> [TARGET] [GAME_DIR] [--check] [--all] [--out DIR]");
     eprintln!("  farust audio <coverage|cues> [GAME_DIR] | audio play-cue <CUE> [GAME_DIR] [--mute] | audio render-mix <OUT.wav> [MAP] [GAME_DIR] [--from TICK] [--ticks N] [--seed S] [--factions a,b]");
@@ -85,20 +104,33 @@ fn print_usage() {
     eprintln!("  farust ai-arena [GAME_DIR] [--maps M1,M2] [--seeds N|S1,S2] [--matchups A:B,C:D] [--factions F0,F1] [--max-ticks N] [--victory V] [--unit-cap N] [--threads K] [--json [FILE]]");
     eprintln!("  farust play [MAP] [GAME_DIR] [--armies 1,2] [--factions uef,cybran] [--ai D] [--victory V] [--unit-cap N] [--seed S] [--speed N] [--load FILE] [--spectate] [--lobby [--lobby-autostart]] [--fow] [--mute] [--no-record] [--record FILE] [--camera-dist F] [--size WxH] [--snapshot OUT.png] [--snapshot-ticks N]");
     eprintln!("  farust replay <verify|play> <FILE> [GAME_DIR] [--speed N] [--mute] [--size WxH] [--snapshot OUT.png] [--snapshot-ticks N]");
-    eprintln!("  farust host <ADDR:PORT> [MAP] [GAME_DIR] [--players N] [--armies 1,2] [--factions uef,cybran] [--seed S] [--play] [--mute] [--size WxH] [--headless-ticks N]");
-    eprintln!("  farust join <ADDR:PORT> [GAME_DIR] [--play] [--mute] [--size WxH] [--headless-ticks N]");
+    eprintln!("  farust replay index [GAME_DIR] [--vault DIR] [--search TEXT] [--map M] [--player P] [--faction F] [--winner W] [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--no-sim] [--rebuild] [--json]");
+    eprintln!("  farust replay upload <FILE> [--rendezvous HOST:PORT] [--vault DIR]");
+    eprintln!("  farust replay download <CODE> [--rendezvous HOST:PORT] [--vault DIR] [--out FILE] [GAME_DIR]");
+    eprintln!("  farust host [<ADDR:PORT>] [MAP] [GAME_DIR] [--code] [--rendezvous ADDR] [--udp] [--netem SPEC] [--players N] [--armies 1,2] [--factions uef,cybran] [--seed S] [--observers K] [--rejoin-grace SECS] [--play] [--mute] [--size WxH] [--headless-ticks N]");
+    eprintln!("  farust join <ADDR:PORT | CODE> [GAME_DIR] [--code CODE] [--rendezvous ADDR] [--udp] [--netem SPEC] [--relay] [--rejoin ARMY|observer] [--play] [--mute] [--size WxH] [--headless-ticks N]");
+    eprintln!("  farust rendezvous [BIND_ADDR] [--replay-dir DIR] [--max-replay-mb N] [--max-storage-mb N]");
+    eprintln!("  global: +connect_lobby <CODE|ADDR:PORT>           (Steam-compatible lobby auto-join arg)");
     eprintln!();
     eprintln!("env:");
-    eprintln!("  FA_PATH  override for the game install dir");
-    eprintln!("  FARUST_PROFILE  enable the scoped profiler (=overlay also shows the F12 overlay)");
-    eprintln!("  FARUST_PROFILE_EXIT  print the profiler span table on exit");
+    eprintln!("  FA_PATH             override for the game install dir");
+    eprintln!("  FARUST_VAULT_DIR    override replay vault directory");
+    eprintln!("  FARUST_RENDEZVOUS   override rendezvous server host:port (default 127.0.0.1:15050)");
+    eprintln!("  FARUST_FORCE_RELAY  =1 forces client relay fallback through rendezvous server");
+    eprintln!("  FARUST_UI_THEME     modern | classic (old-school FA console layout + faction skins)");
+    eprintln!("  FARUST_LANG         localization language code override (e.g. us, de, fr)");
+    eprintln!("  FARUST_PROFILE      enable the scoped profiler (=overlay also shows the F12 overlay)");
+    eprintln!("  FARUST_PROFILE_EXIT print the profiler span table on exit");
 }
 
 fn main() {
+    // Phase 57: crash reports (with the newest desync dump) under <data>/crashes/.
+    crash::install();
     let raw: Vec<String> = std::env::args().collect();
-    // Phase 24: `--mod <DIR|NAME>` (repeatable) is global; strip it before dispatch.
+    // Phase 24/26: `--mod <DIR|NAME>` and `+connect_lobby <CODE>` are global; strip before dispatch.
     let mut args: Vec<String> = Vec::with_capacity(raw.len());
     let mut mod_specs = Vec::new();
+    let mut connect_lobby: Option<String> = None;
     let mut it = raw.into_iter();
     while let Some(a) = it.next() {
         if a == "--mod" {
@@ -109,12 +141,20 @@ fn main() {
                     std::process::exit(1);
                 }
             }
+        } else if a == "+connect_lobby" {
+            match it.next() {
+                Some(t) => connect_lobby = Some(t),
+                None => {
+                    eprintln!("error: +connect_lobby needs an invite code or HOST:PORT");
+                    std::process::exit(1);
+                }
+            }
         } else {
             args.push(a);
         }
     }
     mods::set_enabled(mod_specs);
-    let result = run(&args);
+    let result = run(&args, connect_lobby.as_deref());
     if std::env::var_os("FARUST_PROFILE_EXIT").is_some() {
         profiler::end_frame(None);
         eprintln!("{}", profiler::report_table(None));
@@ -126,17 +166,18 @@ fn main() {
     }
 }
 
-fn run(args: &[String]) -> Result<(), String> {
+fn run(args: &[String], connect_lobby: Option<&str>) -> Result<(), String> {
     profiler::init_from_env();
     if args.len() < 2 {
-        return cmd_menu(args);
+        return cmd_menu(args, connect_lobby);
     }
     match args[1].as_str() {
         "-h" | "--help" | "help" => {
             print_usage();
             Ok(())
         }
-        "menu" => cmd_menu(args),
+        "menu" => cmd_menu(args, connect_lobby),
+        "rendezvous" => cmd_rendezvous(args),
         "ai-arena" => cmd_ai_arena(args),
         "inventory" => {
             let game_dir = positional_after(args, 2).unwrap_or_else(scd::default_game_dir);
@@ -272,12 +313,24 @@ fn run(args: &[String]) -> Result<(), String> {
         }
         "maps" => cmd_maps(args),
         "roster" => roster::cmd_roster(args),
+        "loc" => loc::cmd_loc(args),
         "mods" => mods::cmd_mods(args),
+        "platform" => platform::cmd_platform(),
+        "version" | "--version" | "-V" => {
+            println!("{}", crash::version_line());
+            Ok(())
+        }
+        "crash-test" => crash::cmd_crash_test(),
         "map" => cmd_map(args),
+        "mission" => mission::cmd_mission(args),
+        "map-roundtrip" => map_author::cmd_map_roundtrip(args),
+        "map-edit" => map_author::cmd_map_edit(args),
+        "map-editor" => map_author::cmd_map_editor(args),
         "meshes" => cmd_meshes(args),
         "mesh" => cmd_mesh(args),
         "textures" => cmd_textures(args),
         "dds" => cmd_dds(args),
+        "effects" => effects::cmd_effects(args),
         "anim" => cmd_anim(args),
         "audio" => cmd_audio(args),
         "view-unit" => cmd_view_unit(args),
@@ -291,7 +344,7 @@ fn run(args: &[String]) -> Result<(), String> {
         "play" => cmd_play(args),
         "replay" => cmd_replay(args),
         "host" => cmd_host(args),
-        "join" => cmd_join(args),
+        "join" => cmd_join(args, connect_lobby),
         cmd => Err(format!("unknown command: {cmd}")),
     }
 }
@@ -427,6 +480,13 @@ fn cmd_map(args: &[String]) -> Result<(), String> {
 
     if let Some(scmap_path) = &m.scmap_path {
         let map_data = scmap::ScMap::parse_file(scmap_path)?;
+        let props = skirmish::MapContext::load_props(&game_dir, &map_data);
+        println!(
+            "reclaim:     {} props | {} mass | {} energy",
+            props.len(),
+            props.iter().map(|p| p.mass).sum::<i64>() / sim::SCALE,
+            props.iter().map(|p| p.energy).sum::<i64>() / sim::SCALE
+        );
         let (min_h, max_h, avg_h) = map_data.height_stats();
         println!(
             "scmap:       {} (v{}.{}, map {}x{}, heightmap {}x{}, scale={}, min/max/avg={:.2}/{:.2}/{:.2})",
@@ -719,18 +779,17 @@ fn cmd_anim(args: &[String]) -> Result<(), String> {
 }
 
 fn collect_sound_files(sounds_dir: &Path, ext: &str) -> Result<Vec<PathBuf>, String> {
-    let rd = std::fs::read_dir(sounds_dir)
-        .map_err(|e| format!("cannot read {}: {e}", sounds_dir.display()))?;
-    let mut out: Vec<PathBuf> = rd
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
+    if !sounds_dir.is_dir() {
+        return Err(format!("cannot read {}: not a directory", sounds_dir.display()));
+    }
+    let out: Vec<PathBuf> = xact::collect_sound_paths(sounds_dir)
+        .into_iter()
         .filter(|p| {
             p.extension()
                 .and_then(|s| s.to_str())
                 .is_some_and(|s| s.eq_ignore_ascii_case(ext))
         })
         .collect();
-    out.sort();
     Ok(out)
 }
 
@@ -767,9 +826,13 @@ fn cmd_audio(args: &[String]) -> Result<(), String> {
                                 }
                             }
                         } else {
+                            let rel = p
+                                .strip_prefix(&sounds_dir)
+                                .unwrap_or(p)
+                                .to_string_lossy();
                             println!(
-                                "  XWB {:<24} waves={:<4} v{}",
-                                p.file_name().unwrap_or_default().to_string_lossy(),
+                                "  XWB {:<28} waves={:<4} v{}",
+                                rel,
                                 wb.entries.len(),
                                 wb.version
                             );
@@ -786,9 +849,13 @@ fn cmd_audio(args: &[String]) -> Result<(), String> {
                     Ok(sb) => {
                         total_cues += sb.cues.len();
                         if !check {
+                            let rel = p
+                                .strip_prefix(&sounds_dir)
+                                .unwrap_or(p)
+                                .to_string_lossy();
                             println!(
-                                "  XSB {:<24} cues={:<4} wbs={}",
-                                p.file_name().unwrap_or_default().to_string_lossy(),
+                                "  XSB {:<28} cues={:<4} wbs={}",
+                                rel,
                                 sb.cues.len(),
                                 sb.wavebank_names.join(",")
                             );
@@ -899,7 +966,7 @@ fn cmd_audio_ext(args: &[String]) -> Result<(), String> {
         "cues" => {
             let game_dir = positional_after(args, 3).unwrap_or_else(scd::default_game_dir);
             let catalog = skirmish::Catalog::load(&game_dir).ok();
-            audio_play::print_cue_mapping(&game_dir, catalog.as_ref());
+            audio_play::print_cue_mapping(&game_dir, catalog.as_ref(), has_flag(args, "--all"));
             Ok(())
         }
         _ => {
@@ -1294,8 +1361,24 @@ fn positional_after(args: &[String], start: usize) -> Option<PathBuf> {
             || a == "--units"
             || a == "--headless-ticks"
             || a == "--players"
+            || a == "--observers"
+            || a == "--rejoin-grace"
+            || a == "--rejoin"
             || a == "--camera-dist"
             || a == "--out"
+            || a == "--rendezvous"
+            || a == "--mission"
+            || a == "--personality"
+            || a == "--human-ai"
+            || a == "--vault"
+            || a == "--player"
+            || a == "--faction"
+            || a == "--winner"
+            || a == "--from"
+            || a == "--to"
+            || a == "--replay-dir"
+            || a == "--max-replay-mb"
+            || a == "--max-storage-mb"
         {
             i += 2;
             continue;
@@ -1419,6 +1502,14 @@ fn parse_game_options(args: &[String]) -> Result<skirmish::GameOptions, String> 
     Ok(opts)
 }
 
+/// Phase 53: `--personality rush,turtle` (per army, cycled; default balanced).
+fn parse_personalities(args: &[String], armies: usize) -> Result<Vec<skirmish_ai::Personality>, String> {
+    match flag_str(args, "--personality") {
+        Some(s) => skirmish_ai::parse_personality_list(s, armies),
+        None => Ok(vec![skirmish_ai::Personality::Balanced; armies]),
+    }
+}
+
 fn parse_ai_diffs(args: &[String], armies: usize) -> Result<Vec<skirmish_ai::Difficulty>, String> {
     match flag_str(args, "--ai") {
         Some(s) => skirmish_ai::parse_difficulty_list(s, armies),
@@ -1457,11 +1548,13 @@ fn cmd_skirmish(args: &[String]) -> Result<(), String> {
             })
             .collect();
         let mut rec = replay::ReplayRecorder::new(&map.map_id, seed, setups);
+        rec.set_mission(world.mission_source());
         rec.set_options(options);
         rec
     });
+    let pers = parse_personalities(args, setup.len())?;
     let mut ais: Vec<skirmish_ai::ScriptedAi> = (0..setup.len())
-        .map(|i| skirmish_ai::ScriptedAi::with_difficulty(i as skirmish::ArmyId, diffs[i]))
+        .map(|i| skirmish_ai::ScriptedAi::with_personality(i as skirmish::ArmyId, diffs[i], pers[i]))
         .collect();
     let load_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
@@ -1640,28 +1733,45 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
         return lobby::run_lobby(&game_dir, map_name, seed, width, height, snapshot_out.as_deref(), has_flag(args, "--lobby-autostart"));
     }
 
-    let catalog = skirmish::Catalog::load(&game_dir)?;
-    let meshes = play::UnitMeshCache::load(Some(&game_dir), &catalog);
+    let mut catalog = skirmish::Catalog::load(&game_dir)?;
 
-    let (map, mut session) = if let Some(ref save_path) = load_file {
+    let (map, mut session, meshes) = if let Some(ref save_path) = load_file {
         let save = savegame::SaveGame::read(save_path)?;
+        if let Some(src) = &save.replay.header.mission {
+            mission::ensure_mission_types_src(src, &mut catalog, &game_dir)?;
+        }
+        let meshes = play::UnitMeshCache::load(Some(&game_dir), &catalog);
         let map = skirmish::MapContext::load(&game_dir, &save.replay.header.map_id)?;
         let mut origin = savegame::origin_world(catalog, &map, &save.replay)?;
         origin.set_options(save.replay.header.options);
         let sess = save.into_session(origin)?;
-        (map, sess)
+        (map, sess, meshes)
+    } else if let Some(mpath) = flag_str(args, "--mission") {
+        // Phase 48/49: play a scripted mission.
+        let m = mission::load_file(std::path::Path::new(&mpath))?;
+        m.ensure_catalog_types(&mut catalog, &game_dir)?;
+        let meshes = play::UnitMeshCache::load(Some(&game_dir), &catalog);
+        let map = skirmish::MapContext::load(&game_dir, &m.map)?;
+        let world = mission::build_world(&m, catalog, &map, seed)?;
+        let human = m.human_army().unwrap_or(0) as skirmish::ArmyId;
+        let mut sess = play::PlaySession::new(world, human, spectate, speed);
+        sess.ais = mission::ai_armies(&m, spectate.then_some("normal"))?;
+        (map, sess, meshes)
     } else {
+        let meshes = play::UnitMeshCache::load(Some(&game_dir), &catalog);
         let options = parse_game_options(args)?;
         let map = skirmish::MapContext::load(&game_dir, map_name)?;
         let setup = parse_skirmish_setup(args, &catalog, map.starts.len())?;
         let diffs = parse_ai_diffs(args, setup.len())?;
+        let pers = parse_personalities(args, setup.len())?;
         let world = skirmish::Skirmish::on_map(catalog, &map, &setup, seed)?.with_options(options);
         let mut sess = play::PlaySession::new(world, 0, spectate, speed);
         for ai in &mut sess.ais {
             let d = diffs.get(ai.army as usize).copied().unwrap_or_default();
-            *ai = skirmish_ai::ScriptedAi::with_difficulty(ai.army, d);
+            let pp = pers.get(ai.army as usize).copied().unwrap_or_default();
+            *ai = skirmish_ai::ScriptedAi::with_personality(ai.army, d, pp);
         }
-        (map, sess)
+        (map, sess, meshes)
     };
     session.muted = has_flag(args, "--mute");
     if no_record {
@@ -1731,15 +1841,29 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
 }
 
 fn cmd_replay(args: &[String]) -> Result<(), String> {
+    if args.len() < 3 {
+        return Err(
+            "usage: farust replay <verify|play|index|upload|download> ...".to_string(),
+        );
+    }
+    let mode = args[2].as_str();
+    match mode {
+        "index" => return cmd_replay_index(args),
+        "upload" => return cmd_replay_upload(args),
+        "download" => return cmd_replay_download(args),
+        _ => {}
+    }
     if args.len() < 4 {
         return Err("usage: farust replay <verify|play> <FILE> [GAME_DIR] [--size WxH] [--snapshot OUT.png] [--snapshot-ticks N]".to_string());
     }
-    let mode = args[2].as_str();
     let replay_path = PathBuf::from(&args[3]);
     let game_dir = positional_after(args, 4).unwrap_or_else(scd::default_game_dir);
 
     let rep = replay::Replay::load(&replay_path)?;
-    let catalog = skirmish::Catalog::load(&game_dir)?;
+    let mut catalog = skirmish::Catalog::load(&game_dir)?;
+    if let Some(src) = &rep.header.mission {
+        mission::ensure_mission_types_src(src, &mut catalog, &game_dir)?;
+    }
     let map = skirmish::MapContext::load(&game_dir, &rep.header.map_id)?;
 
     match mode {
@@ -1760,6 +1884,10 @@ fn cmd_replay(args: &[String]) -> Result<(), String> {
         "play" => {
             let speed = flag_usize(args, "--speed").unwrap_or(2).clamp(1, 8) as u32;
             let (width, height) = parse_size_flag(args).unwrap_or((1280, 800));
+            let vault_dir = flag_str(args, "--vault")
+                .map(PathBuf::from)
+                .unwrap_or_else(vault::default_vault_dir);
+            let bookmarks = vault::VaultIndex::bookmarks_for_path(&vault_dir, &replay_path);
             let meshes = play::UnitMeshCache::load(Some(&game_dir), &catalog);
             let mut world = skirmish::Skirmish::new(
                 catalog,
@@ -1769,14 +1897,14 @@ fn cmd_replay(args: &[String]) -> Result<(), String> {
                 &rep.header.setups,
                 rep.header.seed,
             )?;
-            world.set_domain_grids(
-                map.naval_grid.clone(),
-                map.amphib_grid.clone(),
-                map.hydro_points.clone(),
-            );
+            world.attach_map(&map);
             world.set_options(rep.header.options);
+            rep.header.apply_mission(&mut world, &map)?;
             let final_tick = rep.final_tick;
             let mut session = play::PlaySession::new_replay(world, rep, speed);
+            if !bookmarks.is_empty() {
+                session.set_replay_bookmarks(bookmarks);
+            }
             session.muted = has_flag(args, "--mute");
             if let Some(out) = flag_str(args, "--snapshot") {
                 let target_ticks = flag_usize(args, "--snapshot-ticks").unwrap_or(3000) as u64;
@@ -1817,24 +1945,315 @@ fn cmd_replay(args: &[String]) -> Result<(), String> {
                 );
                 return Ok(());
             }
-            println!("Replay: timeline click/drag seek | Space pause | +/- speed 1x-16x | [ ] seek -/+30s | Home restart | V perspective (observer/army FoW)");
+            println!("Replay: timeline click/drag seek | bookmark pips & <BM/BM> | Space pause | +/- speed 1x-16x | [ ] seek -/+30s | Home restart | V perspective (observer/army FoW)");
             play::run_play_window(Some(&game_dir), session, map, meshes, width, height)
         }
-        other => Err(format!("unknown replay subcommand '{other}' (expected verify|play)")),
+        other => Err(format!(
+            "unknown replay subcommand '{other}' (expected verify|play|index|upload|download)"
+        )),
     }
 }
 
-fn cmd_host(args: &[String]) -> Result<(), String> {
-    if args.len() < 3 {
-        return Err("usage: farust host <ADDR:PORT> [MAP] [GAME_DIR] [--players N] [--armies 1,2,3] [--factions uef,cybran] [--seed S] [--play] [--headless-ticks N]".to_string());
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push(' '),
+            c => out.push(c),
+        }
     }
-    let addr = &args[2];
-    let map_name = args
-        .get(3)
+    out
+}
+
+fn cmd_replay_index(args: &[String]) -> Result<(), String> {
+    let vault_dir = flag_str(args, "--vault")
+        .map(PathBuf::from)
+        .unwrap_or_else(vault::default_vault_dir);
+    let game_dir = positional_after(args, 3).unwrap_or_else(scd::default_game_dir);
+    let game_opt = game_dir.is_dir().then_some(game_dir.as_path());
+    let opts = vault::SyncOptions {
+        run_sim: !has_flag(args, "--no-sim"),
+        generate_thumbs: true,
+        force_rebuild: has_flag(args, "--rebuild"),
+    };
+    let t0 = Instant::now();
+    let mut index = vault::VaultIndex::load_or_empty(&vault_dir);
+    let report = index.sync(&vault_dir, game_opt, opts)?;
+
+    let mut query = flag_str(args, "--search")
+        .map(vault::VaultQuery::parse)
+        .unwrap_or_default();
+    if let Some(m) = flag_str(args, "--map") {
+        query.map = Some(m.to_string());
+    }
+    if let Some(p) = flag_str(args, "--player") {
+        query.player = Some(p.to_string());
+    }
+    if let Some(f) = flag_str(args, "--faction") {
+        query.faction = Some(f.to_string());
+    }
+    if let Some(w) = flag_str(args, "--winner") {
+        query.winner = Some(w.to_string());
+    }
+    if let Some(from) = flag_str(args, "--from") {
+        query.date_from = Some(from.to_string());
+    }
+    if let Some(to) = flag_str(args, "--to") {
+        query.date_to = Some(to.to_string());
+    }
+
+    let matches = index.search(&query);
+    if has_flag(args, "--json") {
+        println!("[");
+        for (i, e) in matches.iter().enumerate() {
+            let comma = if i + 1 < matches.len() { "," } else { "" };
+            let winner = e
+                .winner
+                .as_ref()
+                .map(|w| format!("\"{}\"", json_escape(&w.label())))
+                .unwrap_or_else(|| "null".to_string());
+            let code = e
+                .share_code
+                .as_ref()
+                .map(|c| format!("\"{}\"", json_escape(c)))
+                .unwrap_or_else(|| "null".to_string());
+            println!(
+                "  {{\"file\":\"{}\",\"map_id\":\"{}\",\"map_name\":\"{}\",\"date\":\"{}\",\"duration_ticks\":{},\"rules\":{},\"needs_older_build\":{},\"winner\":{},\"bookmarks\":{},\"size\":{},\"share_code\":{}}}{comma}",
+                json_escape(&e.file_name),
+                json_escape(&e.map_id),
+                json_escape(&e.map_name),
+                json_escape(&e.date_ymd),
+                e.duration_ticks,
+                e.rules,
+                e.needs_older_build(),
+                winner,
+                e.bookmarks.len(),
+                e.file_size,
+                code
+            );
+        }
+        println!("]");
+        return Ok(());
+    }
+
+    println!(
+        "Replay vault: {} ({} total, {} cached, {} indexed, {} sim-analyzed, {} removed in {:.0}ms)",
+        vault_dir.display(),
+        report.total,
+        report.cached,
+        report.indexed,
+        report.sim_analyzed,
+        report.removed,
+        t0.elapsed().as_secs_f64() * 1000.0
+    );
+    for err in &report.errors {
+        eprintln!("  warn: {err}");
+    }
+    if matches.is_empty() {
+        println!("No matching replays.");
+        return Ok(());
+    }
+    for e in matches {
+        let rules_note = if e.needs_older_build() {
+            format!(" [needs older build: rules v{}]", e.rules)
+        } else {
+            String::new()
+        };
+        let code_note = e
+            .share_code
+            .as_ref()
+            .map(|c| format!(" [code:{c}]"))
+            .unwrap_or_default();
+        println!(
+            "  {} | {} ({}) | {} | {} | {} | winner: {} | {} bm | {:.1} KiB{}{}",
+            e.file_name,
+            e.map_id,
+            e.map_name,
+            e.date_ymd,
+            e.duration_mmss(),
+            e.armies_summary(),
+            e.winner_label(),
+            e.bookmarks.len(),
+            e.file_size as f64 / 1024.0,
+            rules_note,
+            code_note
+        );
+    }
+    Ok(())
+}
+
+fn cmd_replay_upload(args: &[String]) -> Result<(), String> {
+    if args.len() < 4 || args[3].starts_with("--") {
+        return Err("usage: farust replay upload <FILE> [--rendezvous HOST:PORT] [--vault DIR]".into());
+    }
+    let file = PathBuf::from(&args[3]);
+    let rv_addr = flag_str(args, "--rendezvous")
+        .map(str::to_string)
+        .unwrap_or_else(|| settings::effective_rendezvous(None));
+    let bytes = std::fs::read(&file)
+        .map_err(|e| format!("failed to read {}: {e}", file.display()))?;
+    let up = rendezvous::upload_replay(&rv_addr, &bytes, std::time::Duration::from_secs(10))?;
+
+    // Cache the returned share code in the vault index if the file is in the vault.
+    let vault_dir = flag_str(args, "--vault")
+        .map(PathBuf::from)
+        .unwrap_or_else(vault::default_vault_dir);
+    if let Some(fname) = file.file_name().map(|s| s.to_string_lossy().to_string()) {
+        let mut idx = vault::VaultIndex::load_or_empty(&vault_dir);
+        if idx.set_share_code(&fname, &up.code) {
+            let _ = idx.save(&vault_dir);
+        }
+    }
+
+    println!(
+        "replay uploaded: code={} size={} hash={:016x} via {}",
+        up.code, up.size, up.content_hash, rv_addr
+    );
+    Ok(())
+}
+
+fn cmd_replay_download(args: &[String]) -> Result<(), String> {
+    if args.len() < 4 || args[3].starts_with("--") {
+        return Err("usage: farust replay download <CODE> [--rendezvous HOST:PORT] [--vault DIR] [--out FILE] [GAME_DIR]".into());
+    }
+    let code = &args[3];
+    let rv_addr = flag_str(args, "--rendezvous")
+        .map(str::to_string)
+        .unwrap_or_else(|| settings::effective_rendezvous(None));
+    let timeout = std::time::Duration::from_secs(10);
+
+    if let Some(out) = flag_str(args, "--out") {
+        let dl = rendezvous::download_replay(&rv_addr, code, timeout)?;
+        let out_path = PathBuf::from(out);
+        if let Some(parent) = out_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+        }
+        std::fs::write(&out_path, &dl.bytes)
+            .map_err(|e| format!("failed to write {}: {e}", out_path.display()))?;
+        println!(
+            "replay downloaded: code={} map={} ticks={} size={} -> {}",
+            dl.code,
+            dl.replay.header.map_id,
+            dl.replay.final_tick,
+            dl.bytes.len(),
+            out_path.display()
+        );
+        return Ok(());
+    }
+
+    let vault_dir = flag_str(args, "--vault")
+        .map(PathBuf::from)
+        .unwrap_or_else(vault::default_vault_dir);
+    let (saved_path, dl) =
+        rendezvous::download_replay_into_vault(&rv_addr, code, &vault_dir, timeout)?;
+
+    let game_dir = positional_after(args, 4).unwrap_or_else(scd::default_game_dir);
+    let game_opt = game_dir.is_dir().then_some(game_dir.as_path());
+    let mut idx = vault::VaultIndex::load_or_empty(&vault_dir);
+    let _ = idx.sync(
+        &vault_dir,
+        game_opt,
+        vault::SyncOptions {
+            run_sim: !has_flag(args, "--no-sim"),
+            generate_thumbs: true,
+            force_rebuild: false,
+        },
+    );
+    if let Some(fname) = saved_path.file_name().map(|s| s.to_string_lossy().to_string())
+        && idx.set_share_code(&fname, &dl.code)
+    {
+        let _ = idx.save(&vault_dir);
+    }
+
+    println!(
+        "replay downloaded: code={} map={} ticks={} size={} -> {}",
+        dl.code,
+        dl.replay.header.map_id,
+        dl.replay.final_tick,
+        dl.bytes.len(),
+        saved_path.display()
+    );
+    Ok(())
+}
+
+fn cmd_rendezvous(args: &[String]) -> Result<(), String> {
+    let bind_addr = args
+        .get(2)
         .filter(|a| !a.starts_with("--"))
         .map(String::as_str)
-        .unwrap_or("SCMP_001");
-    let game_dir = positional_after(args, 4).unwrap_or_else(scd::default_game_dir);
+        .unwrap_or("0.0.0.0:15050");
+    let mut cfg = rendezvous::ReplayStoreConfig::default();
+    if let Some(d) = flag_str(args, "--replay-dir") {
+        cfg.dir = PathBuf::from(d);
+    }
+    if let Some(mb) = flag_usize(args, "--max-replay-mb") {
+        cfg.max_replay_bytes = (mb.clamp(1, 8)) * 1024 * 1024;
+    }
+    if let Some(mb) = flag_usize(args, "--max-storage-mb") {
+        cfg.max_total_bytes = (mb.max(1) as u64) * 1024 * 1024;
+    }
+    let srv = rendezvous::RendezvousServer::bind_with_replays(bind_addr, cfg)?;
+    println!(
+        "FARust rendezvous (UDP hole-punch + TCP relay + replay sharing) listening on {} (TCP+UDP) | replays={}",
+        srv.local_addr(),
+        srv.replay_dir().display()
+    );
+    srv.run_forever();
+    Ok(())
+}
+
+fn cmd_host(args: &[String]) -> Result<(), String> {
+    let use_code = has_flag(args, "--code");
+    let netem_spec = flag_str(args, "--netem");
+    let netem = match netem_spec {
+        Some(spec) => udp_transport::NetemConfig::parse(spec)?,
+        None => udp_transport::NetemConfig::default(),
+    };
+    let use_udp = has_flag(args, "--udp") || netem_spec.is_some();
+    let rv_addr = flag_str(args, "--rendezvous")
+        .map(str::to_string)
+        .unwrap_or_else(|| settings::effective_rendezvous(None));
+
+    // Positional args (skipping value flags): optional ADDR:PORT (if contains ':'), MAP, GAME_DIR.
+    let mut pos: Vec<&str> = Vec::new();
+    let mut i = 2usize;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if matches!(
+            a,
+            "--seed" | "--headless-ticks" | "--players" | "--observers" | "--rejoin-grace" | "--armies" | "--factions" | "--size" | "--rendezvous" | "--netem"
+        ) {
+            i += 2;
+            continue;
+        }
+        if a.starts_with("--") {
+            i += 1;
+            continue;
+        }
+        pos.push(a);
+        i += 1;
+    }
+
+    let (addr, map_idx) = match pos.first().copied() {
+        Some(first) if first.contains(':') => (first, 1usize),
+        _ if use_code => ("0.0.0.0:0", 0usize),
+        _ => {
+            return Err("usage: farust host [<ADDR:PORT>] [MAP] [GAME_DIR] [--code] [--rendezvous ADDR] [--udp] [--netem SPEC] [--players N] [--armies 1,2,3] [--factions uef,cybran] [--seed S] [--play] [--headless-ticks N]".to_string());
+        }
+    };
+    let map_name = pos.get(map_idx).copied().unwrap_or("SCMP_001");
+    let game_dir = pos
+        .get(map_idx + 1)
+        .map(PathBuf::from)
+        .unwrap_or_else(scd::default_game_dir);
     let seed = flag_str(args, "--seed")
         .map(|s| s.parse::<u64>().map_err(|_| format!("invalid --seed '{s}'")))
         .transpose()?
@@ -1883,19 +2302,61 @@ fn cmd_host(args: &[String]) -> Result<(), String> {
         input_delay: net::DEFAULT_INPUT_DELAY,
         tick_limit: if interactive { 0 } else { ticks },
         assigned_army: 0,
+        observers: flag_usize(args, "--observers").unwrap_or(0).min(8),
+        join_turn: 0,
+        mods: catalog.mods.clone(),
     };
 
+    let proto_label = match (use_udp, netem_spec) {
+        (true, Some(spec)) => format!("UDP (netem {spec})"),
+        (true, None) => "UDP".to_string(),
+        (false, _) => "TCP".to_string(),
+    };
     println!(
-        "Hosting {players}-player lockstep match on {addr} ({}, {} armies, {} AI, seed {seed}); waiting for {} client(s)...",
+        "Hosting {players}-player {proto_label} lockstep match on {addr} ({}, {} armies, {} AI, seed {seed}); waiting for {} client(s)...",
         map.map_id,
         hs.setups.len(),
         hs.setups.len() - players,
         players - 1
     );
-    let (host, bound) = net::LockstepHost::bind_players(addr, &hs, |army, peer| {
-        println!("  army {army} joined from {peer}");
-    })?;
+    let (mut host, bound) = if use_code && use_udp {
+        let (h, b, _code) = net::LockstepHost::bind_players_udp_with_code(
+            addr,
+            &rv_addr,
+            &hs,
+            netem,
+            |army, peer, via| {
+                println!("  army {army} joined from {peer} ({})", via.label());
+            },
+        )?;
+        (h, b)
+    } else if use_code {
+        let (h, b, _code) = net::LockstepHost::bind_players_with_code(
+            addr,
+            &rv_addr,
+            &hs,
+            |army, peer, relayed| {
+                let via = if relayed { "relay" } else { "direct" };
+                println!("  army {army} joined from {peer} ({via})");
+            },
+        )?;
+        (h, b)
+    } else if use_udp {
+        net::LockstepHost::bind_players_udp(addr, &hs, netem, |army, peer| {
+            println!("  army {army} joined from {peer} (udp)");
+        })?
+    } else {
+        net::LockstepHost::bind_players(addr, &hs, |army, peer| {
+            println!("  army {army} joined from {peer}");
+        })?
+    };
     println!("All players connected on {bound}");
+    // Phase 45: direct TCP hosts accept reconnects, AI hand-backs and late observers.
+    if !use_code && !use_udp {
+        let grace = flag_usize(args, "--rejoin-grace").unwrap_or(if interactive { 20 } else { 0 }) as u64;
+        host.enable_rejoin(None, &hs, std::time::Duration::from_secs(grace))?;
+        println!("Rejoin enabled on {bound} (a dropped player is waited for {grace}s before the AI takes over)");
+    }
     let meshes = interactive.then(|| play::UnitMeshCache::load(Some(&game_dir), &catalog));
     let world = net::world_from_handshake(catalog, &map, &hs)?;
     if let Some(meshes) = meshes {
@@ -1905,20 +2366,108 @@ fn cmd_host(args: &[String]) -> Result<(), String> {
         net::NetHandle::start(&session.world, &hs, Box::new(host))?.attach(&mut session);
         return play::run_play_window(Some(&game_dir), session, map, meshes, width, height);
     }
-    run_headless_peer("host", Box::new(host), world, &hs, ticks)
+    let res = run_headless_peer("host", &mut host, world, &hs, ticks);
+    if let Some(st) = host.netem_stats()
+        && (st.dropped > 0 || st.duplicated > 0 || st.reordered > 0)
+    {
+        println!(
+            "host netem: sent={} dropped={} dup={} reordered={}",
+            st.sent, st.dropped, st.duplicated, st.reordered
+        );
+    }
+    res
 }
 
-fn cmd_join(args: &[String]) -> Result<(), String> {
-    if args.len() < 3 {
-        return Err("usage: farust join <ADDR:PORT> [GAME_DIR] [--play] [--headless-ticks N]".to_string());
+fn cmd_join(args: &[String], connect_lobby: Option<&str>) -> Result<(), String> {
+    let code_flag = flag_str(args, "--code")
+        .map(str::to_string)
+        .or_else(|| connect_lobby.map(str::to_string));
+    let rv_addr = flag_str(args, "--rendezvous")
+        .map(str::to_string)
+        .unwrap_or_else(|| settings::effective_rendezvous(None));
+    let force_relay = has_flag(args, "--relay");
+    let netem_spec = flag_str(args, "--netem");
+    let netem = match netem_spec {
+        Some(spec) => udp_transport::NetemConfig::parse(spec)?,
+        None => udp_transport::NetemConfig::default(),
+    };
+    let use_udp = has_flag(args, "--udp") || netem_spec.is_some();
+
+    let mut pos: Vec<&str> = Vec::new();
+    let mut i = 2usize;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if matches!(a, "--code" | "--rendezvous" | "--headless-ticks" | "--size" | "--netem" | "--rejoin") {
+            i += 2;
+            continue;
+        }
+        if a.starts_with("--") {
+            i += 1;
+            continue;
+        }
+        pos.push(a);
+        i += 1;
     }
-    let addr = &args[2];
-    let game_dir = positional_after(args, 3).unwrap_or_else(scd::default_game_dir);
+
+    let (target, dir_idx) = match code_flag {
+        Some(c) => (c, 0usize),
+        None => {
+            let first = pos.first().copied().ok_or_else(|| {
+                "usage: farust join <ADDR:PORT | CODE> [GAME_DIR] [--code CODE] [--rendezvous ADDR] [--udp] [--netem SPEC] [--relay] [--play] [--headless-ticks N]".to_string()
+            })?;
+            (first.to_string(), 1usize)
+        }
+    };
+    let game_dir = pos
+        .get(dir_idx)
+        .map(PathBuf::from)
+        .unwrap_or_else(scd::default_game_dir);
     let interactive = has_flag(args, "--play");
 
-    let (client, hs) = net::LockstepClient::connect_retry(addr, std::time::Duration::from_secs(30))?;
+    // Phase 45: `--rejoin ARMY|observer` reconnects to a running match (direct TCP).
+    let rejoin = flag_str(args, "--rejoin")
+        .map(|v| match v {
+            "observer" | "obs" => Ok(net::REJOIN_OBSERVER),
+            n => n.parse::<u8>().map_err(|_| format!("invalid --rejoin '{n}' (army number or 'observer')")),
+        })
+        .transpose()?;
+    let (client, hs) = if let Some(army) = rejoin {
+        if rendezvous::looks_like_code(&target) || use_udp {
+            return Err("--rejoin needs a direct TCP host address (ADDR:PORT)".to_string());
+        }
+        let (c, hs) = net::LockstepClient::connect_rejoin_retry(&target, army, std::time::Duration::from_secs(30))?;
+        println!("Rejoining at turn {} (re-simulating the match so far)", hs.join_turn);
+        (c, hs)
+    } else if rendezvous::looks_like_code(&target) {
+        if use_udp {
+            let (c, hs, via) = net::LockstepClient::connect_code_udp_retry(
+                &rv_addr,
+                &target,
+                force_relay,
+                netem,
+                std::time::Duration::from_secs(30),
+            )?;
+            println!("Connected via code {target} ({} @ {})", via.label(), via.addr());
+            (c, hs)
+        } else {
+            let (c, hs, via) = net::LockstepClient::connect_code_retry(
+                &rv_addr,
+                &target,
+                force_relay,
+                std::time::Duration::from_secs(30),
+            )?;
+            let kind = if via.is_relayed() { "relay" } else { "direct" };
+            println!("Connected via code {target} ({kind} @ {})", via.addr());
+            (c, hs)
+        }
+    } else if use_udp {
+        net::LockstepClient::connect_udp_retry(&target, netem, std::time::Duration::from_secs(30))?
+    } else {
+        net::LockstepClient::connect_retry(&target, std::time::Duration::from_secs(30))?
+    };
     println!(
-        "Joined {addr} as army {} of {} players ({} armies) on {} seed {}",
+        "Joined {target} as {} {} of {} players ({} armies) on {} seed {}",
+        if net::is_observer(hs.assigned_army) { "observer" } else { "army" },
         hs.assigned_army,
         hs.player_count,
         hs.setups.len(),
@@ -1941,17 +2490,38 @@ fn cmd_join(args: &[String]) -> Result<(), String> {
     let world = net::world_from_handshake(catalog, &map, &hs)?;
     if let Some(meshes) = meshes {
         let (width, height) = parse_size_flag(args).unwrap_or((1280, 800));
-        let mut session = play::PlaySession::new(world, hs.assigned_army, false, 1);
+        // Phase 38: live observers spectate with fog off and never run local AIs.
+        let observer = net::is_observer(hs.assigned_army);
+        let mut session = play::PlaySession::new(world, hs.assigned_army, observer, 1);
+        if observer {
+            session.ais.clear();
+            session.fog_of_war = false;
+        }
         session.muted = has_flag(args, "--mute");
-        net::NetHandle::start(&session.world, &hs, Box::new(client))?.attach(&mut session);
+        let handle = if hs.join_turn > 0 {
+            net::NetHandle::start_rejoined(&mut session.world, &hs, Box::new(client))?
+        } else {
+            net::NetHandle::start(&session.world, &hs, Box::new(client))?
+        };
+        handle.attach(&mut session);
         return play::run_play_window(Some(&game_dir), session, map, meshes, width, height);
     }
-    run_headless_peer("client", Box::new(client), world, &hs, ticks)
+    let mut client = client;
+    let res = run_headless_peer("client", &mut client, world, &hs, ticks);
+    if let Some(st) = client.netem_stats()
+        && (st.dropped > 0 || st.duplicated > 0 || st.reordered > 0)
+    {
+        println!(
+            "client netem: sent={} dropped={} dup={} reordered={}",
+            st.sent, st.dropped, st.duplicated, st.reordered
+        );
+    }
+    res
 }
 
 fn run_headless_peer(
     role: &str,
-    mut transport: Box<dyn net::TurnTransport>,
+    transport: &mut dyn net::TurnTransport,
     mut world: skirmish::Skirmish,
     hs: &net::Handshake,
     ticks: u64,
@@ -1964,7 +2534,7 @@ fn run_headless_peer(
         core.shared_ai_armies()
     );
     let t0 = Instant::now();
-    let final_hash = net::run_headless(transport.as_mut(), &mut core, &mut world, ticks)?;
+    let final_hash = net::run_headless(transport, &mut core, &mut world, ticks)?;
     println!(
         "lockstep {role} complete: army={} players={} ticks={} turns={} hash={final_hash:016x} ({:.0}ms)",
         hs.assigned_army,
@@ -2171,7 +2741,7 @@ fn cmd_bench_scale(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn cmd_menu(args: &[String]) -> Result<(), String> {
+fn cmd_menu(args: &[String], connect_lobby: Option<&str>) -> Result<(), String> {
     let start_idx = if args.get(1).is_some_and(|s| s == "menu") { 2 } else { 1 };
     let game_dir = positional_after(args, start_idx).unwrap_or_else(scd::default_game_dir);
     let screen = match flag_str(args, "--screen") {
@@ -2188,6 +2758,7 @@ fn cmd_menu(args: &[String]) -> Result<(), String> {
         initial_map: flag_str(args, "--map").map(str::to_string),
         seed,
         autostart: has_flag(args, "--lobby-autostart"),
+        connect_lobby: connect_lobby.map(str::to_string),
     };
     menu::run(&game_dir, opts)
 }
@@ -2481,16 +3052,18 @@ fn cmd_ai_arena(args: &[String]) -> Result<(), String> {
             o.hash
         );
     }
+    let elo = skirmish_ai::elo_ratings(&outcomes.iter().map(|o| (o.d0, o.d1, o.winner)).collect::<Vec<_>>());
     println!("standings:");
     for (diff, rec) in &table {
         println!(
-            "  {:<9} games={:<3} wins={:<3} losses={:<3} draws={:<3} avg_ticks={}",
+            "  {:<9} games={:<3} wins={:<3} losses={:<3} draws={:<3} avg_ticks={:<6} elo={:.0}",
             diff.name(),
             rec.games,
             rec.wins,
             rec.losses,
             rec.draws,
-            rec.ticks / rec.games.max(1) as u64
+            rec.ticks / rec.games.max(1) as u64,
+            elo.get(diff).copied().unwrap_or(1500.0)
         );
     }
     if let Some(ref path) = json_file {
