@@ -495,8 +495,9 @@ pub const LOF_CLEARANCE: i64 = SCALE / 4;
 /// 3 = Phase 30 air fuel & staging; 4 = Phase 31 engineering stations & pod drones;
 /// 5 = Phase 32 mobile factories, mobile staging & hatching eggs; 6 = Phase 33 Novax
 /// satellite, EMP stun, death explosions & kamikaze weapons; 7 = Phase 34 prop reclaim;
-/// 8 = Phase 35 fire states, ground fire, guard & build pause; 9 = Phase 36 ferries.
-pub const RULES_VERSION: u32 = 9;
+/// 8 = Phase 35 fire states, ground fire, guard & build pause; 9 = Phase 36 ferries;
+/// 10 = Phase 53 pings as sim commands (allied AIs react).
+pub const RULES_VERSION: u32 = 10;
 
 /// Phase 29: milliradians per degree, scaled by 1000 (17.453 mrad / deg).
 const MRAD_PER_DEG_MILLI: i64 = 17_453;
@@ -1943,6 +1944,8 @@ pub enum Command {
     MoveWaypoint { units: Vec<UnitId>, index: u32, x: i64, y: i64 },
     /// Phase 36: set up a ferry route for air transports.
     Ferry { transports: Vec<UnitId>, from: (i64, i64), to: (i64, i64), queue: bool },
+    /// Phase 53: map ping for allies (0 alert / 1 move / 2 attack); allied AIs react.
+    Ping { kind: u8, x: i64, y: i64 },
     /// Phase 18: `transports` fly to `(x, y)` and drop their cargo.
     Unload { transports: Vec<UnitId>, x: i64, y: i64, queue: bool },
     /// Phase 18: install ACU/SCU enhancement `name` (blueprint `Enhancements` key).
@@ -2434,6 +2437,8 @@ pub struct Skirmish {
     props_gone: Vec<(u32, u32)>,
     /// Phase 48: running mission script (triggers evaluated after every tick's cleanup).
     mission: Option<Box<crate::mission::MissionRuntime>>,
+    /// Phase 53: recent map pings `(tick, army, kind, position)`, oldest first (≤ 32).
+    pings: VecDeque<(u64, ArmyId, u8, (i64, i64))>,
     flow_cache: FlowFieldCache,
     spatial: Arc<SpatialGrid>,
     spatial_snap: Arc<Vec<UnitSpatialSnap>>,
@@ -2516,6 +2521,7 @@ impl Skirmish {
             props: BTreeMap::new(),
             props_gone: Vec::new(),
             mission: None,
+            pings: VecDeque::new(),
             flow_cache: FlowFieldCache::new(),
             spatial,
             spatial_snap: Arc::new(Vec::new()),
@@ -2646,6 +2652,11 @@ impl Skirmish {
         self.set_domain_grids(map.naval_grid.clone(), map.amphib_grid.clone(), map.hydro_points.clone());
         self.set_terrain(HeightField::from_scmap(&map.scmap));
         self.set_props(map.props.clone());
+    }
+
+    /// Phase 53: recent map pings `(tick, army, kind, position)`, oldest first.
+    pub fn pings(&self) -> impl Iterator<Item = &(u64, ArmyId, u8, (i64, i64))> {
+        self.pings.iter()
     }
 
     /// Phase 48: runs `mission` in this world from now on.
@@ -3913,6 +3924,17 @@ impl Skirmish {
                     self.push_order(*id, UnitOrder::Guard(target), queue);
                 }
                 !v.is_empty()
+            }
+            Command::Ping { kind, x, y } => {
+                if kind > 2 {
+                    return false;
+                }
+                let p = self.clamp_to_map(x, y);
+                if self.pings.len() >= 32 {
+                    self.pings.pop_front();
+                }
+                self.pings.push_back((self.tick, army, kind, p));
+                true
             }
             Command::MoveWaypoint { units, index, x, y } => {
                 let p = self.clamp_to_map(x, y);

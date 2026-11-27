@@ -3232,6 +3232,15 @@ impl ApplicationHandler for PlayApp {
                         };
                         self.session.chat.send_ping(kind, x, z);
                         self.session.flush_local_chat();
+                        // Phase 53: also a sim command, so allied AIs can react.
+                        if !self.session.is_replay() {
+                            let code = match kind {
+                                crate::chat::PingKind::Alert => 0,
+                                crate::chat::PingKind::Move => 1,
+                                crate::chat::PingKind::Attack => 2,
+                            };
+                            self.session.world.issue(self.session.human_army, Command::Ping { kind: code, x, y: z });
+                        }
                         self.session.status_banner = format!("{} ping sent to allies", kind.label());
                         st.dirty_dynamic = true;
                         st.window.request_redraw();

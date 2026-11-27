@@ -1348,6 +1348,7 @@ fn positional_after(args: &[String], start: usize) -> Option<PathBuf> {
             || a == "--out"
             || a == "--rendezvous"
             || a == "--mission"
+            || a == "--personality"
             || a == "--human-ai"
         {
             i += 2;
@@ -1472,6 +1473,14 @@ fn parse_game_options(args: &[String]) -> Result<skirmish::GameOptions, String> 
     Ok(opts)
 }
 
+/// Phase 53: `--personality rush,turtle` (per army, cycled; default balanced).
+fn parse_personalities(args: &[String], armies: usize) -> Result<Vec<skirmish_ai::Personality>, String> {
+    match flag_str(args, "--personality") {
+        Some(s) => skirmish_ai::parse_personality_list(s, armies),
+        None => Ok(vec![skirmish_ai::Personality::Balanced; armies]),
+    }
+}
+
 fn parse_ai_diffs(args: &[String], armies: usize) -> Result<Vec<skirmish_ai::Difficulty>, String> {
     match flag_str(args, "--ai") {
         Some(s) => skirmish_ai::parse_difficulty_list(s, armies),
@@ -1514,8 +1523,9 @@ fn cmd_skirmish(args: &[String]) -> Result<(), String> {
         rec.set_options(options);
         rec
     });
+    let pers = parse_personalities(args, setup.len())?;
     let mut ais: Vec<skirmish_ai::ScriptedAi> = (0..setup.len())
-        .map(|i| skirmish_ai::ScriptedAi::with_difficulty(i as skirmish::ArmyId, diffs[i]))
+        .map(|i| skirmish_ai::ScriptedAi::with_personality(i as skirmish::ArmyId, diffs[i], pers[i]))
         .collect();
     let load_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
@@ -1711,21 +1721,20 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
         let world = mission::build_world(&m, catalog, &map, seed)?;
         let human = m.human_army().unwrap_or(0) as skirmish::ArmyId;
         let mut sess = play::PlaySession::new(world, human, spectate, speed);
-        sess.ais = mission::ai_armies(&m, spectate.then_some("normal"))?
-            .into_iter()
-            .map(|(a, d)| skirmish_ai::ScriptedAi::with_difficulty(a, d))
-            .collect();
+        sess.ais = mission::ai_armies(&m, spectate.then_some("normal"))?;
         (map, sess)
     } else {
         let options = parse_game_options(args)?;
         let map = skirmish::MapContext::load(&game_dir, map_name)?;
         let setup = parse_skirmish_setup(args, &catalog, map.starts.len())?;
         let diffs = parse_ai_diffs(args, setup.len())?;
+        let pers = parse_personalities(args, setup.len())?;
         let world = skirmish::Skirmish::on_map(catalog, &map, &setup, seed)?.with_options(options);
         let mut sess = play::PlaySession::new(world, 0, spectate, speed);
         for ai in &mut sess.ais {
             let d = diffs.get(ai.army as usize).copied().unwrap_or_default();
-            *ai = skirmish_ai::ScriptedAi::with_difficulty(ai.army, d);
+            let pp = pers.get(ai.army as usize).copied().unwrap_or_default();
+            *ai = skirmish_ai::ScriptedAi::with_personality(ai.army, d, pp);
         }
         (map, sess)
     };

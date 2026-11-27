@@ -2243,10 +2243,7 @@ fn build_tutorial_from_menu(game_dir: &Path) -> Result<(PlaySession, MapContext,
     let world = crate::mission::build_world(&m, catalog, &map, crate::sim::DEFAULT_SEED)?;
     let human = m.human_army().unwrap_or(0) as crate::skirmish::ArmyId;
     let mut session = PlaySession::new(world, human, false, 1);
-    session.ais = crate::mission::ai_armies(&m, None)?
-        .into_iter()
-        .map(|(a, d)| crate::skirmish_ai::ScriptedAi::with_difficulty(a, d))
-        .collect();
+    session.ais = crate::mission::ai_armies(&m, None)?;
     Ok((session, map, meshes))
 }
 

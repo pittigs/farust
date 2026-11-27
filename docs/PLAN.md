@@ -656,10 +656,21 @@ bumps `SIM_VERSION`, re-baselines golden hashes deliberately, and keeps
 - Tried and rejected (no gain or worse): earlier tech thresholds, earlier extractor
   upgrades, harder commitment (100 / 220 %), capping land factories on island maps.
 
-### Phase 53 — AI personalities & co-op commands (planned)
-- Personalities (turtle, rush, air, tech), allied AI that responds to pings
-  ("attack here", "send engineers"), difficulty-scaled cheats as an option.
-- Exit: pinged requests are acted on within 30 s in co-op matches.
+### Phase 53 — AI personalities & co-op commands (done)
+- Pings are sim commands (`Command::Ping`, replay tag 29, rules v10, protocol v15) as
+  well as chat lines, so every lockstep peer's allied AI sees the same pings. AIs that
+  coordinate with their team answer the newest ally ping within 30 s: attack → push the
+  army there, alert → defend there, move → lend two engineers that assist the ally's
+  nearest builder (released after 2 min).
+- Personalities over any difficulty (`--personality rush,turtle` per army on `skirmish` /
+  `play`, `personality X` on mission `army` lines): rush (early waves, no tech), turtle
+  (extra point defenses / shields, home guard, attacks only at 170 %), air (air
+  factories scale with income), tech (tech push, experimentals from 45 mass/s).
+- Exit: a 2v1 test where the human pings and the allied AI's army closes in on an attack
+  ping, lends two engineers on a move ping and gathers at an alert ping, all within 300
+  ticks (339/339 tests). Default skirmish hash unchanged. Done.
+- Not done: difficulty-scaled resource cheats (need a per-army replay-header option),
+  personalities in `ai-arena` matchups.
 
 ### Arc G — Scale, platforms & release (54–57)
 

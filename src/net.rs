@@ -76,7 +76,8 @@ const ADAPTIVE_DOWN_HYSTERESIS: u8 = 2;
 /// v12 (Phase 35): sim rules v8 (fire states, ground fire, guard, build pause).
 /// v13 (Phase 36): sim rules v9 (waypoint moves, ferries).
 /// v14 (Phase 44): reliable UDP lockstep transport & synchronized adaptive input delay (`NetControl::InputDelay`).
-pub const PROTOCOL_VERSION: u32 = 14;
+/// v15 (Phase 53): sim rules v10 (pings as commands).
+pub const PROTOCOL_VERSION: u32 = 15;
 /// The host's army (star-topology relay); only it may change the game speed.
 pub const HOST_ARMY: ArmyId = 0;
 /// Sender id of host-generated control messages (`Dropped`).
