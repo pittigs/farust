@@ -498,6 +498,8 @@ pub struct PlaySession {
     pub end_shown: bool,
     /// Write the automatic replay on exit / game end (`--no-record` disables).
     pub auto_record: bool,
+    /// Phase 41: render-only dynamic decal tracker (observed while preparing frames).
+    pub decals: std::cell::RefCell<crate::decals::DecalTracker>,
 }
 
 impl PlaySession {
@@ -548,6 +550,7 @@ impl PlaySession {
             menu: Default::default(),
             end_shown: false,
             auto_record: !crate::savegame::recording_disabled(),
+            decals: Default::default(),
         }
     }
 
@@ -581,6 +584,7 @@ impl PlaySession {
             menu: Default::default(),
             end_shown: false,
             auto_record: false,
+            decals: Default::default(),
         }
     }
 
@@ -2125,6 +2129,19 @@ pub(crate) fn upload_frame_resources(
     height: u32,
 ) {
     let _p = crate::profiler::scope("render.prep_upload");
+    // Phase 41: dynamic terrain marks (rebuilt only when the tracker's revision moves).
+    {
+        let _p = crate::profiler::scope("render.decals");
+        let mut t = session.decals.borrow_mut();
+        t.observe(&session.world);
+        if t.revision != resources.dyn_decal_rev {
+            for k in 0..crate::decals::KINDS {
+                let (v, i) = t.geometry(k, &map.scmap);
+                resources.set_dynamic_decals(device, k, &v, &i);
+            }
+            resources.dyn_decal_rev = t.revision;
+        }
+    }
     let (batches, dyn_v, dyn_i) = build_skirmish_render_frame(session, &map.scmap, meshes, camera);
     {
         let _p = crate::profiler::scope("render.upload_units");
@@ -2276,6 +2293,7 @@ pub fn render_skirmish_snapshot(
     if let Some(ref mm) = minimap_img {
         resources.set_minimap_texture(&device, &queue, mm);
     }
+    resources.set_dynamic_decal_textures(&device, &queue, &scene::load_dynamic_decal_textures(game_dir));
     upload_hud_icons(game_dir, &device, &queue, &mut resources, session);
     let templates = upload_unit_templates(&device, &queue, &resources, meshes);
     upload_frame_resources(
@@ -2604,6 +2622,7 @@ impl PlayApp {
         if let Some(ref mm) = minimap_img {
             resources.set_minimap_texture(&device, &queue, mm);
         }
+        resources.set_dynamic_decal_textures(&device, &queue, &scene::load_dynamic_decal_textures(self.game_dir.as_deref()));
         upload_hud_icons(
             self.game_dir.as_deref(),
             &device,

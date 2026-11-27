@@ -2284,6 +2284,7 @@ pub fn snapshot_warm_up(
     aspect: f32,
     final_tick: u64,
 ) {
+    session.decals.borrow_mut().observe(&session.world);
     if session.world.tick() + SNAPSHOT_WARMUP_TICKS < final_tick {
         return;
     }

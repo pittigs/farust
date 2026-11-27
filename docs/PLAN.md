@@ -477,11 +477,21 @@ bumps `SIM_VERSION`, re-baselines golden hashes deliberately, and keeps
   sim hashes unchanged (`sim-run` `35db8f2bd7a6faf2`, `skirmish SCMP_001` `192e89b083b978cb`);
   `bench-render` at 8,192 units stays at ~5.7 ms p50 frame / 252 draws. Done.
 
-### Phase 41 — Dynamic decals & terrain marks (planned)
-- Runtime scorch, crater and tread decals with a bounded decal atlas and
-  fade-out, footprint decals under structures, wreck shadows.
-- Exit: a 20-minute battle stays under a fixed decal budget without frame
-  time regressions.
+### Phase 41 — Dynamic decals & terrain marks (done)
+- `src/decals.rs` `DecalTracker` (render-only, observes the world while frames are
+  prepared and during snapshot warm-up): craters under new wrecks, scorch marks where
+  splash shells land, tank treads every 2.5 m behind moving land units, footprints under
+  live structures. FA textures (`env/Common/decals/Scorch_001` / `crater01`,
+  `textures/tilesets/_global/tank_treads` / `scorch_mark`), terrain-draped 3×3 quads.
+- Fixed budgets per kind (256 scorch / 128 crater / 384 tread / 512 footprint, oldest
+  recycled) and fade-out lifetimes (3 min / 5 min / 15 s / while the structure stands);
+  a backward replay seek clears the marks. GPU geometry is rebuilt only when the tracker
+  revision changes; the decal shader now honours vertex alpha (map decals use 1.0).
+- Exit: budget/expiry and live-battle tracker tests pass (327/327); a 12-minute `SCMP_001`
+  battle holds 28 scorch / 68 crater / 384 tread / 87 footprint marks. `bench-render
+  --no-sim` 8,192 units: frame p50 7.36 ms (7.33 ms before), decals 0.03 ms/frame avg.
+  Bisecting the frame time also found and fixed a Phase 39 regression (per-unit settings
+  clone: 21.6 ms → 7.4 ms). Done.
 
 ### Phase 42 — HDR, bloom & glow (planned)
 - HDR render target, FA-like tonemap and bloom from `.scmap` lighting values,

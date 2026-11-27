@@ -10,6 +10,7 @@ mod command_card;
 mod controls;
 mod dds;
 mod dds_decode;
+mod decals;
 mod economy;
 mod effects;
 mod flowfield;

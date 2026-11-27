@@ -1545,7 +1545,7 @@ pub(crate) fn sample_scmap_height(scmap: &ScMap, wx: f32, wz: f32) -> f32 {
 }
 
 #[allow(dead_code)]
-fn sample_scmap_normal(scmap: &ScMap, wx: f32, wz: f32) -> [f32; 3] {
+pub(crate) fn sample_scmap_normal(scmap: &ScMap, wx: f32, wz: f32) -> [f32; 3] {
     let hm_w = scmap.heightmap_width;
     let hm_h = scmap.heightmap_height;
     if hm_w == 0 || hm_h == 0 {
@@ -1662,7 +1662,7 @@ pub fn load_map_decals(game_dir: &Path, scmap: &ScMap) -> Vec<DecalBatch> {
                         position: [wx, wy, wz],
                         normal,
                         uv: [u, v],
-                        color: [1.0, 1.0, 1.0, 0.05],
+                        color: [1.0, 1.0, 1.0, 1.0],
                     });
                 }
             }
@@ -2395,7 +2395,19 @@ fn find_asset_in_scds(
     None
 }
 
-fn decode_first_dds(
+/// Phase 41: the FA textures of the dynamic decal kinds ([`crate::decals::TEXTURES`]).
+pub fn load_dynamic_decal_textures(game_dir: Option<&Path>) -> Vec<Option<RgbaImage>> {
+    let Some(dir) = game_dir else {
+        return vec![None; crate::decals::KINDS];
+    };
+    let gamedata = scd::gamedata_dir(dir);
+    crate::decals::TEXTURES
+        .iter()
+        .map(|p| decode_first_dds(&gamedata, &["env.scd", "textures.scd"], &[p.to_string()]))
+        .collect()
+}
+
+pub(crate) fn decode_first_dds(
     gamedata: &Path,
     archives: &[&str],
     candidates: &[String],

@@ -825,7 +825,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let fog_end = max(u.fog_params.y + 800.0, fog_start + 1800.0);
     let fog_t = clamp((dist - fog_start) / (fog_end - fog_start), 0.0, 0.35);
     lit = mix(lit, u.fog_color.rgb, fog_t);
-    return vec4<f32>(lit, tex.a * 0.90);
+    return vec4<f32>(lit, tex.a * 0.90 * in.color.a);
 }
 "#;
 
@@ -1070,6 +1070,11 @@ pub(crate) struct GpuSceneResources {
 
     water_draw: Option<(wgpu::Buffer, wgpu::Buffer, u32, wgpu::BindGroup)>,
     decal_batches: Vec<(wgpu::Buffer, wgpu::Buffer, u32, wgpu::BindGroup)>,
+    /// Phase 41: dynamic decal textures (bind groups) and geometry per kind, plus the
+    /// tracker revision the geometry was built from.
+    dyn_decal_bgs: Vec<Option<wgpu::BindGroup>>,
+    dyn_decal_geo: Vec<Option<(wgpu::Buffer, wgpu::Buffer, u32)>>,
+    pub dyn_decal_rev: u64,
     static_overlay: Option<(wgpu::Buffer, wgpu::Buffer, u32)>,
     prop_batches: Vec<(
         wgpu::Buffer,
@@ -2850,6 +2855,9 @@ impl GpuSceneResources {
             terrain_bind_group,
             water_draw,
             decal_batches,
+            dyn_decal_bgs: Vec::new(),
+            dyn_decal_geo: Vec::new(),
+            dyn_decal_rev: u64::MAX,
             static_overlay,
             prop_batches,
             unit_batches: Vec::new(),
@@ -3182,6 +3190,39 @@ impl GpuSceneResources {
     }
 
     /// Replaces the static prop batches after placing or deleting props in the map editor.
+    /// Phase 41: textures for the dynamic decal kinds (missing ones are never drawn).
+    pub(crate) fn set_dynamic_decal_textures(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, images: &[Option<RgbaImage>]) {
+        self.dyn_decal_bgs = images
+            .iter()
+            .enumerate()
+            .map(|(k, img)| {
+                img.as_ref().map(|img| {
+                    create_rgba_bind_group(device, queue, &self.bind_group_layout, &self.uniform_buf, &self.sampler_clamp, img, &format!("dyn_decal_{k}"))
+                })
+            })
+            .collect();
+        self.dyn_decal_geo = (0..images.len()).map(|_| None).collect();
+        self.dyn_decal_rev = u64::MAX;
+    }
+
+    /// Phase 41: replaces the geometry of dynamic decal `kind`.
+    pub(crate) fn set_dynamic_decals(&mut self, device: &wgpu::Device, kind: usize, vertices: &[crate::scene::GpuVertex], indices: &[u32]) {
+        let Some(slot) = self.dyn_decal_geo.get_mut(kind) else { return };
+        *slot = (!indices.is_empty()).then(|| {
+            let vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("dyn_decal_vb"),
+                contents: bytemuck::cast_slice(vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+            let ib = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("dyn_decal_ib"),
+                contents: bytemuck::cast_slice(indices),
+                usage: wgpu::BufferUsages::INDEX,
+            });
+            (vb, ib, indices.len() as u32)
+        });
+    }
+
     pub(crate) fn update_prop_batches(
         &mut self,
         device: &wgpu::Device,
@@ -3587,6 +3628,18 @@ impl GpuSceneResources {
                 rpass.set_vertex_buffer(0, vb.slice(..));
                 rpass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
                 { st.add(*idx_n, 1); rpass.draw_indexed(0..*idx_n, 0, 0..1); }
+            }
+        }
+        // Phase 41: dynamic marks (footprints, treads, craters, scorch) over the map decals.
+        if self.dyn_decal_geo.iter().any(Option::is_some) {
+            rpass.set_pipeline(&self.decal_pipeline);
+            for k in [3usize, 2, 1, 0] {
+                if let (Some(Some((vb, ib, n))), Some(Some(bg))) = (self.dyn_decal_geo.get(k), self.dyn_decal_bgs.get(k)) {
+                    rpass.set_bind_group(0, bg, &[]);
+                    rpass.set_vertex_buffer(0, vb.slice(..));
+                    rpass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                    { st.add(*n, 1); rpass.draw_indexed(0..*n, 0, 0..1); }
+                }
             }
         }
 
