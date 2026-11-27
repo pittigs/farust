@@ -19,10 +19,11 @@ pub enum Kind {
     Sca,
     ScMap,
     Dds,
+    Loc,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 4] = [Kind::Scm, Kind::Sca, Kind::ScMap, Kind::Dds];
+    pub const ALL: [Kind; 5] = [Kind::Scm, Kind::Sca, Kind::ScMap, Kind::Dds, Kind::Loc];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -30,6 +31,7 @@ impl Kind {
             Kind::Sca => "sca",
             Kind::ScMap => "scmap",
             Kind::Dds => "dds",
+            Kind::Loc => "loc",
         }
     }
 }
@@ -244,6 +246,14 @@ pub fn exercise(kind: Kind, data: &[u8]) -> bool {
             }
             let _ = crate::dds_decode::decode_dds_cubemap_rgba8(data);
             header_ok
+        }
+        Kind::Loc => {
+            let ok_db = crate::loc::parse_strings_db(data).is_ok();
+            let _ = crate::loc::parse_strings_db_lossy(data);
+            let ok_tt = crate::loc::parse_tooltips(data).is_ok();
+            let decoded = crate::loc::decode_text_bytes(data);
+            let _ = crate::loc::split_loc_tag(&decoded);
+            ok_db || ok_tt
         }
     }
 }
@@ -520,6 +530,23 @@ pub fn synthetic_scmap() -> Vec<u8> {
     v
 }
 
+/// Minimal valid loc string table + tooltips seed.
+pub fn synthetic_loc() -> Vec<(String, Vec<u8>)> {
+    vec![
+        (
+            "synthetic_strings_db.lua".into(),
+            "\u{FEFF}# synthetic loc\nuel0001_desc=\"Armored Command Unit\"\nuel0201_desc=\"Mittlerer Panzer (äöüß)\"\n['enh_01']=\"Tech-2-Paket\\nZeile 2\"\n"
+                .as_bytes()
+                .to_vec(),
+        ),
+        (
+            "synthetic_tooltips.lua".into(),
+            b"Tooltips = {\n move = { title = \"<LOC tooltipui0000>Move\", description = \"<LOC d>Go\", keyID = \"move\" },\n}\n"
+                .to_vec(),
+        ),
+    ]
+}
+
 /// Synthetic seeds for every parser family.
 pub fn synthetic_seeds() -> Vec<Seed> {
     let mut v = vec![
@@ -529,6 +556,9 @@ pub fn synthetic_seeds() -> Vec<Seed> {
     ];
     for (label, bytes) in synthetic_dds() {
         v.push(Seed { kind: Kind::Dds, label, bytes });
+    }
+    for (label, bytes) in synthetic_loc() {
+        v.push(Seed { kind: Kind::Loc, label, bytes });
     }
     v
 }

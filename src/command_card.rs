@@ -54,6 +54,26 @@ impl CardGroup {
             CardGroup::Naval => "NAVY",
         }
     }
+
+    pub fn tooltip(self) -> (String, String) {
+        let (key, fb_t, fb_d) = match self {
+            CardGroup::Factories => ("factories", "Factories", "Filter production factories."),
+            CardGroup::Economy => ("economy", "Economy", "Filter mass/energy economy structures."),
+            CardGroup::Defense => ("defense", "Defense", "Filter defensive structures and walls."),
+            CardGroup::Intel => ("intel", "Intelligence", "Filter radar, omni, and stealth structures."),
+            CardGroup::Shields => ("shields", "Shields", "Filter shield generators."),
+            CardGroup::Missiles => ("missiles", "Missiles", "Filter missile launchers and defenses."),
+            CardGroup::Experimental => ("experimental", "Experimental", "Filter Tech 4 experimental units."),
+            CardGroup::Engineers => ("engineers", "Engineers", "Filter engineer units."),
+            CardGroup::Land => ("land", "Land Units", "Filter ground combat units."),
+            CardGroup::Air => ("air", "Air Units", "Filter aircraft and transports."),
+            CardGroup::Naval => ("naval", "Naval Units", "Filter naval vessels."),
+        };
+        (
+            crate::loc::tr(&format!("group.{key}.title"), fb_t),
+            crate::loc::tr(&format!("group.{key}.desc"), fb_d),
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -295,17 +315,28 @@ pub fn tab_label(tab: u8) -> &'static str {
 }
 
 /// Tooltip lines for a card entry built at `build_rate` (work per tick, 0 = unknown).
+/// Localized via [`crate::loc`] (unit name, FA description, cost/build time, and stats).
 pub fn item_tooltip(cat: &Catalog, unit_type: &str, build_rate: i64) -> Vec<String> {
     let Some(t) = cat.get(unit_type) else {
         return vec![unit_type.to_string()];
     };
-    let name = if t.name.trim().is_empty() { t.id.clone() } else { t.name.trim().to_string() };
+    let role_name = crate::loc::unit_display_name(&t.id, &t.name);
+    let display = match crate::loc::unit_proper_name(&t.id) {
+        Some(proper) if !proper.eq_ignore_ascii_case(&role_name) => format!("{proper} - {role_name}"),
+        _ => role_name,
+    };
     let tier = if t.tier >= 4 { "EXP".to_string() } else { format!("T{}", t.tier.max(1)) };
-    let mut out = vec![format!("{name} ({tier})").chars().take(44).collect(), format!("{}  {:?}", t.id, t.role).to_ascii_uppercase()];
-    let mut cost = format!("MASS {}  ENERGY {}", t.cost_mass / SCALE, t.cost_energy / SCALE);
+    let mut out = vec![
+        format!("{display} ({tier})"),
+        format!("{}  {:?}", t.id, t.role),
+    ];
+    let l_mass = crate::loc::tr("tt.mass", "Mass");
+    let l_energy = crate::loc::tr("tt.energy", "Energy");
+    let l_time = crate::loc::tr("tt.time", "Time");
+    let mut cost = format!("{l_mass} {}  {l_energy} {}", t.cost_mass / SCALE, t.cost_energy / SCALE);
     if build_rate > 0 {
         let secs = t.build_work as f64 / build_rate as f64 / TICK_HZ as f64;
-        cost.push_str(&format!("  TIME {secs:.0}S"));
+        cost.push_str(&format!("  {l_time} {secs:.0}s"));
     }
     out.push(cost);
     let dps: f64 = t
@@ -313,36 +344,49 @@ pub fn item_tooltip(cat: &Catalog, unit_type: &str, build_rate: i64) -> Vec<Stri
         .iter()
         .map(|w| (w.damage as f64 / SCALE as f64) * TICK_HZ as f64 / w.reset.max(1) as f64)
         .sum();
+    let l_hp = crate::loc::tr("tt.hp", "HP");
     if dps > 0.0 {
-        out.push(format!("HP {}  DPS {:.0}  RANGE {}", t.max_hp / SCALE, dps, t.max_range() / SCALE));
+        let l_dps = crate::loc::tr("tt.dps", "DPS");
+        let l_rng = crate::loc::tr("tt.range", "Range");
+        out.push(format!("{l_hp} {}  {l_dps} {:.0}  {l_rng} {}", t.max_hp / SCALE, dps, t.max_range() / SCALE));
     } else {
-        out.push(format!("HP {}", t.max_hp / SCALE));
+        out.push(format!("{l_hp} {}", t.max_hp / SCALE));
     }
     let mut extra = Vec::new();
     let per_s = |v: i64| v as f64 * TICK_HZ as f64 / SCALE as f64;
     if t.mass_per_tick > 0 {
-        extra.push(format!("+{:.1} MASS/S", per_s(t.mass_per_tick)));
+        extra.push(format!("+{:.1} {l_mass}/s", per_s(t.mass_per_tick)));
     }
     if t.energy_per_tick > 0 {
-        extra.push(format!("+{:.0} ENERGY/S", per_s(t.energy_per_tick)));
+        extra.push(format!("+{:.0} {l_energy}/s", per_s(t.energy_per_tick)));
     }
     if t.shield_max_hp > 0 {
-        extra.push(format!("SHIELD {} R{}", t.shield_max_hp / SCALE, t.shield_radius / SCALE));
+        let l_shd = crate::loc::tr("tt.shield", "Shield");
+        extra.push(format!("{l_shd} {} R{}", t.shield_max_hp / SCALE, t.shield_radius / SCALE));
     }
     if t.radar_radius > 0 {
-        extra.push(format!("RADAR {}", t.radar_radius / SCALE));
+        let l_rad = crate::loc::tr("tt.radar", "Radar");
+        extra.push(format!("{l_rad} {}", t.radar_radius / SCALE));
     }
     if t.build_rate > 0 && !t.role.is_factory() {
-        extra.push(format!("BUILDRATE {}", t.build_rate));
+        let l_br = crate::loc::tr("tt.buildrate", "Buildrate");
+        extra.push(format!("{l_br} {}", t.build_rate));
     }
-    if let Some(tr) = &t.ext.transport {
-        extra.push(format!("CARGO {}", tr.slots()));
+    if let Some(tr_spec) = &t.ext.transport {
+        let l_cargo = crate::loc::tr("tt.cargo", "Cargo");
+        extra.push(format!("{l_cargo} {}", tr_spec.slots()));
     }
     if t.missile_range > 0 {
-        extra.push(format!("MISSILE RANGE {}", t.missile_range / SCALE));
+        let l_msl = crate::loc::tr("tt.missile_range", "Missile Range");
+        extra.push(format!("{l_msl} {}", t.missile_range / SCALE));
     }
     if !extra.is_empty() {
         out.push(extra.join("  "));
+    }
+    if let Some(desc) = crate::loc::unit_description(&t.id) {
+        for line in crate::loc::word_wrap(&desc, 48).into_iter().take(4) {
+            out.push(line);
+        }
     }
     out
 }
@@ -412,6 +456,15 @@ pub fn slot_label(slot: &str) -> &'static str {
         1 => "RIGHT ARM",
         2 => "BACK",
         _ => "OTHER",
+    }
+}
+
+pub fn localized_slot_label(slot: &str) -> String {
+    match slot_rank(slot) {
+        0 => crate::loc::tr("tt.slot_lch", "Left Arm"),
+        1 => crate::loc::tr("tt.slot_rch", "Right Arm"),
+        2 => crate::loc::tr("tt.slot_back", "Back"),
+        _ => crate::loc::tr("tt.slot_other", "Other"),
     }
 }
 
@@ -530,6 +583,53 @@ impl OrderKind {
             OrderKind::Ai => "AI",
             OrderKind::IdleEngineer => "IDLE ENG",
         }
+    }
+
+    /// Tooltip ID in FA's `lua/ui/help/tooltips.lua` (and FARust's `loc` fallback table).
+    pub fn tooltip_id(self) -> &'static str {
+        match self {
+            OrderKind::Move => "move",
+            OrderKind::Attack => "attack",
+            OrderKind::Patrol => "patrol",
+            OrderKind::Stop => "stop",
+            OrderKind::Assist => "assist",
+            OrderKind::Guard => "guard",
+            OrderKind::Repair => "repair",
+            OrderKind::Reclaim => "reclaim",
+            OrderKind::Load => "load",
+            OrderKind::Unload => "transport",
+            OrderKind::Overcharge => "overcharge",
+            OrderKind::LaunchMissile => "fire_tactical",
+            OrderKind::ToggleShield => "toggle_shield",
+            OrderKind::ToggleRepeat => "toggle_repeat",
+            OrderKind::Pause => "pause",
+            OrderKind::Fog => "fog",
+            OrderKind::Ai => "ai",
+            OrderKind::IdleEngineer => "idle_engineer",
+        }
+    }
+
+    /// Localized `(title, help_text)` for hover tooltips.
+    pub fn tooltip(self) -> (String, String) {
+        crate::loc::order_tooltip(self.tooltip_id(), self.label(), "")
+    }
+
+    /// Compact localized label for the 66px orders-panel button.
+    pub fn short_label(self) -> String {
+        let key = format!("order.{}.short", self.tooltip_id());
+        let short = crate::loc::tr(&key, "");
+        if !short.is_empty() {
+            return short;
+        }
+        if crate::loc::active_language() == "us" {
+            return self.label().to_string();
+        }
+        let (title, _) = self.tooltip();
+        let trimmed = title.trim();
+        if trimmed.is_empty() {
+            return self.label().to_string();
+        }
+        trimmed.chars().take(8).collect::<String>().to_uppercase()
     }
 
     /// Whether the order waits for a map click (cursor mode).
@@ -1607,8 +1707,8 @@ mod tests {
         let cat = test_catalog();
         let t = item_tooltip(&cat, "RT", 20);
         assert!(t[0].starts_with("RT (T1)"));
-        assert!(t[2].contains("MASS 50") && t[2].contains("ENERGY 250") && t[2].contains("TIME 1S"), "{t:?}");
-        assert!(t[3].contains("DPS 25") && t[3].contains("RANGE 16"), "{t:?}");
+        assert!(t[2].contains("Mass 50") && t[2].contains("Energy 250") && t[2].contains("Time 1s"), "{t:?}");
+        assert!(t[3].contains("DPS 25") && t[3].contains("Range 16"), "{t:?}");
         assert_eq!(item_tooltip(&cat, "NOPE", 1), vec!["NOPE".to_string()]);
     }
 

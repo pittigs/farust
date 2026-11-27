@@ -17,6 +17,7 @@ mod hud;
 mod jobs;
 mod keymap;
 mod lobby;
+mod loc;
 mod menu;
 mod mods;
 mod net;
@@ -65,6 +66,7 @@ fn print_usage() {
     eprintln!("  farust unit <ID> [FILE.scd]");
     eprintln!("  farust maps [GAME_DIR] [--limit N] [--check]      (stock + user maps, with source)");
     eprintln!("  farust roster [GAME_DIR] [--faction F] [--json]   (data-driven unit roster & coverage)");
+    eprintln!("  farust loc [--check | <KEY> | --unit <ID>] [--lang CODE] [GAME_DIR] (localization tables)");
     eprintln!("  farust mods                                       (installed blueprint mods)");
     eprintln!("  global: --mod <DIR|NAME> (repeatable) enables a blueprint mod for any subcommand");
     eprintln!("  farust map <NAME> [GAME_DIR]");
@@ -96,6 +98,7 @@ fn print_usage() {
     eprintln!("  FARUST_RENDEZVOUS   override rendezvous server host:port (default 127.0.0.1:15050)");
     eprintln!("  FARUST_FORCE_RELAY  =1 forces client relay fallback through rendezvous server");
     eprintln!("  FARUST_UI_THEME     modern | classic (old-school FA console layout + faction skins)");
+    eprintln!("  FARUST_LANG         localization language code override (e.g. us, de, fr)");
     eprintln!("  FARUST_PROFILE      enable the scoped profiler (=overlay also shows the F12 overlay)");
     eprintln!("  FARUST_PROFILE_EXIT print the profiler span table on exit");
 }
@@ -288,6 +291,7 @@ fn run(args: &[String], connect_lobby: Option<&str>) -> Result<(), String> {
         }
         "maps" => cmd_maps(args),
         "roster" => roster::cmd_roster(args),
+        "loc" => loc::cmd_loc(args),
         "mods" => mods::cmd_mods(args),
         "map" => cmd_map(args),
         "meshes" => cmd_meshes(args),

@@ -268,6 +268,53 @@ impl Fonts {
         }
     }
 
+    pub fn white_uv(&self) -> [f32; 2] {
+        self.white_uv
+    }
+
+    /// Appends TrueType textured quads for `s` at `(x, y)` into raw HUD vertex/index buffers
+    /// (for in-match HUD tooltips / stats cards using `self.atlas`). Returns advance width.
+    #[allow(clippy::too_many_arguments)]
+    pub fn push_hud_text(
+        &self,
+        verts: &mut Vec<HudVertex>,
+        idx: &mut Vec<u32>,
+        x: f32,
+        y: f32,
+        st: TextStyle,
+        s: &str,
+        color: [f32; 4],
+        screen_w: f32,
+        screen_h: f32,
+    ) -> f32 {
+        let Some(face) = self.face(st.font, st.px) else {
+            return 0.0;
+        };
+        let k = st.px / face.px;
+        let base = (y + face.ascent * k).round();
+        let mut pen = x;
+        for ch in s.chars() {
+            let g = *face.glyph(ch);
+            if g.width > 0.0 {
+                let rx = (pen + g.left * k).round();
+                let ry = base + g.top * k;
+                let rw = g.width * k;
+                let rh = g.height * k;
+                let ndc = |px: f32, py: f32| [2.0 * px / screen_w - 1.0, 1.0 - 2.0 * py / screen_h];
+                let vbase = verts.len() as u32;
+                verts.extend_from_slice(&[
+                    HudVertex { pos: ndc(rx, ry), uv: [g.uv[0], g.uv[1]], color },
+                    HudVertex { pos: ndc(rx + rw, ry), uv: [g.uv[2], g.uv[1]], color },
+                    HudVertex { pos: ndc(rx + rw, ry + rh), uv: [g.uv[2], g.uv[3]], color },
+                    HudVertex { pos: ndc(rx, ry + rh), uv: [g.uv[0], g.uv[3]], color },
+                ]);
+                idx.extend_from_slice(&[vbase, vbase + 1, vbase + 2, vbase, vbase + 2, vbase + 3]);
+            }
+            pen += g.advance * k;
+        }
+        pen - x
+    }
+
     #[allow(dead_code)]
     pub fn has_faces(&self) -> bool {
         !self.faces.is_empty()

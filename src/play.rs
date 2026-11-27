@@ -2100,10 +2100,10 @@ pub(crate) fn upload_frame_resources(
     }
 
     let _p = crate::profiler::scope("render.hud");
-    let (mm_v, mm_i, mut bg_v, mut bg_i, ic_v, ic_i, mut fg_v, mut fg_i) =
-        hud::build_hud_geometry(session, map, camera, width, height);
-    crate::profiler::append_overlay(&mut bg_v, &mut bg_i, &mut fg_v, &mut fg_i, width as f32, height as f32);
-    resources.set_hud(device, &mm_v, &mm_i, &bg_v, &bg_i, &ic_v, &ic_i, &fg_v, &fg_i);
+    let mut g = hud::build_hud_geometry_ex(session, map, camera, width, height, crate::settings::ui_theme());
+    crate::profiler::append_overlay(&mut g.bg_v, &mut g.bg_i, &mut g.fg_v, &mut g.fg_i, width as f32, height as f32);
+    resources.set_hud(device, &g.mm_v, &g.mm_i, &g.bg_v, &g.bg_i, &g.ic_v, &g.ic_i, &g.fg_v, &g.fg_i);
+    resources.set_hud_ttf(device, &g.ttf_v, &g.ttf_i);
 }
 
 pub(crate) fn upload_hud_icons(
@@ -2113,11 +2113,20 @@ pub(crate) fn upload_hud_icons(
     resources: &mut GpuSceneResources,
     session: &PlaySession,
 ) {
-    // Phase 23: grid atlas of every catalog unit icon (command card, queue panel).
+    // Phase 23/37: grid atlas of every catalog unit icon, TrueType HUD font atlas, and FA localization tables.
     let Some(dir) = game_dir else {
         crate::command_card::set_atlas_ids(None);
+        hud::set_hud_fonts(None);
         return;
     };
+    crate::loc::init(dir);
+    let hud_fonts = std::sync::Arc::new(crate::ui_kit::Fonts::load(dir));
+    if hud_fonts.has_faces() {
+        resources.set_hud_font_texture(device, queue, &hud_fonts.atlas);
+        hud::set_hud_fonts(Some(hud_fonts));
+    } else {
+        hud::set_hud_fonts(None);
+    }
     let ids = crate::command_card::atlas_icon_ids(session.world.catalog());
     match crate::command_card::load_icon_atlas(dir, &ids) {
         Some((atlas, found_ids)) => {
@@ -2154,6 +2163,9 @@ pub fn render_skirmish_snapshot(
     // `=factory` (with a queue) or `=enhance` (ACU mid-enhancement) select one unit class for
     // the command card / queue / enhancement panels; `FARUST_SNAPSHOT_HOVER=card` hovers the
     // first card entry (tooltip), `FARUST_SNAPSHOT_TAB=N` picks the card tech tab.
+    if let Some(dir) = game_dir {
+        crate::loc::init(dir);
+    }
     let preselected;
     let session = if let Ok(sel) = std::env::var("FARUST_SNAPSHOT_SELECT") {
         let mut s = session.clone();
@@ -2163,9 +2175,22 @@ pub fn render_skirmish_snapshot(
         if let Some(t) = std::env::var("FARUST_SNAPSHOT_TAB").ok().and_then(|v| v.trim().parse::<u8>().ok()) {
             s.set_card_tab(t);
         }
-        if std::env::var("FARUST_SNAPSHOT_HOVER").is_ok_and(|v| v.trim() == "card") {
+        if let Ok(hov) = std::env::var("FARUST_SNAPSHOT_HOVER") {
             let layout = HudLayout::compute(&s, width, height);
-            if let Some(r) = layout.card.slots.first() {
+            let hspec = hov.trim().to_ascii_lowercase();
+            let (kind, idx) = match hspec.split_once(':') {
+                Some((k, n)) => (k, n.parse::<usize>().unwrap_or(0)),
+                None => (hspec.as_str(), 0),
+            };
+            let target_rect = match kind {
+                "card" => layout.card.slots.get(idx).copied(),
+                "order" => layout.buttons.get(idx).map(|b| [b.x, b.y, b.w, b.h]),
+                "enhance" => layout.enh.as_ref().and_then(|e| e.rows.get(idx).map(|(r, _, _)| *r)),
+                "group" => layout.card.groups.get(idx).map(|(r, _)| *r),
+                "tab" => layout.card.tabs.get(idx).map(|(r, _)| *r),
+                _ => None,
+            };
+            if let Some(r) = target_rect {
                 s.ui.cursor_px = Some((r[0] + r[2] * 0.5, r[1] + r[3] * 0.5));
                 s.ui.hud_hover = layout.hit_test_button(r[0] + r[2] * 0.5, r[1] + r[3] * 0.5);
             }

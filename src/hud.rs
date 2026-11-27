@@ -4,6 +4,7 @@
 //! panels, tooltips, cursor-mode label, map pings).
 
 use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use crate::camera::OrbitCamera;
@@ -13,7 +14,35 @@ use crate::savegame::SaveEntry;
 use crate::sim::{SCALE, TICK_HZ};
 use crate::skirmish::{GameResult, IntelVisibility, MapContext, Role};
 use crate::stats::Series;
+use crate::ui_kit::{Fonts, body as ttf_body, bold as ttf_bold};
 use crate::viewer::HudVertex;
+
+static HUD_FONTS: RwLock<Option<Arc<Fonts>>> = RwLock::new(None);
+
+/// Publishes the TrueType font atlas for crisp in-match HUD tooltips and stats cards.
+pub fn set_hud_fonts(fonts: Option<Arc<Fonts>>) {
+    if let Ok(mut g) = HUD_FONTS.write() {
+        *g = fonts;
+    }
+}
+
+fn active_fonts() -> Option<Arc<Fonts>> {
+    HUD_FONTS.read().ok().and_then(|g| g.clone()).filter(|f| f.has_faces())
+}
+
+/// Complete 2D HUD geometry for one frame (including the optional TrueType overlay layer).
+pub struct HudGeometry {
+    pub mm_v: Vec<HudVertex>,
+    pub mm_i: Vec<u32>,
+    pub bg_v: Vec<HudVertex>,
+    pub bg_i: Vec<u32>,
+    pub ic_v: Vec<HudVertex>,
+    pub ic_i: Vec<u32>,
+    pub fg_v: Vec<HudVertex>,
+    pub fg_i: Vec<u32>,
+    pub ttf_v: Vec<HudVertex>,
+    pub ttf_i: Vec<u32>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HudAction {
@@ -363,6 +392,7 @@ pub struct HudButton {
     pub y: f32,
     pub w: f32,
     pub h: f32,
+    #[allow(dead_code)]
     pub label: &'static str,
     pub action: HudAction,
     pub active: bool,
@@ -694,6 +724,7 @@ impl HudLayout {
 }
 
 /// Builds `(minimap_v, minimap_i, bg_v, bg_i, icons_v, icons_i, text_v, text_i)` for the 2D HUD pass.
+#[allow(dead_code, clippy::type_complexity)]
 pub fn build_hud_geometry(
     session: &PlaySession,
     map: &MapContext,
@@ -713,6 +744,7 @@ pub fn build_hud_geometry(
     build_hud_geometry_with_theme(session, map, camera, width, height, crate::settings::ui_theme())
 }
 
+#[allow(dead_code, clippy::type_complexity)]
 pub fn build_hud_geometry_with_theme(
     session: &PlaySession,
     map: &MapContext,
@@ -730,6 +762,18 @@ pub fn build_hud_geometry_with_theme(
     Vec<HudVertex>,
     Vec<u32>,
 ) {
+    let g = build_hud_geometry_ex(session, map, camera, width, height, theme);
+    (g.mm_v, g.mm_i, g.bg_v, g.bg_i, g.ic_v, g.ic_i, g.fg_v, g.fg_i)
+}
+
+pub fn build_hud_geometry_ex(
+    session: &PlaySession,
+    map: &MapContext,
+    camera: &OrbitCamera,
+    width: u32,
+    height: u32,
+    theme: crate::settings::UiTheme,
+) -> HudGeometry {
     let layout = HudLayout::compute_with_theme(session, width, height, theme);
     let w = layout.width;
     let h = layout.height;
@@ -742,6 +786,9 @@ pub fn build_hud_geometry_with_theme(
     let mut ic_i = Vec::with_capacity(96);
     let mut fg_v = Vec::with_capacity(4096);
     let mut fg_i = Vec::with_capacity(6144);
+    let mut ttf_v: Vec<HudVertex> = Vec::with_capacity(1024);
+    let mut ttf_i: Vec<u32> = Vec::with_capacity(1536);
+    let ttf_fonts = active_fonts();
 
     let pal = layout.classic.then(|| faction_palette(session));
     let (brd_default, hdr_bg_default, title_gold, panel_bg_default) = match pal {
@@ -913,12 +960,25 @@ pub fn build_hud_geometry_with_theme(
     if let Some((cid, count)) = session.card_unit() {
         let lines = crate::controls::unit_card_lines(&session.world, cid, count);
         if !lines.is_empty() {
-            let ts = 1.5;
-            let lh = 5.0 * ts + 5.0;
-            let max_chars = lines.iter().map(|l| l.len()).max().unwrap_or(0) as f32;
             let portrait = if pal.is_some() { 54.0 } else { 0.0 };
-            let cw = (max_chars * 4.0 * ts + 22.0 + portrait).clamp(160.0 + portrait, 360.0);
-            let ch = (lines.len() as f32 * lh + 16.0).max(if pal.is_some() { 68.0 } else { 0.0 });
+            let (cw, ch, lh) = if let Some(ref fonts) = ttf_fonts {
+                let lh = 17.0f32;
+                let max_w = lines
+                    .iter()
+                    .enumerate()
+                    .map(|(li, l)| fonts.measure(if li == 0 { ttf_bold(14.0) } else { ttf_body(12.5) }, l))
+                    .fold(0.0f32, f32::max);
+                let cw = (max_w + 26.0 + portrait).clamp(180.0 + portrait, 390.0);
+                let ch = (lines.len() as f32 * lh + 16.0).max(if pal.is_some() { 70.0 } else { 0.0 });
+                (cw, ch, lh)
+            } else {
+                let ts = 1.5;
+                let lh = 5.0 * ts + 5.0;
+                let max_chars = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0) as f32;
+                let cw = (max_chars * 4.0 * ts + 22.0 + portrait).clamp(160.0 + portrait, 360.0);
+                let ch = (lines.len() as f32 * lh + 16.0).max(if pal.is_some() { 68.0 } else { 0.0 });
+                (cw, ch, lh)
+            };
             let cx = w - cw - (if pal.is_some() { 6.0 } else { 12.0 });
             let cy = if pal.is_some() {
                 let floor_y = layout.timeline.as_ref().map(|tl| tl.panel[1] - 8.0).unwrap_or(h - 6.0);
@@ -943,7 +1003,13 @@ pub fn build_hud_geometry_with_theme(
                 }
                 for (li, line) in lines.iter().enumerate() {
                     let col = if li == 0 { p.title_gold } else { [0.90, 0.94, 1.0, 1.0] };
-                    draw_text(&mut fg_v, &mut fg_i, cx + 60.0, cy + 8.0 + li as f32 * lh, ts, line, col, w, h);
+                    if let Some(ref fonts) = ttf_fonts {
+                        let st = if li == 0 { ttf_bold(14.0) } else { ttf_body(12.5) };
+                        let fit = fonts.fit(st, line, cw - 68.0);
+                        fonts.push_hud_text(&mut ttf_v, &mut ttf_i, cx + 60.0, cy + 7.0 + li as f32 * lh, st, &fit, col, w, h);
+                    } else {
+                        draw_text(&mut fg_v, &mut fg_i, cx + 60.0, cy + 8.0 + li as f32 * lh, 1.5, line, col, w, h);
+                    }
                 }
             } else {
                 push_rect(&mut v, &mut i, cx, cy, cw, ch, [0.05, 0.07, 0.11, 0.88], w, h);
@@ -956,7 +1022,13 @@ pub fn build_hud_geometry_with_theme(
                 push_rect_outline(&mut fg_v, &mut fg_i, cx, cy, cw, ch, 1.2, [0.30, 0.44, 0.64, 0.95], w, h);
                 for (li, line) in lines.iter().enumerate() {
                     let col = if li == 0 { [1.0, 0.92, 0.55, 1.0] } else { [0.88, 0.93, 1.0, 1.0] };
-                    draw_text(&mut fg_v, &mut fg_i, cx + 12.0, cy + 7.0 + li as f32 * lh, ts, line, col, w, h);
+                    if let Some(ref fonts) = ttf_fonts {
+                        let st = if li == 0 { ttf_bold(14.0) } else { ttf_body(12.5) };
+                        let fit = fonts.fit(st, line, cw - 20.0);
+                        fonts.push_hud_text(&mut ttf_v, &mut ttf_i, cx + 12.0, cy + 6.0 + li as f32 * lh, st, &fit, col, w, h);
+                    } else {
+                        draw_text(&mut fg_v, &mut fg_i, cx + 12.0, cy + 7.0 + li as f32 * lh, 1.5, line, col, w, h);
+                    }
                 }
             }
         }
@@ -1152,7 +1224,7 @@ pub fn build_hud_geometry_with_theme(
         push_rect(&mut fg_v, &mut fg_i, bx + 18.0, by + 42.0, (bw - 36.0) * frac, 16.0, [0.28, 0.78, 0.95, 0.95], w, h);
     }
 
-    // 6b. Phase 23 tooltip and targeting-mode label at the cursor
+    // 6b. Phase 23/37 tooltip and targeting-mode label at the cursor
     if !session.menu.is_open()
         && let Some(cur) = session.ui.cursor_px
     {
@@ -1161,11 +1233,18 @@ pub fn build_hud_geometry_with_theme(
             let lines = hud_tooltip(session, &layout, hit);
             // Cluster elements show their tooltip above the whole cluster.
             let anchor = if rect_hit(layout.cluster, cur.0, cur.1) { (cur.0, layout.cluster[1]) } else { cur };
-            draw_tooltip(&mut hb, anchor, &lines);
+            if let Some(ref fonts) = ttf_fonts {
+                draw_tooltip_ttf(fonts, &mut ttf_v, &mut ttf_i, anchor, &lines, pal, w, h);
+            } else {
+                draw_tooltip(&mut hb, anchor, &lines);
+            }
         } else if !layout.over_hud(cur.0, cur.1) {
             let label = match (session.current_order_mode(), session.build_mode.as_deref()) {
-                (Some(k), _) => Some((k.label().to_string(), k.rgb())),
-                (None, Some(t)) => Some((format!("BUILD {t}"), [0.45, 1.0, 0.55])),
+                (Some(k), _) => Some((k.tooltip().0.to_uppercase(), k.rgb())),
+                (None, Some(t)) => {
+                    let fb = session.world.catalog().get(t).map(|u| u.name.as_str()).unwrap_or(t);
+                    Some((crate::loc::unit_display_name(t, fb).to_uppercase(), [0.45, 1.0, 0.55]))
+                }
                 _ => None,
             };
             if let Some((txt, rgb)) = label {
@@ -1292,7 +1371,7 @@ pub fn build_hud_geometry_with_theme(
         }
     }
 
-    (mm_v, mm_i, v, i, ic_v, ic_i, fg_v, fg_i)
+    HudGeometry { mm_v, mm_i, bg_v: v, bg_i: i, ic_v, ic_i, fg_v, fg_i, ttf_v, ttf_i }
 }
 
 /// Geometry buffers of the 2D HUD pass (`bg` under icons, `ic` = unit icon atlas, `fg` on top).
@@ -1413,7 +1492,7 @@ impl HudBufs<'_> {
 }
 
 fn text_w(s: &str, scale: f32) -> f32 {
-    s.len() as f32 * 4.0 * scale
+    s.chars().count() as f32 * 4.0 * scale
 }
 
 fn trunc(s: &str, n: usize) -> String {
@@ -1481,7 +1560,8 @@ fn draw_command_interface(session: &PlaySession, layout: &HudLayout, b: &mut Hud
                 b.outline(*r, 1.2, brd);
                 if !b.icon(&item.unit_type, [r[0] + 3.0, r[1] + 3.0, r[2] - 6.0, r[3] - 6.0], 0.98) {
                     b.text(r[0] + 4.0, r[1] + 16.0, 1.3, &trunc(&item.unit_type, 8), [0.92, 0.95, 1.0, 1.0]);
-                    let name = session.world.catalog().get(&item.unit_type).map(|t| t.name.trim().to_string()).unwrap_or_default();
+                    let fb = session.world.catalog().get(&item.unit_type).map(|t| t.name.trim()).unwrap_or("");
+                    let name = crate::loc::unit_display_name(&item.unit_type, fb);
                     b.text(r[0] + 4.0, r[1] + 28.0, 1.1, &trunc(&name, 9), [0.62, 0.70, 0.80, 1.0]);
                 }
                 if card_keys && let Some(k) = keymap.label(crate::keymap::Action::CardSlot(k as u8)) {
@@ -1525,9 +1605,9 @@ fn draw_command_interface(session: &PlaySession, layout: &HudLayout, b: &mut Hud
                 .filter(|u| u.role == Role::MissileSilo)
                 .map(|u| u.silo_missiles)
                 .sum();
-            format!("MISSILE:{n}")
+            format!("{}:{n}", trunc(&kind.short_label(), 6))
         } else {
-            btn.label.to_string()
+            kind.short_label()
         };
         b.text(r[0] + 6.0, r[1] + 4.0, 1.35, &label, [0.94, 0.97, 1.0, 1.0]);
         if let Some(k) = kind.key_action().and_then(|a| keymap.label(a)) {
@@ -1539,7 +1619,10 @@ fn draw_command_interface(session: &PlaySession, layout: &HudLayout, b: &mut Hud
     if let Some(q) = &layout.queue {
         b.panel(q.panel);
         let title = match session.queue_panel_unit().and_then(|id| session.world.unit(id)) {
-            Some(u) => format!("QUEUE  {}", trunc(&session.world.catalog().get(&u.type_id).map(|t| t.name.trim().to_string()).unwrap_or_else(|| u.type_id.clone()), 28)),
+            Some(u) => {
+                let fb = session.world.catalog().get(&u.type_id).map(|t| t.name.trim()).unwrap_or(&u.type_id);
+                format!("QUEUE  {}", trunc(&crate::loc::unit_display_name(&u.type_id, fb), 28))
+            }
             None => "UPGRADE".to_string(),
         };
         b.text(q.panel[0] + 8.0, q.panel[1] + 7.0, 1.5, &title, title_col);
@@ -1581,15 +1664,16 @@ fn draw_command_interface(session: &PlaySession, layout: &HudLayout, b: &mut Hud
     // --- Enhancements -------------------------------------------------------
     if let Some(e) = &layout.enh {
         b.panel(e.panel);
+        let enh_uid = session.world.unit(e.unit).map(|u| u.type_id.clone()).unwrap_or_default();
         let name = session
             .world
-            .unit(e.unit)
-            .and_then(|u| session.world.catalog().get(&u.type_id))
-            .map(|t| t.name.trim().to_string())
+            .catalog()
+            .get(&enh_uid)
+            .map(|t| crate::loc::unit_display_name(&t.id, &t.name))
             .unwrap_or_default();
         b.text(e.panel[0] + 8.0, e.panel[1] + 7.0, 1.5, &format!("ENHANCEMENTS  {}", trunc(&name, 30)), title_col);
         for (r, slot) in &e.headers {
-            b.text(r[0] + 2.0, r[1] + 2.0, 1.3, crate::command_card::slot_label(slot), [0.55, 0.72, 0.90, 1.0]);
+            b.text(r[0] + 2.0, r[1] + 2.0, 1.3, &crate::command_card::localized_slot_label(slot).to_uppercase(), [0.55, 0.72, 0.90, 1.0]);
         }
         for (r, row, idx) in &e.rows {
             let hover = session.ui.hud_hover == Some(HudAction::EnhanceRow(*idx as u16));
@@ -1614,14 +1698,15 @@ fn draw_command_interface(session: &PlaySession, layout: &HudLayout, b: &mut Hud
             };
             let cw = text_w(&cost, 1.3);
             let max_chars = (((r[2] - cw - 14.0) / (4.0 * 1.3)).floor().max(3.0)) as usize;
-            b.text(r[0] + 5.0, r[1] + 8.0, 1.3, &trunc(&row.display.to_ascii_uppercase(), max_chars), txt);
+            let enh_lbl = crate::loc::enhancement_name(&enh_uid, &row.name, &row.display);
+            b.text(r[0] + 5.0, r[1] + 8.0, 1.3, &trunc(&enh_lbl.to_uppercase(), max_chars), txt);
             b.text(r[0] + r[2] - cw - 5.0, r[1] + 8.0, 1.3, &cost, txt);
         }
     }
 }
 
-/// Tooltip lines for the HUD element `hit`.
-fn hud_tooltip(session: &PlaySession, layout: &HudLayout, hit: HudAction) -> Vec<String> {
+/// Tooltip lines for the HUD element `hit` (localized via [`crate::loc`]).
+pub fn hud_tooltip(session: &PlaySession, layout: &HudLayout, hit: HudAction) -> Vec<String> {
     let cat = session.world.catalog();
     let keymap = crate::keymap::active();
     match hit {
@@ -1631,64 +1716,194 @@ fn hud_tooltip(session: &PlaySession, layout: &HudLayout, hit: HudAction) -> Vec
             };
             let mut v = crate::command_card::item_tooltip(cat, &item.unit_type, session.card_build_rate());
             v.push(match layout.card.model.source {
-                Some(CardSource::Production) => "LMB QUEUE  SHIFT X5  RMB REMOVE".to_string(),
-                _ => "LMB PLACE  DRAG = LINE  SHIFT QUEUE".to_string(),
+                Some(CardSource::Production) => crate::loc::tr("tt.hint_prod", "LMB: Queue  Shift: x5  RMB: Remove"),
+                _ => crate::loc::tr("tt.hint_build", "LMB: Place  Drag: Line  Shift: Queue"),
             });
             v
         }
         HudAction::Order(k) => {
-            let mut v = vec![k.label().to_string()];
+            let (title, help) = k.tooltip();
+            let mut v = vec![title];
             if let Some(key) = k.key_action().map(|a| keymap.get(a)).filter(|c| !c.is_empty()) {
-                v.push(format!("KEY {}", crate::keymap::chords_to_string(key).to_ascii_uppercase()));
+                let kl = crate::loc::tr("tt.key", "Key");
+                v.push(format!("{kl}: {}", crate::keymap::chords_to_string(key)));
+            }
+            if !help.is_empty() {
+                for line in crate::loc::word_wrap(&help, 46).into_iter().take(3) {
+                    v.push(line);
+                }
             }
             if k.is_targeted() {
-                v.push("THEN CLICK THE MAP (SHIFT QUEUE)".to_string());
+                v.push(crate::loc::tr("tt.click_map", "Click on the map to target (Shift to queue)"));
             }
             v
         }
         HudAction::QueueItem(i) => match layout.queue.as_ref().and_then(|q| q.entries.get(i as usize)) {
             Some((_, e)) => {
-                let name = cat.get(&e.unit_type).map(|t| t.name.trim().to_string()).unwrap_or_else(|| e.unit_type.clone());
-                vec![format!("{name} X{}", e.count), "CLICK: CANCEL 1  SHIFT: CANCEL 5".to_string()]
+                let fb = cat.get(&e.unit_type).map(|t| t.name.trim()).unwrap_or(&e.unit_type);
+                let name = crate::loc::unit_display_name(&e.unit_type, fb);
+                vec![
+                    format!("{name} x{}", e.count),
+                    crate::loc::tr("tt.hint_queue", "Click: Cancel 1  Shift: Cancel 5"),
+                ]
             }
             None => Vec::new(),
         },
         HudAction::Upgrade => match layout.queue.as_ref().and_then(|q| q.upgrade.as_ref()) {
             Some((_, t)) => {
-                let mut v = crate::command_card::item_tooltip(cat, t, 0);
-                v.insert(0, "UPGRADE SELECTED TO".to_string());
+                let mut v = crate::command_card::item_tooltip(cat, t, session.card_build_rate());
+                v.insert(0, crate::loc::tr("tt.upgrade_to", "Upgrade selected to"));
                 v
             }
             None => Vec::new(),
         },
-        HudAction::EnhanceRow(i) => match session.enhancement_panel().and_then(|(_, rows)| rows.get(i as usize).cloned()) {
-            Some(r) => {
+        HudAction::EnhanceRow(i) => match session.enhancement_panel().and_then(|(uid, rows)| {
+            let type_id = session.world.unit(uid).map(|u| u.type_id.clone()).unwrap_or_default();
+            rows.get(i as usize).cloned().map(|r| (type_id, r))
+        }) {
+            Some((type_id, r)) => {
                 let rate = session.card_build_rate().max(1);
+                let enh_title = crate::loc::enhancement_name(&type_id, &r.name, &r.display);
+                let slot_lbl = crate::command_card::localized_slot_label(&r.slot);
+                let l_mass = crate::loc::tr("tt.mass", "Mass");
+                let l_energy = crate::loc::tr("tt.energy", "Energy");
+                let l_time = crate::loc::tr("tt.time", "Time");
                 let mut v = vec![
-                    format!("{} ({})", r.display.to_ascii_uppercase(), crate::command_card::slot_label(&r.slot)),
+                    format!("{enh_title} ({slot_lbl})"),
                     format!(
-                        "MASS {}  ENERGY {}  TIME {:.0}S",
+                        "{l_mass} {}  {l_energy} {}  {l_time} {:.0}s",
                         r.cost_mass / SCALE,
                         r.cost_energy / SCALE,
                         r.build_work as f64 / rate as f64 / TICK_HZ as f64
                     ),
                 ];
+                if let Some(desc) = crate::loc::enhancement_description(&type_id, &r.name) {
+                    for line in crate::loc::word_wrap(&desc, 48).into_iter().take(4) {
+                        v.push(line);
+                    }
+                }
                 v.push(match (r.state, &r.prerequisite) {
-                    (EnhState::Installed, _) => "INSTALLED".to_string(),
-                    (EnhState::InProgress(p), _) => format!("INSTALLING {}%", p / 10),
-                    (EnhState::Locked, Some(p)) => format!("REQUIRES {}", p.to_ascii_uppercase()),
-                    (EnhState::Locked, None) => "SLOT OCCUPIED".to_string(),
-                    (EnhState::Available, _) => "CLICK TO INSTALL".to_string(),
+                    (EnhState::Installed, _) => crate::loc::tr("tt.installed", "Installed"),
+                    (EnhState::InProgress(p), _) => format!("{} {}%", crate::loc::tr("tt.installing", "Installing"), p / 10),
+                    (EnhState::Locked, Some(p)) => {
+                        let pre_name = crate::loc::enhancement_name(&type_id, p, p);
+                        format!("{} {pre_name}", crate::loc::tr("tt.requires", "Requires"))
+                    }
+                    (EnhState::Locked, None) => crate::loc::tr("tt.slot_occupied", "Slot occupied"),
+                    (EnhState::Available, _) => crate::loc::tr("tt.click_install", "Click to install"),
                 });
                 v
             }
             None => Vec::new(),
         },
-        HudAction::CardTab(t) => vec![
-            format!("TECH {} ({} ENTRIES)", crate::command_card::tab_label(t), layout.card.model.tab_counts[(t.clamp(1, 4) - 1) as usize]),
-            format!("NEXT TAB: {}", keymap.label(crate::keymap::Action::CardNextTab).unwrap_or_default()),
+        HudAction::CardTab(t) => {
+            let entries = crate::loc::tr("tt.entries", "entries");
+            let next_tab = crate::loc::tr("tt.next_tab", "Next tab");
+            vec![
+                format!(
+                    "Tech {} ({} {entries})",
+                    crate::command_card::tab_label(t),
+                    layout.card.model.tab_counts[(t.clamp(1, 4) - 1) as usize]
+                ),
+                format!("{next_tab}: {}", keymap.label(crate::keymap::Action::CardNextTab).unwrap_or_default()),
+            ]
+        }
+        HudAction::CardGroup(g) => {
+            if g == 255 {
+                let mut v = vec![crate::loc::tr("tt.filter_all", "All Categories")];
+                for line in crate::loc::word_wrap(&crate::loc::tr("tt.filter_all_desc", "Show every buildable unit and structure in this tech level."), 44) {
+                    v.push(line);
+                }
+                v
+            } else if let Some(&grp) = layout.card.model.groups.get(g as usize) {
+                let (title, desc) = grp.tooltip();
+                let mut v = vec![title];
+                for line in crate::loc::word_wrap(&desc, 44) {
+                    v.push(line);
+                }
+                v
+            } else {
+                Vec::new()
+            }
+        }
+        HudAction::CardPage => vec![
+            format!("{} {}/{}", crate::loc::tr("tt.page", "Page"), layout.card.model.page + 1, layout.card.model.pages),
+            crate::loc::tr("tt.page_hint", "Click to cycle command card page"),
         ],
         _ => Vec::new(),
+    }
+}
+
+fn push_ttf_rect(
+    verts: &mut Vec<HudVertex>,
+    idx: &mut Vec<u32>,
+    uv: [f32; 2],
+    r: [f32; 4],
+    color: [f32; 4],
+    w: f32,
+    h: f32,
+) {
+    let base = verts.len() as u32;
+    verts.extend_from_slice(&[
+        HudVertex { pos: to_ndc(r[0], r[1], w, h), uv, color },
+        HudVertex { pos: to_ndc(r[0] + r[2], r[1], w, h), uv, color },
+        HudVertex { pos: to_ndc(r[0] + r[2], r[1] + r[3], w, h), uv, color },
+        HudVertex { pos: to_ndc(r[0], r[1] + r[3], w, h), uv, color },
+    ]);
+    idx.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_tooltip_ttf(
+    fonts: &Fonts,
+    verts: &mut Vec<HudVertex>,
+    idx: &mut Vec<u32>,
+    cursor: (f32, f32),
+    lines: &[String],
+    pal: Option<crate::ui_kit::ClassicPalette>,
+    w: f32,
+    h: f32,
+) {
+    if lines.is_empty() {
+        return;
+    }
+    let title_st = ttf_bold(14.5);
+    let body_st = ttf_body(13.0);
+    let lh = 17.5f32;
+    let max_line_w = lines
+        .iter()
+        .enumerate()
+        .map(|(k, l)| fonts.measure(if k == 0 { title_st } else { body_st }, l))
+        .fold(0.0f32, f32::max);
+    let tw = (max_line_w + 22.0).clamp(150.0, (w - 16.0).min(420.0));
+    let th = lines.len() as f32 * lh + 14.0;
+    let x = (cursor.0 + 16.0).min(w - tw - 4.0).max(4.0);
+    let y = (cursor.1 - th - 10.0).max(52.0);
+    let wuv = fonts.white_uv();
+    let (bg, brd, hdr_col) = match pal {
+        Some(p) => (p.panel_bot, p.border_outer, p.title_gold),
+        None => ([0.025, 0.035, 0.055, 0.95], [0.45, 0.80, 0.96, 0.95], [1.0, 0.90, 0.50, 1.0]),
+    };
+    push_ttf_rect(verts, idx, wuv, [x, y, tw, th], bg, w, h);
+    let t = 1.4;
+    push_ttf_rect(verts, idx, wuv, [x, y, tw, t], brd, w, h);
+    push_ttf_rect(verts, idx, wuv, [x, y + th - t, tw, t], brd, w, h);
+    push_ttf_rect(verts, idx, wuv, [x, y, t, th], brd, w, h);
+    push_ttf_rect(verts, idx, wuv, [x + tw - t, y, t, th], brd, w, h);
+    if lines.len() > 1 {
+        push_ttf_rect(verts, idx, wuv, [x + 8.0, y + 7.0 + lh - 1.5, tw - 16.0, 1.0], [brd[0], brd[1], brd[2], 0.35], w, h);
+    }
+    let last_idx = lines.len().saturating_sub(1);
+    for (k, l) in lines.iter().enumerate() {
+        let (st, col) = if k == 0 {
+            (title_st, hdr_col)
+        } else if k == last_idx && lines.len() >= 3 {
+            (body_st, [0.62, 0.78, 0.90, 1.0])
+        } else {
+            (body_st, [0.90, 0.94, 0.98, 1.0])
+        };
+        let fit = fonts.fit(st, l, tw - 18.0);
+        fonts.push_hud_text(verts, idx, x + 10.0, y + 6.0 + k as f32 * lh, st, &fit, col, w, h);
     }
 }
 
@@ -1815,8 +2030,8 @@ pub(crate) fn draw_text(
     h: f32,
 ) {
     let mut cx = x;
-    for ch in text.bytes() {
-        let g = glyph_3x5(ch.to_ascii_uppercase());
+    for ch in text.chars() {
+        let g = glyph_3x5_char(ch);
         for row in 0..5usize {
             let bits = g[row];
             for col in 0..3usize {
@@ -1836,6 +2051,27 @@ pub(crate) fn draw_text(
             }
         }
         cx += 4.0 * scale;
+    }
+}
+
+/// Maps Unicode chars (including German umlauts / Latin-1) onto the 3x5 fallback glyph set.
+fn glyph_3x5_char(ch: char) -> [u8; 5] {
+    match ch {
+        'ä' | 'Ä' => [5, 0, 2, 7, 5],
+        'ö' | 'Ö' => [5, 0, 7, 5, 7],
+        'ü' | 'Ü' => [5, 0, 5, 5, 7],
+        'ß' => [6, 5, 6, 5, 6],
+        'á' | 'à' | 'â' | 'ã' | 'å' | 'Á' | 'À' | 'Â' | 'Ã' | 'Å' => glyph_3x5(b'A'),
+        'é' | 'è' | 'ê' | 'ë' | 'É' | 'È' | 'Ê' | 'Ë' => glyph_3x5(b'E'),
+        'í' | 'ì' | 'î' | 'ï' | 'Í' | 'Ì' | 'Î' | 'Ï' => glyph_3x5(b'I'),
+        'ó' | 'ò' | 'ô' | 'õ' | 'ø' | 'Ó' | 'Ò' | 'Ô' | 'Õ' | 'Ø' => glyph_3x5(b'O'),
+        'ú' | 'ù' | 'û' | 'Ú' | 'Ù' | 'Û' => glyph_3x5(b'U'),
+        'ñ' | 'Ñ' => glyph_3x5(b'N'),
+        'ç' | 'Ç' => glyph_3x5(b'C'),
+        '–' | '—' => glyph_3x5(b'-'),
+        '‘' | '’' => glyph_3x5(b'\''),
+        c if c.is_ascii() => glyph_3x5((c as u8).to_ascii_uppercase()),
+        _ => [0, 0, 0, 0, 0],
     }
 }
 
@@ -2070,5 +2306,42 @@ mod tests {
         // Switching back to Modern restores bottom-right minimap immediately.
         let back = HudLayout::compute_with_theme(&sess, 1280, 800, UiTheme::Modern);
         assert_eq!(back.minimap, modern.minimap);
+    }
+
+    #[test]
+    fn command_card_and_order_tooltips_cover_every_button_and_localize_to_german() {
+        let w = test_world(53);
+        let sess = PlaySession::new(w, 0, false, 1);
+        let layout = HudLayout::compute(&sess, 1280, 800);
+
+        // Every visible command-card slot, tab, category chip, and order button produces a tooltip.
+        for i in 0..layout.card.slots.len() {
+            let tt = hud_tooltip(&sess, &layout, HudAction::CardItem(i as u16));
+            assert!(tt.len() >= 3, "slot {i} tooltip too short: {tt:?}");
+        }
+        for &(_, t) in &layout.card.tabs {
+            let tt = hud_tooltip(&sess, &layout, HudAction::CardTab(t));
+            assert!(!tt.is_empty(), "tab {t} missing tooltip");
+        }
+        for &(_, g) in &layout.card.groups {
+            let tt = hud_tooltip(&sess, &layout, HudAction::CardGroup(g));
+            assert!(!tt.is_empty(), "group {g} missing tooltip");
+        }
+        for b in &layout.buttons {
+            let tt = hud_tooltip(&sess, &layout, b.action);
+            assert!(tt.len() >= 2, "order {:?} missing help text: {tt:?}", b.action);
+        }
+
+        // Switching active language to German localizes order tooltips and unit card stats.
+        let prev = crate::loc::active_language();
+        crate::loc::set_language("de");
+        let ovc = hud_tooltip(&sess, &layout, HudAction::Order(OrderKind::Overcharge));
+        assert!(ovc[0].contains("Überladen"), "{ovc:?}");
+        assert!(ovc.iter().any(|l| l.contains("Überladungsschuss")), "{ovc:?}");
+        let grp_all = hud_tooltip(&sess, &layout, HudAction::CardGroup(255));
+        assert!(grp_all[0].contains("Alle Kategorien"), "{grp_all:?}");
+        let slot0 = hud_tooltip(&sess, &layout, HudAction::CardItem(0));
+        assert!(slot0.iter().any(|l| l.contains("Masse")), "{slot0:?}");
+        crate::loc::set_language(&prev);
     }
 }

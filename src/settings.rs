@@ -117,6 +117,8 @@ pub struct Settings {
     pub card_hotkeys: bool,
     /// Phase 27: UI layout & skin theme (`modern` or `classic`).
     pub ui_theme: UiTheme,
+    /// Phase 37: localization language code (`us`, `de`, `fr`, ...).
+    pub language: String,
     /// Phase 26: lightweight TCP rendezvous + relay server (`HOST:PORT`).
     pub rendezvous_server: String,
     /// Phase 23: remappable key bindings (`key.<action>=Ctrl+Shift+K`).
@@ -139,6 +141,7 @@ impl Default for Settings {
             last_host: "127.0.0.1:15000".to_string(),
             card_hotkeys: false,
             ui_theme: UiTheme::Modern,
+            language: "us".to_string(),
             rendezvous_server: crate::rendezvous::DEFAULT_ADDR.to_string(),
             keys: crate::keymap::KeyMap::default(),
         }
@@ -147,7 +150,7 @@ impl Default for Settings {
 
 /// Every key written to / understood in `settings.ini`, in file order (followed by one
 /// `key.<action>` line per bindable action, see [`crate::keymap`]).
-pub const KEYS: [&str; 14] = [
+pub const KEYS: [&str; 15] = [
     "resolution",
     "fullscreen",
     "vsync",
@@ -161,6 +164,7 @@ pub const KEYS: [&str; 14] = [
     "last_host",
     "card_hotkeys",
     "ui_theme",
+    "language",
     "rendezvous_server",
 ];
 
@@ -227,6 +231,21 @@ pub fn faction_index(key: &str) -> Option<usize> {
     FACTION_KEYS.iter().position(|k| k.eq_ignore_ascii_case(key.trim()))
 }
 
+/// Validates a localization language code (`us`, `de`, `fr`, `en_US`, ...).
+pub fn validate_language(v: &str) -> Result<String, String> {
+    let t = v.trim();
+    if !(2..=12).contains(&t.len())
+        || !t.bytes().all(|b| b.is_ascii_alphabetic() || b == b'_' || b == b'-')
+    {
+        return Err(format!("'{t}' is not a valid language code (e.g. us, de, fr)"));
+    }
+    let norm = crate::loc::normalize_lang(t);
+    if !(2..=4).contains(&norm.len()) || !norm.bytes().all(|b| b.is_ascii_alphabetic()) {
+        return Err(format!("'{t}' is not a valid language code"));
+    }
+    Ok(norm)
+}
+
 impl Settings {
     /// Applies one `key=value` pair; returns an error (and leaves the field unchanged)
     /// for unknown keys or invalid values.
@@ -255,6 +274,7 @@ impl Settings {
                 self.ui_theme =
                     UiTheme::parse(v).ok_or_else(|| format!("'{v}' is not modern/classic"))?
             }
+            "language" => self.language = validate_language(v)?,
             "rendezvous_server" => self.rendezvous_server = validate_host_addr(v)?,
             other => match other.strip_prefix("key.") {
                 Some(id) => self.keys.set_from_setting(id, v)?,
@@ -281,6 +301,7 @@ impl Settings {
             "last_host" => self.last_host.clone(),
             "card_hotkeys" => b(self.card_hotkeys),
             "ui_theme" => self.ui_theme.key().to_string(),
+            "language" => self.language.clone(),
             "rendezvous_server" => self.rendezvous_server.clone(),
             other => {
                 let id = other.strip_prefix("key.")?;
@@ -466,6 +487,16 @@ pub fn ui_theme() -> UiTheme {
     input_settings().ui_theme
 }
 
+/// Active localization language (`FARUST_LANG` env var overrides `settings.ini`, default `"us"`).
+pub fn language() -> String {
+    if let Ok(v) = std::env::var("FARUST_LANG")
+        && let Ok(code) = validate_language(&v)
+    {
+        return code;
+    }
+    input_settings().language
+}
+
 /// Active rendezvous server address (`FARUST_RENDEZVOUS` env var overrides `settings.ini`).
 pub fn effective_rendezvous(override_s: Option<&Settings>) -> String {
     if let Ok(v) = std::env::var("FARUST_RENDEZVOUS") {
@@ -499,6 +530,7 @@ mod tests {
             last_host: "192.168.1.20:15400".into(),
             card_hotkeys: true,
             ui_theme: UiTheme::Classic,
+            language: "de".into(),
             rendezvous_server: "relay.example.org:15050".into(),
             keys: {
                 let mut k = crate::keymap::KeyMap::default();
@@ -617,11 +649,20 @@ mod tests {
         assert_eq!(s.rendezvous_server, crate::rendezvous::DEFAULT_ADDR);
         assert_eq!(w.len(), 2, "{w:?}");
 
-        let (c, cw) = Settings::parse("ui_theme=classic\nrendezvous_server=10.0.0.5:15050\n");
+        let (c, cw) = Settings::parse("ui_theme=classic\nlanguage=DE\nrendezvous_server=10.0.0.5:15050\n");
         assert!(cw.is_empty(), "{cw:?}");
         assert_eq!(c.ui_theme, UiTheme::Classic);
+        assert_eq!(c.language, "de");
         assert_eq!(c.rendezvous_server, "10.0.0.5:15050");
         assert_eq!(c.get("ui_theme").as_deref(), Some("classic"));
+        assert_eq!(c.get("language").as_deref(), Some("de"));
         assert_eq!(c.get("rendezvous_server").as_deref(), Some("10.0.0.5:15050"));
+
+        let (bad, bw) = Settings::parse("language=123!!\n");
+        assert_eq!(bad.language, "us");
+        assert_eq!(bw.len(), 1, "{bw:?}");
+        assert_eq!(validate_language("en_US").as_deref(), Ok("us"));
+        assert_eq!(validate_language("de-DE").as_deref(), Ok("de"));
+        assert_eq!(validate_language("fr").as_deref(), Ok("fr"));
     }
 }

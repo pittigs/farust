@@ -196,3 +196,16 @@ cargo run --release -- host --code SCMP_001 --rendezvous 127.0.0.1:15050 --play
 cargo run --release -- join --code XXXX-XXXX --rendezvous 127.0.0.1:15050 --play
 FARUST_UI_THEME=classic cargo run --release -- play SCMP_001
 ```
+
+## Step 37 — done: localization & tooltips
+
+- **FA `loc` parser & help tables** (`src/loc.rs`, `src/fuzz.rs`): parses `gamedata/loc_<LANG>.scd` (`strings_db.lua`/`usdb.lua`), loose `loc/<LANG>/`, and `lua.scd` (`unitdescription.lua`, `tooltips.lua`), with fallback to built-in German/English tables → US English → inline `<LOC key>Fallback`.
+- **Language selection & Latin-1/Cyrillic TrueType HUD** (`src/settings.rs`, `src/menu.rs`, `src/ttf.rs`, `src/ui_kit.rs`, `src/viewer.rs`, `src/hud.rs`, `src/command_card.rs`, `src/controls.rs`): `language=<code>` in `settings.ini` + `FARUST_LANG` override + Options `Language` selector, Latin-1 umlauts (`äöüÄÖÜß`) and Cyrillic in the TrueType glyph atlas, localized unit names in the stats card, and TrueType hover tooltips on every command-card, order, queue, upgrade, and enhancement button. Render/UI only: sim hashes unchanged.
+
+```sh
+cargo run --release -- loc --check
+cargo run --release -- loc uel0001_desc --lang de
+cargo run --release -- loc --unit UEL0201 --lang de
+FARUST_LANG=de cargo run --release -- menu --screen options --snapshot fa-unpack/renders/options_de.png
+FARUST_LANG=de FARUST_SNAPSHOT_SELECT=acu FARUST_SNAPSHOT_HOVER=card:0 cargo run --release -- play SCMP_001 --snapshot fa-unpack/renders/tooltip_de.png --snapshot-ticks 10
+```

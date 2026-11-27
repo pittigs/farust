@@ -991,6 +991,7 @@ pub(crate) struct GpuSceneResources {
     overlay_bind_group: wgpu::BindGroup,
     minimap_bind_group: wgpu::BindGroup,
     hud_icons_bind_group: wgpu::BindGroup,
+    hud_font_bind_group: wgpu::BindGroup,
     strat_icons_bind_group: wgpu::BindGroup,
     uniform_only_bg: wgpu::BindGroup,
 
@@ -1048,6 +1049,7 @@ pub(crate) struct GpuSceneResources {
     hud_bg: Option<(wgpu::Buffer, wgpu::Buffer, u32)>,
     hud_icons: Option<(wgpu::Buffer, wgpu::Buffer, u32)>,
     hud_text: Option<(wgpu::Buffer, wgpu::Buffer, u32)>,
+    hud_ttf: Option<(wgpu::Buffer, wgpu::Buffer, u32)>,
 
     lighting: ScMapLighting,
     map_size: [f32; 2],
@@ -1557,6 +1559,15 @@ impl GpuSceneResources {
             &sampler_clamp,
             &white_img,
             "hud_icons_bg",
+        );
+        let hud_font_bind_group = create_rgba_bind_group(
+            device,
+            queue,
+            &bind_group_layout,
+            &uniform_buf,
+            &sampler_clamp,
+            &white_img,
+            "hud_font_bg",
         );
         let strat_icons_bind_group = create_rgba_bind_group(
             device,
@@ -2620,6 +2631,7 @@ impl GpuSceneResources {
             overlay_bind_group,
             minimap_bind_group,
             hud_icons_bind_group,
+            hud_font_bind_group,
             strat_icons_bind_group,
             uniform_only_bg,
             bone_bgl,
@@ -2657,6 +2669,7 @@ impl GpuSceneResources {
             hud_bg: None,
             hud_icons: None,
             hud_text: None,
+            hud_ttf: None,
             lighting,
             map_size,
             water_levels,
@@ -2845,6 +2858,48 @@ impl GpuSceneResources {
             img,
             "hud_icons_tex",
         );
+    }
+
+    pub(crate) fn set_hud_font_texture(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        img: &RgbaImage,
+    ) {
+        self.hud_font_bind_group = create_rgba_bind_group(
+            device,
+            queue,
+            &self.bind_group_layout,
+            &self.uniform_buf,
+            &self.sampler_clamp,
+            img,
+            "hud_font_tex",
+        );
+    }
+
+    pub(crate) fn set_hud_ttf(
+        &mut self,
+        device: &wgpu::Device,
+        verts: &[HudVertex],
+        indices: &[u32],
+    ) {
+        self.hud_ttf = if verts.is_empty() || indices.is_empty() {
+            None
+        } else {
+            Some((
+                device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("hud_ttf"),
+                    contents: bytemuck::cast_slice(verts),
+                    usage: wgpu::BufferUsages::VERTEX,
+                }),
+                device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("hud_ttf"),
+                    contents: bytemuck::cast_slice(indices),
+                    usage: wgpu::BufferUsages::INDEX,
+                }),
+                indices.len() as u32,
+            ))
+        };
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3291,12 +3346,13 @@ impl GpuSceneResources {
             { st.add(*n, 1); rpass.draw_indexed(0..*n, 0, 0..1); }
         }
 
-        // 2D HUD Pass (Strategic Icons -> Minimap -> Button Backgrounds/Bars -> FA Unit Icons -> Bitmap Text)
+        // 2D HUD Pass (Strategic Icons -> Minimap -> Button Backgrounds/Bars -> FA Unit Icons -> Bitmap Text -> TrueType Tooltips/Cards)
         if self.hud_strat_icons.is_some()
             || self.hud_minimap.is_some()
             || self.hud_bg.is_some()
             || self.hud_icons.is_some()
             || self.hud_text.is_some()
+            || self.hud_ttf.is_some()
         {
             rpass.set_pipeline(&self.hud_pipeline);
             if let Some((vb, ib, n)) = &self.hud_strat_icons {
@@ -3325,6 +3381,12 @@ impl GpuSceneResources {
             }
             if let Some((vb, ib, n)) = &self.hud_text {
                 rpass.set_bind_group(0, &self.overlay_bind_group, &[]);
+                rpass.set_vertex_buffer(0, vb.slice(..));
+                rpass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                { st.add(*n, 1); rpass.draw_indexed(0..*n, 0, 0..1); }
+            }
+            if let Some((vb, ib, n)) = &self.hud_ttf {
+                rpass.set_bind_group(0, &self.hud_font_bind_group, &[]);
                 rpass.set_vertex_buffer(0, vb.slice(..));
                 rpass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
                 { st.add(*n, 1); rpass.draw_indexed(0..*n, 0, 0..1); }
