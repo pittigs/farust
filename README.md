@@ -112,6 +112,7 @@ cargo run --release -- play SCMP_001 --mute               # F3 mute, F4/F5 volum
 cargo run --release -- view-unit URL0402 --anim walk --anim-time 0.7
 cargo run --release -- host 127.0.0.1:15000 SCMP_001 --players 2 --play   # + join 127.0.0.1:15000 --play
 cargo run --release -- host 127.0.0.1:15000 SCMP_001 --players 3 --headless-ticks 600
+cargo run --release -- host 127.0.0.1:15000 SCMP_001 --players 2 --observers 1 --play  # 3rd joiner spectates
 cargo run --release -- audio render-mix fa-unpack/audio/mix.wav SCMP_001 --from 7200 --ticks 1200
 ```
 

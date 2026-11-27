@@ -1224,6 +1224,17 @@ pub fn build_hud_geometry_ex(
         push_rect(&mut fg_v, &mut fg_i, bx + 18.0, by + 42.0, (bw - 36.0) * frac, 16.0, [0.28, 0.78, 0.95, 0.95], w, h);
     }
 
+    // 6a. Phase 38 observer/caster panel: per-army economy, army size/value and APM.
+    if session.spectate && !session.menu.is_open() {
+        let rows = observer_rows(&session.world);
+        if let Some(ref fonts) = ttf_fonts {
+            draw_observer_panel_ttf(fonts, &mut ttf_v, &mut ttf_i, &rows, pal, w, h);
+        } else {
+            let mut hb = HudBufs { v: &mut v, i: &mut i, ic_v: &mut ic_v, ic_i: &mut ic_i, fg_v: &mut fg_v, fg_i: &mut fg_i, w, h, pal };
+            draw_observer_panel(&mut hb, &rows);
+        }
+    }
+
     // 6b. Phase 23/37 tooltip and targeting-mode label at the cursor
     if !session.menu.is_open()
         && let Some(cur) = session.ui.cursor_px
@@ -1907,6 +1918,120 @@ fn draw_tooltip_ttf(
     }
 }
 
+/// Phase 38: one observer-panel row (already formatted) plus the army colour swatch.
+pub(crate) struct ObserverRow {
+    pub rgb: [f32; 3],
+    pub text: String,
+    /// The same values split per column (name left-aligned, numbers right-aligned).
+    pub cols: [String; 6],
+    pub defeated: bool,
+}
+
+pub(crate) const OBSERVER_HEADER: &str = "ARMY           MASS  ENERGY  UNITS  VALUE  APM";
+/// Column titles and their right edges (in TTF ems of 7 px) for the proportional-font panel.
+const OBSERVER_COLS: [&str; 6] = ["ARMY", "MASS", "ENERGY", "UNITS", "VALUE", "APM"];
+const OBSERVER_COL_X: [f32; 6] = [0.0, 138.0, 196.0, 244.0, 294.0, 330.0];
+
+/// Phase 38: rows of the observer panel, one per army, in army order.
+pub(crate) fn observer_rows(world: &crate::skirmish::Skirmish) -> Vec<ObserverRow> {
+    world
+        .armies()
+        .iter()
+        .map(|a| {
+            let (mobile, _structs, value) = world.army_summary(a.id);
+            // income_* is milli-resource per tick at 10 Hz -> resource per second.
+            let m = a.income_mass as f64 * 10.0 / crate::sim::SCALE as f64;
+            let e = a.income_energy as f64 * 10.0 / crate::sim::SCALE as f64;
+            let mut name: String = a.name.chars().take(12).collect();
+            if a.defeated {
+                name = format!("{} X", name.chars().take(10).collect::<String>());
+            }
+            let apm = world.apm(a.id);
+            ObserverRow {
+                rgb: crate::play::army_rgb(world, a.id),
+                text: format!("{name:<12} {m:>6.1} {e:>7.0} {mobile:>6} {value:>6} {apm:>4}"),
+                cols: [name, format!("{m:.1}"), format!("{e:.0}"), mobile.to_string(), value.to_string(), apm.to_string()],
+                defeated: a.defeated,
+            }
+        })
+        .collect()
+}
+
+fn observer_panel_rect(rows: usize, row_h: f32, pw: f32, w: f32) -> [f32; 4] {
+    let ph = (rows + 1) as f32 * row_h + 12.0;
+    [(w - pw - 6.0).max(4.0), 52.0, pw, ph]
+}
+
+fn draw_observer_panel_ttf(
+    fonts: &Fonts,
+    verts: &mut Vec<HudVertex>,
+    idx: &mut Vec<u32>,
+    rows: &[ObserverRow],
+    pal: Option<crate::ui_kit::ClassicPalette>,
+    w: f32,
+    h: f32,
+) {
+    if rows.is_empty() {
+        return;
+    }
+    let st = ttf_body(12.5);
+    let hdr = ttf_bold(12.5);
+    let lh = 16.5f32;
+    let [x, y, pw, ph] = observer_panel_rect(rows.len(), lh, OBSERVER_COL_X[5] + 34.0, w);
+    let wuv = fonts.white_uv();
+    let (bg, brd, hdr_col) = match pal {
+        Some(p) => (p.panel_bot, p.border_outer, p.title_gold),
+        None => ([0.025, 0.035, 0.055, 0.86], [0.45, 0.80, 0.96, 0.9], [1.0, 0.90, 0.50, 1.0]),
+    };
+    push_ttf_rect(verts, idx, wuv, [x, y, pw, ph], bg, w, h);
+    let t = 1.2;
+    push_ttf_rect(verts, idx, wuv, [x, y, pw, t], brd, w, h);
+    push_ttf_rect(verts, idx, wuv, [x, y + ph - t, pw, t], brd, w, h);
+    push_ttf_rect(verts, idx, wuv, [x, y, t, ph], brd, w, h);
+    push_ttf_rect(verts, idx, wuv, [x + pw - t, y, t, ph], brd, w, h);
+    let x0 = x + 24.0;
+    // Column 0 is left-aligned at x0; the numeric columns are right-aligned at their edge.
+    let cell = |verts: &mut Vec<HudVertex>, idx: &mut Vec<u32>, c: usize, ty: f32, style: crate::ui_kit::TextStyle, s: &str, col: [f32; 4]| {
+        let cx = if c == 0 { x0 } else { x0 + OBSERVER_COL_X[c] - fonts.measure(style, s) };
+        let fit = if c == 0 { fonts.fit(style, s, OBSERVER_COL_X[1] - 52.0) } else { s.to_string() };
+        fonts.push_hud_text(verts, idx, cx, ty, style, &fit, col, w, h);
+    };
+    for (c, title) in OBSERVER_COLS.iter().enumerate() {
+        cell(verts, idx, c, y + 6.0, hdr, title, hdr_col);
+    }
+    for (k, r) in rows.iter().enumerate() {
+        let ry = y + 6.0 + (k + 1) as f32 * lh;
+        let a = if r.defeated { 0.45 } else { 1.0 };
+        push_ttf_rect(verts, idx, wuv, [x + 8.0, ry + 3.0, 10.0, 10.0], [r.rgb[0], r.rgb[1], r.rgb[2], a], w, h);
+        for (c, v) in r.cols.iter().enumerate() {
+            cell(verts, idx, c, ry, st, v, [0.90, 0.94, 0.98, a]);
+        }
+    }
+}
+
+fn draw_observer_panel(b: &mut HudBufs, rows: &[ObserverRow]) {
+    if rows.is_empty() {
+        return;
+    }
+    let ts = 1.4;
+    let lh = 5.0 * ts + 6.0;
+    let tw = rows.iter().map(|r| text_w(&r.text, ts)).fold(text_w(OBSERVER_HEADER, ts), f32::max);
+    let [x, y, pw, ph] = observer_panel_rect(rows.len(), lh, tw + 30.0, b.w);
+    b.fg([x, y, pw, ph], [0.02, 0.03, 0.05, 0.86]);
+    let (brd, hdr_col) = match b.pal {
+        Some(p) => (p.border_outer, p.title_gold),
+        None => ([0.45, 0.80, 0.96, 0.9], [1.0, 0.92, 0.55, 1.0]),
+    };
+    b.outline([x, y, pw, ph], 1.2, brd);
+    b.text(x + 22.0, y + 7.0, ts, OBSERVER_HEADER, hdr_col);
+    for (k, r) in rows.iter().enumerate() {
+        let ry = y + 7.0 + (k + 1) as f32 * lh;
+        let a = if r.defeated { 0.45 } else { 1.0 };
+        b.fg([x + 7.0, ry, 9.0, 8.0], [r.rgb[0], r.rgb[1], r.rgb[2], a]);
+        b.text(x + 22.0, ry, ts, &r.text, [0.90, 0.94, 0.98, a]);
+    }
+}
+
 fn draw_tooltip(b: &mut HudBufs, cursor: (f32, f32), lines: &[String]) {
     if lines.is_empty() {
         return;
@@ -2235,6 +2360,27 @@ mod tests {
         assert_eq!(ic_v.len() * 6, ic_i.len() * 4);
         assert!(!fg_v.is_empty() && !fg_i.is_empty());
         assert!(fg_v.iter().all(|vx| vx.pos.iter().all(|c| c.is_finite())));
+    }
+
+    #[test]
+    fn observer_panel_lists_every_army_only_while_spectating() {
+        let w = test_world(52);
+        let map = dummy_map();
+        let cam = OrbitCamera::for_map(256.0, 256.0, 10.0, 1.6);
+        let mut sess = PlaySession::new(w, 0, true, 1);
+        let rows = observer_rows(&sess.world);
+        assert_eq!(rows.len(), sess.world.armies().len());
+        for (r, a) in rows.iter().zip(sess.world.armies()) {
+            assert!(r.text.starts_with(&a.name.chars().take(12).collect::<String>()));
+            // Columns line up under the header.
+            assert_eq!(r.text.len(), OBSERVER_HEADER.len());
+        }
+        let on = build_hud_geometry(&sess, &map, &cam, 1280, 800).6.len();
+        sess.spectate = false;
+        let off = build_hud_geometry(&sess, &map, &cam, 1280, 800).6.len();
+        assert!(on > off, "observer panel adds foreground geometry ({on} vs {off})");
+        let [x, y, pw, ph] = observer_panel_rect(rows.len(), 13.0, 300.0, 1280.0);
+        assert!(x >= 0.0 && x + pw <= 1280.0 && y + ph < 800.0);
     }
 
     #[test]

@@ -1344,6 +1344,7 @@ fn positional_after(args: &[String], start: usize) -> Option<PathBuf> {
             || a == "--units"
             || a == "--headless-ticks"
             || a == "--players"
+            || a == "--observers"
             || a == "--camera-dist"
             || a == "--out"
             || a == "--rendezvous"
@@ -1930,7 +1931,7 @@ fn cmd_host(args: &[String]) -> Result<(), String> {
         let a = args[i].as_str();
         if matches!(
             a,
-            "--seed" | "--headless-ticks" | "--players" | "--armies" | "--factions" | "--size" | "--rendezvous" | "--netem"
+            "--seed" | "--headless-ticks" | "--players" | "--observers" | "--armies" | "--factions" | "--size" | "--rendezvous" | "--netem"
         ) {
             i += 2;
             continue;
@@ -2003,6 +2004,7 @@ fn cmd_host(args: &[String]) -> Result<(), String> {
         input_delay: net::DEFAULT_INPUT_DELAY,
         tick_limit: if interactive { 0 } else { ticks },
         assigned_army: 0,
+        observers: flag_usize(args, "--observers").unwrap_or(0).min(8),
     };
 
     let proto_label = match (use_udp, netem_spec) {
@@ -2145,7 +2147,8 @@ fn cmd_join(args: &[String], connect_lobby: Option<&str>) -> Result<(), String> 
         net::LockstepClient::connect_retry(&target, std::time::Duration::from_secs(30))?
     };
     println!(
-        "Joined {target} as army {} of {} players ({} armies) on {} seed {}",
+        "Joined {target} as {} {} of {} players ({} armies) on {} seed {}",
+        if net::is_observer(hs.assigned_army) { "observer" } else { "army" },
         hs.assigned_army,
         hs.player_count,
         hs.setups.len(),
@@ -2168,7 +2171,13 @@ fn cmd_join(args: &[String], connect_lobby: Option<&str>) -> Result<(), String> 
     let world = net::world_from_handshake(catalog, &map, &hs)?;
     if let Some(meshes) = meshes {
         let (width, height) = parse_size_flag(args).unwrap_or((1280, 800));
-        let mut session = play::PlaySession::new(world, hs.assigned_army, false, 1);
+        // Phase 38: live observers spectate with fog off and never run local AIs.
+        let observer = net::is_observer(hs.assigned_army);
+        let mut session = play::PlaySession::new(world, hs.assigned_army, observer, 1);
+        if observer {
+            session.ais.clear();
+            session.fog_of_war = false;
+        }
         session.muted = has_flag(args, "--mute");
         net::NetHandle::start(&session.world, &hs, Box::new(client))?.attach(&mut session);
         return play::run_play_window(Some(&game_dir), session, map, meshes, width, height);

@@ -2461,10 +2461,16 @@ pub struct Skirmish {
     paths_solved: u64,
     commands_applied: u64,
     commands_rejected: u64,
+    /// Phase 38: (tick, army) of recently applied commands, for the observer APM readout.
+    /// Presentation only: never hashed, trimmed to the last [`APM_WINDOW_TICKS`].
+    apm_log: VecDeque<(u64, ArmyId)>,
     result: Option<GameResult>,
     /// Phase 18 game options (victory condition, unit cap).
     options: GameOptions,
 }
+
+/// Phase 38: rolling window of the observer APM readout (one minute).
+pub const APM_WINDOW_TICKS: u64 = 60 * TICK_HZ;
 
 /// Integer square root (floor) for non-negative `i128`.
 pub fn isqrt(v: i128) -> i64 {
@@ -2543,6 +2549,7 @@ impl Skirmish {
             paths_solved: 0,
             commands_applied: 0,
             commands_rejected: 0,
+            apm_log: VecDeque::new(),
             result: None,
             options: GameOptions::default(),
         };
@@ -2987,6 +2994,33 @@ impl Skirmish {
     pub fn commands_rejected(&self) -> u64 {
         self.commands_rejected
     }
+
+    /// Phase 38: actions per minute of `army` over the last [`APM_WINDOW_TICKS`] (or the
+    /// elapsed game time if shorter). Counts accepted commands only.
+    pub fn apm(&self, army: ArmyId) -> u32 {
+        let cutoff = self.tick.saturating_sub(APM_WINDOW_TICKS);
+        let n = self.apm_log.iter().filter(|&&(t, a)| a == army && t >= cutoff).count() as u64;
+        let window = self.tick.clamp(TICK_HZ * 10, APM_WINDOW_TICKS);
+        (n * 60 * TICK_HZ / window) as u32
+    }
+
+    /// Phase 38: live observer summary of one army: (mobile unit count, structure count,
+    /// army value = summed mass cost of living mobile non-commander units, in whole mass).
+    pub fn army_summary(&self, army: ArmyId) -> (u32, u32, i64) {
+        let (mut mobile, mut structs, mut value) = (0u32, 0u32, 0i64);
+        for u in self.units.values().filter(|u| u.alive && u.army == army) {
+            if u.role.is_structure() {
+                structs += 1;
+            } else {
+                mobile += 1;
+                // The commander is priceless (and would swamp the comparison): not counted.
+                if u.role != Role::Commander {
+                    value += self.catalog.get(&u.type_id).map_or(0, |t| t.cost_mass);
+                }
+            }
+        }
+        (mobile, structs, value / SCALE)
+    }
     pub fn result(&self) -> Option<GameResult> {
         self.result
     }
@@ -3378,6 +3412,11 @@ impl Skirmish {
             && self.apply_command(army, cmd);
         if ok {
             self.commands_applied += 1;
+            self.apm_log.push_back((self.tick, army));
+            let cutoff = self.tick.saturating_sub(APM_WINDOW_TICKS);
+            while self.apm_log.front().is_some_and(|&(t, _)| t < cutoff) {
+                self.apm_log.pop_front();
+            }
         } else {
             self.commands_rejected += 1;
         }
@@ -8326,6 +8365,37 @@ pub(crate) mod tests {
         assert_eq!(left, 1, "the far rock still stands");
         assert_eq!(gone, vec![(1, 2), (3, 4)], "reclaimed props reported in order for the renderer");
         assert_eq!(run(true).4, h1, "prop reclaim is deterministic");
+    }
+
+    #[test]
+    fn observer_apm_and_army_summary_track_commands_without_touching_the_hash() {
+        let mut a = test_world(7);
+        let mut b = test_world(7);
+        let army = a.armies()[0].id;
+        let unit = a.units().find(|u| u.army == army && !u.role.is_structure()).map(|u| u.id).unwrap();
+        for k in 0..30 {
+            a.apply_command_direct(army, Command::Move { units: vec![unit], x: (100 + k) * SCALE, y: 100 * SCALE, queue: false });
+            b.apply_command_direct(army, Command::Move { units: vec![unit], x: (100 + k) * SCALE, y: 100 * SCALE, queue: false });
+            a.step();
+            b.step();
+        }
+        assert_eq!(a.state_hash(), b.state_hash());
+        // 30 commands in 30 ticks: the window floor is 10 s, so 30 actions over 10 s -> 180 APM.
+        assert_eq!(a.apm(army), 180);
+        assert_eq!(a.apm(army + 1), 0);
+        let (mobile, _s, value) = a.army_summary(army);
+        let expect: i64 = a
+            .units()
+            .filter(|u| u.alive && u.army == army && !u.role.is_structure() && u.role != Role::Commander)
+            .map(|u| a.catalog().get(&u.type_id).unwrap().cost_mass)
+            .sum();
+        assert!(mobile >= 1);
+        assert_eq!(value, expect / SCALE, "army value excludes the commander");
+        // Old entries age out of the one-minute window.
+        for _ in 0..(APM_WINDOW_TICKS + 5) {
+            a.step();
+        }
+        assert_eq!(a.apm(army), 0);
     }
 
     #[test]

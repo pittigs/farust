@@ -439,10 +439,20 @@ bumps `SIM_VERSION`, re-baselines golden hashes deliberately, and keeps
   fuzzing); sim hashes unchanged (`sim-run` `35db8f2bd7a6faf2`, `skirmish SCMP_001`
   `192e89b083b978cb`). Done.
 
-### Phase 38 — Observer & caster tools (planned)
-- Live spectator slots in the lobby, observer HUD (all-army economy, army
-  value graph, APM), follow-unit camera, picture-in-picture minimap.
-- Exit: a 2-player match with 1 live observer completes without desync.
+### Phase 38 — Observer & caster tools (done: live observers + observer HUD)
+- `host … --players N --observers K` (K ≤ 8): after the N players the host accepts K more
+  peers as live observers (army ids from `net::OBSERVER_ARMY_BASE` = 200). They receive
+  every lockstep turn and hash-check like players, but their (empty) command slots are
+  ignored by the sim, so they cannot influence the match. `join … --play` as an observer
+  spectates with fog off and no local AIs. Handshake wire format unchanged.
+- Observer HUD (any spectate session — live observer, `play --spectate`, replays): a
+  top-right panel listing every army's mass/energy income, unit count, army value (mass
+  cost of living mobile units, commander excluded) and APM over a rolling minute
+  (`Skirmish::apm`, a presentation-only command log that is never hashed).
+- Exit met: `host --players 2 --observers 1` with a player and an observer joined: all
+  three peers end on hash `4f868f25ff409113`, identical to the same match with no observer
+  (`live_observer_follows_a_2_player_match_without_desync_or_influence` covers it in tests).
+- Not done: army-value graph over time, follow-unit camera, picture-in-picture minimap.
 
 ### Phase 39 — Onboarding & accessibility (done)
 - Tutorial: `missions/tutorial.farust-mission` (built into the binary, main menu → TUTORIAL)

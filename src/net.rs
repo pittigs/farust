@@ -106,6 +106,23 @@ pub struct Handshake {
     /// Host-authoritative tick limit for headless matches (0 = unlimited).
     pub tick_limit: u64,
     pub assigned_army: ArmyId,
+    /// Phase 38: live observers the host accepts after the players (host-side only; each
+    /// gets `assigned_army` ≥ [`OBSERVER_ARMY_BASE`], which no army uses).
+    pub observers: usize,
+}
+
+/// Phase 38: first army id given to live observers (they send empty turns, so their
+/// hashes are still desync-checked but they never affect the sim).
+pub const OBSERVER_ARMY_BASE: ArmyId = 200;
+
+/// Phase 38: army id of accept slot `slot` with `players` players (then observers).
+fn slot_army(slot: usize, players: usize) -> ArmyId {
+    if slot < players { slot as ArmyId } else { OBSERVER_ARMY_BASE + (slot - players) as ArmyId }
+}
+
+/// Phase 38: whether `army` belongs to a live observer.
+pub fn is_observer(army: ArmyId) -> bool {
+    army >= OBSERVER_ARMY_BASE
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -315,6 +332,7 @@ fn decode_handshake(data: &[u8]) -> Result<Handshake, String> {
         ));
     }
     Ok(Handshake {
+        observers: 0,
         map_id,
         seed,
         setups,
@@ -687,14 +705,14 @@ impl LockstepHost {
             ));
         }
         mux.set_accepting(true);
-        let mut clients = Vec::with_capacity(n - 1);
-        for slot in 1..n {
+        let mut clients = Vec::with_capacity(n - 1 + hs.observers);
+        for slot in 1..n + hs.observers {
             let mut ch = mux
                 .accept(None)
                 .map_err(|e| format!("udp accept slot {slot} failed: {e}"))?;
             let peer = ch.peer_addr();
             ch.set_read_timeout(Some(NET_TIMEOUT));
-            let army = slot as ArmyId;
+            let army = slot_army(slot, n);
             let mut client_hs = hs.clone();
             client_hs.assigned_army = army;
             ch.write_frame(&encode_handshake(&client_hs))?;
@@ -819,8 +837,8 @@ impl LockstepHost {
         let code = reg.code.clone();
         println!("Invite code: {code} (rendezvous {rendezvous_addr}, UDP punch + TCP relay)");
 
-        let mut clients = Vec::with_capacity(n - 1);
-        for slot in 1..n {
+        let mut clients = Vec::with_capacity(n - 1 + hs.observers);
+        for slot in 1..n + hs.observers {
             let (mut stream, peer, via) = rx
                 .recv()
                 .map_err(|_| format!("accept slot {slot} failed: listener closed"))?;
@@ -828,7 +846,7 @@ impl LockstepHost {
                 let _ = s.set_nodelay(true);
             }
             stream.set_read_timeout(Some(NET_TIMEOUT));
-            let army = slot as ArmyId;
+            let army = slot_army(slot, n);
             let mut client_hs = hs.clone();
             client_hs.assigned_army = army;
             stream.write_frame(&encode_handshake(&client_hs))?;
@@ -921,14 +939,14 @@ impl LockstepHost {
         let code = reg.code.clone();
         println!("Invite code: {code} (rendezvous {rendezvous_addr})");
 
-        let mut clients = Vec::with_capacity(n - 1);
-        for slot in 1..n {
+        let mut clients = Vec::with_capacity(n - 1 + hs.observers);
+        for slot in 1..n + hs.observers {
             let (mut stream, peer, relayed) = rx
                 .recv()
                 .map_err(|_| format!("accept slot {slot} failed: listener closed"))?;
             let _ = stream.set_nodelay(true);
             let _ = stream.set_read_timeout(Some(NET_TIMEOUT));
-            let army = slot as ArmyId;
+            let army = slot_army(slot, n);
             let mut client_hs = hs.clone();
             client_hs.assigned_army = army;
             write_frame(&mut stream, &encode_handshake(&client_hs))?;
@@ -967,14 +985,14 @@ impl LockstepHost {
                 hs.setups.len()
             ));
         }
-        let mut clients = Vec::with_capacity(n - 1);
-        for slot in 1..n {
+        let mut clients = Vec::with_capacity(n - 1 + hs.observers);
+        for slot in 1..n + hs.observers {
             let (mut stream, peer) = listener
                 .accept()
                 .map_err(|e| format!("accept slot {slot} failed: {e}"))?;
             let _ = stream.set_nodelay(true);
             let _ = stream.set_read_timeout(Some(NET_TIMEOUT));
-            let army = slot as ArmyId;
+            let army = slot_army(slot, n);
             let mut client_hs = hs.clone();
             client_hs.assigned_army = army;
             write_frame(&mut stream, &encode_handshake(&client_hs))?;
@@ -2514,6 +2532,7 @@ mod tests {
 
     fn handshake(players: usize, armies: usize, seed: u64, ticks: u64) -> Handshake {
         Handshake {
+            observers: 0,
             map_id: "LOOP".into(),
             seed,
             setups: setups(armies),
@@ -2641,7 +2660,12 @@ mod tests {
 
     /// Runs host + clients as threads over 127.0.0.1 and returns every final hash.
     fn run_loopback(players: usize, armies: usize, ticks: u64) -> Vec<u64> {
-        let hs = handshake(players, armies, 4242, ticks);
+        run_loopback_obs(players, armies, ticks, 0)
+    }
+
+    fn run_loopback_obs(players: usize, armies: usize, ticks: u64, observers: usize) -> Vec<u64> {
+        let mut hs = handshake(players, armies, 4242, ticks);
+        hs.observers = observers;
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         let hs_host = hs.clone();
@@ -2652,7 +2676,7 @@ mod tests {
             assert_eq!(core.shared_ai_armies().len(), armies - players);
             run_headless(&mut t, &mut core, &mut w, hs_host.tick_limit).unwrap()
         });
-        let clients: Vec<_> = (1..players)
+        let clients: Vec<_> = (1..players + observers)
             .map(|_| {
                 let addr = addr.clone();
                 std::thread::spawn(move || {
@@ -2673,8 +2697,20 @@ mod tests {
             out.push(h);
         }
         seen.sort();
-        assert_eq!(seen, (1..players as ArmyId).collect::<Vec<_>>());
+        let mut want: Vec<ArmyId> = (1..players as ArmyId).collect();
+        want.extend((0..observers as ArmyId).map(|i| OBSERVER_ARMY_BASE + i));
+        assert_eq!(seen, want);
         out
+    }
+
+    #[test]
+    fn live_observer_follows_a_2_player_match_without_desync_or_influence() {
+        let with_obs = run_loopback_obs(2, 2, 300, 1);
+        assert_eq!(with_obs.len(), 3);
+        assert!(with_obs.iter().all(|h| *h == with_obs[0]), "{with_obs:x?}");
+        let without = run_loopback(2, 2, 300);
+        assert_eq!(without[0], with_obs[0], "an observer never changes the match");
+        assert!(is_observer(OBSERVER_ARMY_BASE) && !is_observer(7));
     }
 
     #[test]
