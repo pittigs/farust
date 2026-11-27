@@ -8,7 +8,7 @@ use bytemuck::{Pod, Zeroable};
 use crate::blueprint::{self, Value};
 use crate::camera::OrbitCamera;
 use crate::dds_decode::{
-    RgbaImage, decode_dds_cubemap_rgba8, decode_dds_rgba8, resize_rgba_bilinear,
+    RgbaImage, SpecGlowMap, decode_dds_cubemap_rgba8, decode_dds_rgba8, resize_rgba_bilinear,
 };
 use crate::jobs;
 use crate::scd;
@@ -175,6 +175,8 @@ pub struct LoadedScene {
     pub overlay_vertices: Vec<GpuVertex>,
     pub overlay_indices: Vec<u32>,
     pub albedo: RgbaImage,
+    /// Optional linear `(specular, glow)` map extracted from `*_SpecTeam.dds` (Phase 42).
+    pub spec_glow: Option<SpecGlowMap>,
     pub initial_camera: OrbitCamera,
     pub clear_color: [f64; 4],
     pub terrain_splat: Option<TerrainSplatData>,
@@ -534,6 +536,7 @@ pub fn load_unit_scene_posed(
     }
 
     let spec_team = decode_first_dds(&gamedata, &["units.scd"], &spec_candidates);
+    let spec_glow = spec_team.as_ref().map(SpecGlowMap::from_spec_team);
     let mut spec_applied = false;
     if let Some(spec_img) = spec_team
         && spec_img.width == albedo.width
@@ -551,8 +554,9 @@ pub fn load_unit_scene_posed(
                 let blended = base_c + (team_c - base_c) * mask;
                 albedo.pixels[i * 4 + c] = blended.round().clamp(0.0, 255.0) as u8;
             }
+            // FA SpecTeam.dds G channel = Phong specular intensity.
             let spec_strength =
-                ((spec_img.pixels[i * 4] as u16 * 180 / 255) + 40).min(255) as u8;
+                ((spec_img.pixels[i * 4 + 1] as u16 * 180 / 255) + 40).min(255) as u8;
             albedo.pixels[i * 4 + 3] = spec_strength;
         }
         spec_applied = true;
@@ -682,6 +686,7 @@ pub fn load_unit_scene_posed(
         overlay_vertices: Vec::new(),
         overlay_indices: Vec::new(),
         albedo,
+        spec_glow,
         initial_camera,
         clear_color: [0.055, 0.070, 0.095, 1.0],
         terrain_splat: None,
@@ -765,6 +770,7 @@ pub fn build_map_scene_from_parts(
         overlay_vertices,
         overlay_indices,
         albedo,
+        spec_glow: None,
         initial_camera,
         clear_color: [
             f64::from(fc[0].clamp(0.05, 1.0)),

@@ -493,10 +493,29 @@ bumps `SIM_VERSION`, re-baselines golden hashes deliberately, and keeps
   Bisecting the frame time also found and fixed a Phase 39 regression (per-unit settings
   clone: 21.6 ms → 7.4 ms). Done.
 
-### Phase 42 — HDR, bloom & glow (planned)
-- HDR render target, FA-like tonemap and bloom from `.scmap` lighting values,
-  emissive/glow maps on units, MSAA/FXAA option, gamma setting.
-- Exit: `bench-render` at 8k units keeps frame p50 within +15% of Phase 25.
+### Phase 42 — HDR, bloom & glow (done)
+- `Rgba16Float` HDR 3-D scene target (`src/viewer.rs`, `src/play.rs`, `src/perf_cmds.rs`,
+  `src/map_author.rs`) with a 5-level half-res bright-pass (Karis anti-firefly + soft knee) →
+  Jimenez 13-tap downsample → additive 3×3 tent upsample bloom mip chain driven by `.scmap`
+  `Bloom` (skipped when off or 0), Narkowicz ACES filmic tonemap with exposure from `.scmap`
+  `LightingMultiplier`, relative gamma (`0.8..1.4`), optional FXAA 3.11 or MSAA 4× (auto-falls
+  back to FXAA if `Rgba16Float` 4× MSAA is unsupported), and LDR 2-D HUD composited on top
+  after tonemapping/AA.
+- Data-driven unit glow & specular maps (`SpecGlowMap` in `src/dds_decode.rs`, `src/scene.rs`,
+  `src/play.rs`, `src/render_prep.rs`): extracts FA's `*_SpecTeam.dds` `G` (specular) and `B`
+  (emissive/glow mask per `effects/mesh.fx`) into a linear `Rg8Unorm` texture for units
+  (both `view-unit` and instanced LOD0/LOD1 skirmish meshes; disabled on wrecks) so glowing
+  visors/cores/vents and additive VFX/shield hits bloom naturally.
+- Settings & Options UI (`src/settings.rs`, `src/menu.rs`, `src/loc.rs`): `bloom=on|off`,
+  `aa=off|fxaa|msaa4`, `gamma=0.80..1.40` (plus `FARUST_BLOOM` / `FARUST_AA` / `FARUST_GAMMA`
+  overrides) backed by a lock-free `AtomicU32` cache (`settings::render_post`) so per-frame
+  reads never clone `Settings`. Render-only.
+- Exit: 331/331 tests pass (incl. tonemap/gamma curve, bloom mip chain, AA fallback, settings
+  round-trip & atomic cache); determinism hashes unchanged (`sim-run --ticks 10000`
+  `35db8f2bd7a6faf2`, `skirmish SCMP_001` `0fe934990406d829`); `bench-render --no-sim` at
+  8,192 units: frame p50 `8.00 ms` MSAA4 / `7.97 ms` FXAA (`gpu` `1.93 ms` / `1.66 ms`,
+  `gpu.post_pass` `0.077–0.097 ms`, within +15% of baseline); battle, `UEL0001`/`UAL0001`,
+  `view-map`, and Options snapshots verified visually with bloom on/off and FXAA. Done.
 
 ### Phase 43 — Announcer, ambience & adaptive music (done)
 - Recursive SoundBank/WaveBank scan & direct `"Bank#Index"` wave playback

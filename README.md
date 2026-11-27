@@ -278,3 +278,16 @@ cargo run --release -- rendezvous 0.0.0.0:15050
 cargo run --release -- host --code --udp SCMP_001 --rendezvous 127.0.0.1:15050
 cargo run --release -- join --code XXXX-XXXX --udp --rendezvous 127.0.0.1:15050
 ```
+
+## Step 42 — done: HDR, bloom, unit glow, AA & gamma
+
+- **HDR & Bloom Pipeline** (`src/viewer.rs`, `src/play.rs`, `src/perf_cmds.rs`, `src/map_author.rs`): Renders the 3D scene into `Rgba16Float`, runs a 5-mip Karis bright-pass + Jimenez downsample + additive tent upsample bloom chain scaled by `.scmap` `Bloom`, applies Narkowicz ACES filmic tonemapping with exposure from `.scmap` `LightingMultiplier` plus user gamma (`0.80..1.40`), and supports `off` / `fxaa` / `msaa4` anti-aliasing (auto-fallback to FXAA when `Rgba16Float` MSAA 4× is unsupported) before compositing the 2D HUD in LDR.
+- **Data-Driven Unit Glow** (`src/dds_decode.rs`, `src/scene.rs`, `src/play.rs`, `src/render_prep.rs`): Extracts `*_SpecTeam.dds` specular (`G`) and glow (`B`) masks into a linear `Rg8Unorm` texture so glowing visors, cores, and vents bloom alongside additive VFX and shield hits.
+- **Graphics Settings** (`src/settings.rs`, `src/menu.rs`, `src/loc.rs`): `bloom=on|off`, `aa=off|fxaa|msaa4`, and `gamma=0.80..1.40` in `settings.ini` + Options (lock-free atomic cache; `FARUST_BLOOM` / `FARUST_AA` / `FARUST_GAMMA` overrides). Render-only: sim hashes unchanged.
+
+```sh
+cargo run --release -- play SCMP_001 --snapshot fa-unpack/renders/hdr_battle.png --snapshot-ticks 7200
+FARUST_BLOOM=off cargo run --release -- play SCMP_001 --snapshot fa-unpack/renders/hdr_nobloom.png --snapshot-ticks 7200
+FARUST_AA=fxaa cargo run --release -- bench-render SCMP_001 --units 4096,8192 --frames 30 --no-sim
+cargo run --release -- view-unit UAL0001 --snapshot fa-unpack/renders/ual0001_glow.png
+```

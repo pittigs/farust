@@ -9,6 +9,33 @@ pub struct RgbaImage {
     pub pixels: Vec<u8>,
 }
 
+/// Two-channel linear `(specular, glow)` map extracted from a Forged Alliance `*_SpecTeam.dds`
+/// (`G` = Phong specular mask, `B` = emissive/glow mask per FA's `effects/mesh.fx`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpecGlowMap {
+    pub width: u32,
+    pub height: u32,
+    /// Interleaved `[spec, glow]` pairs (`width * height * 2` bytes), uploaded as `Rg8Unorm`.
+    pub pixels: Vec<u8>,
+}
+
+impl SpecGlowMap {
+    /// Extracts `(spec = G, glow = B)` from a decoded RGBA8 `*_SpecTeam.dds` image.
+    pub fn from_spec_team(spec: &RgbaImage) -> Self {
+        let count = (spec.width as usize * spec.height as usize).min(spec.pixels.len() / 4);
+        let mut pixels = Vec::with_capacity(count * 2);
+        for &[_, g, b, _] in spec.pixels.as_chunks::<4>().0.iter().take(count) {
+            pixels.push(g); // G = specular intensity
+            pixels.push(b); // B = emissive/glow mask
+        }
+        Self {
+            width: spec.width,
+            height: spec.height,
+            pixels,
+        }
+    }
+}
+
 pub fn decode_dds_rgba8(data: &[u8]) -> Result<RgbaImage, String> {
     let header = parse_dds(data)?;
     let payload = data

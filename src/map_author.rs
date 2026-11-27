@@ -32,7 +32,7 @@ use crate::scmap::{BrushMode, ScMap, ScMapProp};
 use crate::ui_kit::{
     self, Align, Canvas, Fonts, ImageStore, Rect, UiRenderer, WState, body, bold, hit_test, theme,
 };
-use crate::viewer::{self, DEPTH_FORMAT, GpuSceneResources, MSAA_SAMPLES, create_attachment};
+use crate::viewer::{self, GpuSceneResources, create_attachment};
 
 const DEFAULT_SCRIPT_LUA: &str = "local ScenarioUtils = import('/lua/sim/ScenarioUtilities.lua')\n\nfunction OnPopulate()\n\tScenarioUtils.InitializeArmies()\nend\n\nfunction OnStart(self)\nend\n";
 
@@ -1512,21 +1512,14 @@ fn render_editor_snapshot(
         .map_err(|e| format!("failed to create GPU device: {e}"))?;
 
     let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+    let msaa4_ok = viewer::hdr_msaa4_supported(&adapter);
     let mut camera = scene.initial_camera.clone();
     camera.set_aspect(width, height);
-    let mut resources = GpuSceneResources::new(&device, &queue, scene, format, MSAA_SAMPLES, &camera);
+    let mut resources =
+        GpuSceneResources::new(&device, &queue, scene, format, width, height, msaa4_ok, &camera);
     let (dv, di) = state.build_dynamic_overlay();
     resources.set_dynamic(&device, &dv, &di);
 
-    let (_msaa_tex, msaa_view) = create_attachment(
-        &device,
-        width,
-        height,
-        format,
-        MSAA_SAMPLES,
-        wgpu::TextureUsages::RENDER_ATTACHMENT,
-        "editor_snap_msaa",
-    );
     let (resolve_tex, resolve_view) = create_attachment(
         &device,
         width,
@@ -1536,18 +1529,9 @@ fn render_editor_snapshot(
         wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
         "editor_snap_resolve",
     );
-    let (_depth_tex, depth_view) = create_attachment(
-        &device,
-        width,
-        height,
-        DEPTH_FORMAT,
-        MSAA_SAMPLES,
-        wgpu::TextureUsages::RENDER_ATTACHMENT,
-        "editor_snap_depth",
-    );
 
     let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("editor_snap_enc") });
-    resources.encode_draw(&mut enc, &msaa_view, Some(&resolve_view), &depth_view, scene.clear_color);
+    resources.encode_draw(&mut enc, &resolve_view, scene.clear_color);
     queue.submit(Some(enc.finish()));
 
     // Composite ui_kit toolbar on top
@@ -1613,8 +1597,6 @@ struct EditorGpu {
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
-    msaa_view: wgpu::TextureView,
-    depth_view: wgpu::TextureView,
     resources: GpuSceneResources,
     ui: UiRenderer,
     fonts: Fonts,
@@ -1722,24 +1704,16 @@ impl MapEditorApp {
 
         let mut camera = self.scene.initial_camera.clone();
         camera.set_aspect(width, height);
-        let resources = GpuSceneResources::new(&device, &queue, &self.scene, format, MSAA_SAMPLES, &camera);
-        let (_, msaa_view) = create_attachment(
+        let msaa4_ok = viewer::hdr_msaa4_supported(&adapter);
+        let resources = GpuSceneResources::new(
             &device,
-            width,
-            height,
+            &queue,
+            &self.scene,
             format,
-            MSAA_SAMPLES,
-            wgpu::TextureUsages::RENDER_ATTACHMENT,
-            "ed_msaa",
-        );
-        let (_, depth_view) = create_attachment(
-            &device,
             width,
             height,
-            DEPTH_FORMAT,
-            MSAA_SAMPLES,
-            wgpu::TextureUsages::RENDER_ATTACHMENT,
-            "ed_depth",
+            msaa4_ok,
+            &camera,
         );
         let fonts = Fonts::load(&self.game_dir);
         let ui = UiRenderer::new(&device, &queue, format, &fonts);
@@ -1749,8 +1723,6 @@ impl MapEditorApp {
             device,
             queue,
             config,
-            msaa_view,
-            depth_view,
             resources,
             ui,
             fonts,
@@ -1816,26 +1788,8 @@ impl ApplicationHandler for MapEditorApp {
                 gpu.config.width = w;
                 gpu.config.height = h;
                 gpu.surface.configure(&gpu.device, &gpu.config);
-                let (_, mv) = create_attachment(
-                    &gpu.device,
-                    w,
-                    h,
-                    gpu.config.format,
-                    MSAA_SAMPLES,
-                    wgpu::TextureUsages::RENDER_ATTACHMENT,
-                    "ed_msaa",
-                );
-                let (_, dv) = create_attachment(
-                    &gpu.device,
-                    w,
-                    h,
-                    DEPTH_FORMAT,
-                    MSAA_SAMPLES,
-                    wgpu::TextureUsages::RENDER_ATTACHMENT,
-                    "ed_depth",
-                );
-                gpu.msaa_view = mv;
-                gpu.depth_view = dv;
+                gpu.resources.resize(&gpu.device, w, h);
+                gpu.resources.sync_render_settings(&gpu.device, &gpu.queue);
                 gpu.camera.set_aspect(w, h);
                 gpu.resources.update_camera(&gpu.queue, &gpu.camera);
                 gpu.window.request_redraw();
@@ -2074,13 +2028,8 @@ impl ApplicationHandler for MapEditorApp {
                     .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                         label: Some("editor_3d_enc"),
                     });
-                gpu.resources.encode_draw(
-                    &mut encoder,
-                    &gpu.msaa_view,
-                    Some(&resolve_view),
-                    &gpu.depth_view,
-                    self.scene.clear_color,
-                );
+                gpu.resources
+                    .encode_draw(&mut encoder, &resolve_view, self.scene.clear_color);
                 gpu.queue.submit(Some(encoder.finish()));
 
                 let mut canvas = Canvas::new(
@@ -2104,7 +2053,6 @@ impl ApplicationHandler for MapEditorApp {
 // Keep unused imports clean if needed.
 #[allow(dead_code)]
 fn _assert_imports_used() {
-    let _ = viewer::MSAA_SAMPLES;
     let _ = scene::load_map_scene;
 }
 
