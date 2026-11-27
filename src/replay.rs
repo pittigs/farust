@@ -338,6 +338,29 @@ pub(crate) fn encode_command(out: &mut Vec<u8>, cmd: &Command) {
             write_ids(out, units);
             out.push(u8::from(*enabled));
         }
+        Command::SetFireState { units, state } => {
+            out.push(23);
+            write_ids(out, units);
+            out.push(state.code());
+        }
+        Command::AttackGround { units, x, y, queue } => {
+            out.push(24);
+            write_ids(out, units);
+            out.extend_from_slice(&x.to_le_bytes());
+            out.extend_from_slice(&y.to_le_bytes());
+            out.push(u8::from(*queue));
+        }
+        Command::Guard { units, target, queue } => {
+            out.push(25);
+            write_ids(out, units);
+            out.extend_from_slice(&target.to_le_bytes());
+            out.push(u8::from(*queue));
+        }
+        Command::SetBuildPaused { units, paused } => {
+            out.push(26);
+            write_ids(out, units);
+            out.push(u8::from(*paused));
+        }
         Command::Enhance { unit, name } => {
             out.push(18);
             out.extend_from_slice(&unit.to_le_bytes());
@@ -462,6 +485,27 @@ pub(crate) fn decode_command(data: &[u8], pos: &mut usize) -> Result<Command, St
         22 => Ok(Command::SetAutoRefuel {
             units: read_ids(data, pos)?,
             enabled: read_u8(data, pos)? != 0,
+        }),
+        23 => {
+            let units = read_ids(data, pos)?;
+            let code = read_u8(data, pos)?;
+            let state = crate::skirmish::FireState::from_code(code).ok_or_else(|| format!("unknown fire state {code}"))?;
+            Ok(Command::SetFireState { units, state })
+        }
+        24 => Ok(Command::AttackGround {
+            units: read_ids(data, pos)?,
+            x: read_i64(data, pos)?,
+            y: read_i64(data, pos)?,
+            queue: read_u8(data, pos)? != 0,
+        }),
+        25 => Ok(Command::Guard {
+            units: read_ids(data, pos)?,
+            target: read_u32(data, pos)?,
+            queue: read_u8(data, pos)? != 0,
+        }),
+        26 => Ok(Command::SetBuildPaused {
+            units: read_ids(data, pos)?,
+            paused: read_u8(data, pos)? != 0,
         }),
         18 => Ok(Command::Enhance {
             unit: read_u32(data, pos)?,
@@ -769,6 +813,11 @@ mod tests {
             Command::SetRepeat { factories: vec![7], enabled: true },
             Command::Dock { units: vec![11, 12], staging: 40, queue: true },
             Command::SetAutoRefuel { units: vec![11], enabled: false },
+            Command::SetFireState { units: vec![1, 2], state: crate::skirmish::FireState::HoldFire },
+            Command::SetFireState { units: vec![3], state: crate::skirmish::FireState::ReturnFire },
+            Command::AttackGround { units: vec![4], x: -5, y: 9_000, queue: true },
+            Command::Guard { units: vec![5, 6], target: 7, queue: false },
+            Command::SetBuildPaused { units: vec![8], paused: true },
         ];
         let mut buf = Vec::new();
         for c in &all {

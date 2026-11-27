@@ -1334,6 +1334,12 @@ const BUILTIN_US: &[(&str, &str)] = &[
     ("order.ai.help", "Hand control of your army to the AI or take manual control back."),
     ("order.idle_engineer.title", "Idle Engineer"),
     ("order.idle_engineer.help", "Select and cycle through idle engineers."),
+    ("order.attack_ground.title", "Attack Ground"),
+    ("order.attack_ground.help", "Fire at a map position until given another order."),
+    ("order.fire_state.title", "Fire State"),
+    ("order.fire_state.help", "Cycle fire at will, return fire and hold fire."),
+    ("order.pause_construction.title", "Pause Construction"),
+    ("order.pause_construction.help", "Pause or resume construction and production."),
 ];
 
 const BUILTIN_DE: &[(&str, &str)] = &[
@@ -1474,6 +1480,12 @@ const BUILTIN_DE: &[(&str, &str)] = &[
     ("order.ai.help", "Übergibt die Armeesteuerung an die KI oder übernimmt selbst."),
     ("order.idle_engineer.title", "Untätiger Ingenieur"),
     ("order.idle_engineer.help", "Wählt den nächsten untätigen Ingenieur aus."),
+    ("order.attack_ground.title", "Bodenangriff"),
+    ("order.attack_ground.help", "Feuert auf eine Kartenposition, bis ein neuer Befehl kommt."),
+    ("order.fire_state.title", "Feuermodus"),
+    ("order.fire_state.help", "Wechselt zwischen Feuer frei, Erwidern und Feuer einstellen."),
+    ("order.pause_construction.title", "Bau pausieren"),
+    ("order.pause_construction.help", "Pausiert oder setzt Bau und Produktion fort."),
     // Compact order-panel button labels (<= 8 chars)
     ("order.move.short", "BEWEGEN"),
     ("order.attack.short", "ANGRIFF"),
@@ -1493,6 +1505,9 @@ const BUILTIN_DE: &[(&str, &str)] = &[
     ("order.fog.short", "NEBEL"),
     ("order.ai.short", "KI"),
     ("order.idle_engineer.short", "ING"),
+    ("order.attack_ground.short", "BODEN"),
+    ("order.fire_state.short", "FEUER"),
+    ("order.pause_construction.short", "BAU-P"),
 ];
 
 const DE_PHRASES: &[(&str, &str)] = &[

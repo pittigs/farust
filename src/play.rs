@@ -1285,7 +1285,8 @@ fn unit_yaw(world: &Skirmish, u: &crate::skirmish::Unit) -> f32 {
             .unwrap_or(0.0),
         Some(UnitOrder::Unload { x, y }) => ((x - u.pos.x) as f32).atan2((y - u.pos.y) as f32),
         Some(UnitOrder::Board(_) | UnitOrder::Enhance(_)) => 0.0,
-        Some(UnitOrder::Dock(tid)) => world
+        Some(UnitOrder::AttackGround { x, y }) => ((x - u.pos.x) as f32).atan2((y - u.pos.y) as f32),
+        Some(UnitOrder::Guard(tid)) | Some(UnitOrder::Dock(tid)) => world
             .unit(*tid)
             .map(|t| ((t.pos.x - u.pos.x) as f32).atan2((t.pos.y - u.pos.y) as f32))
             .unwrap_or(0.0),
@@ -1621,6 +1622,11 @@ pub(crate) fn build_skirmish_render_frame(
                     UnitOrder::Upgrade(_) => continue,
                     UnitOrder::Unload { x, y } => ((*x, *y), [0.85, 0.80, 0.30, 0.2]),
                     UnitOrder::Board(_) | UnitOrder::Enhance(_) => continue,
+                    UnitOrder::AttackGround { x, y } => ((*x, *y), [1.0, 0.45, 0.10, 0.2]),
+                    UnitOrder::Guard(tid) => match world.unit(*tid) {
+                        Some(t) => ((t.pos.x, t.pos.y), [0.45, 1.0, 0.55, 0.2]),
+                        None => continue,
+                    },
                     UnitOrder::Dock(tid) => match world.unit(*tid) {
                         Some(t) => ((t.pos.x, t.pos.y), [0.40, 0.85, 1.0, 0.2]),
                         None => continue,

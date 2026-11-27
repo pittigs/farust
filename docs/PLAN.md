@@ -378,11 +378,24 @@ bumps `SIM_VERSION`, re-baselines golden hashes deliberately, and keeps
 - Not modelled: falling / burning tree animation, prop destruction by weapons, reclaim
   time from `ReclaimTime` (props use the wreck rate).
 
-### Phase 35 — Fire states & unit behaviours (planned)
-- Hold fire / return fire / ground fire (`Command::SetFireState`,
-  `Command::AttackGround`), guard, pause construction, target priorities from
-  blueprint `TargetPriorities`, air dive/hover, dock and stop-and-shoot.
-- Exit: a replay covering every new command round-trips through replay v5.
+### Phase 35 — Fire states & unit behaviours (done)
+- `FireState` (fire at will / return fire / hold fire, `Command::SetFireState`): return
+  fire only engages the unit's last attacker; hold fire never auto-engages; units not
+  firing at will no longer stop to fight on attack-move / patrol.
+- Ground fire (`Command::AttackGround` → `UnitOrder::AttackGround`): ready weapons in range
+  fire at the map position — artillery arcs, direct shells into the ground (hitting
+  whatever is in the way), until another order; works under hold fire.
+- Guard (`Command::Guard` → `UnitOrder::Guard`): follow a friendly unit and engage threats
+  around it; the command card's Guard on a mobile now issues it (was a plain move).
+- Build pause (`Command::SetBuildPaused`): builders / factories stop progressing and
+  spending until resumed.
+- Command card: GROUND (targeted), FIRE (cycles, lit unless firing at will), HOLD BLD
+  (toggle) with EN/DE tooltips. Replay tags 23–26, rules v8.
+- Exit: every new command round-trips in the replay codec test; fire-state, ground-fire,
+  guard and pause tests pass (319/319); `skirmish SCMP_009 --record` → `replay verify` OK.
+  `bench-scale --units 2048` 170 / 305 ticks/s (gradual drift from 181 / 346 since Phase 29
+  as each sim phase adds per-tick work — target of Phase 54). Done.
+- Not modelled: blueprint `TargetPriorities`, air dive/hover, stop-and-shoot.
 
 ### Arc B — Controls & UX (36–39)
 

@@ -559,6 +559,12 @@ pub enum OrderKind {
     Fog,
     Ai,
     IdleEngineer,
+    /// Phase 35: fire at a map position.
+    AttackGround,
+    /// Phase 35: cycle fire at will → return fire → hold fire.
+    FireState,
+    /// Phase 35: pause / resume construction & production.
+    PauseBuild,
 }
 
 impl OrderKind {
@@ -582,6 +588,9 @@ impl OrderKind {
             OrderKind::Fog => "FOG",
             OrderKind::Ai => "AI",
             OrderKind::IdleEngineer => "IDLE ENG",
+            OrderKind::AttackGround => "GROUND",
+            OrderKind::FireState => "FIRE",
+            OrderKind::PauseBuild => "HOLD BLD",
         }
     }
 
@@ -606,6 +615,9 @@ impl OrderKind {
             OrderKind::Fog => "fog",
             OrderKind::Ai => "ai",
             OrderKind::IdleEngineer => "idle_engineer",
+            OrderKind::AttackGround => "attack_ground",
+            OrderKind::FireState => "fire_state",
+            OrderKind::PauseBuild => "pause_construction",
         }
     }
 
@@ -647,6 +659,7 @@ impl OrderKind {
                 | OrderKind::Unload
                 | OrderKind::Overcharge
                 | OrderKind::LaunchMissile
+                | OrderKind::AttackGround
         )
     }
 
@@ -672,12 +685,13 @@ impl OrderKind {
             OrderKind::Fog => A::ToggleFog,
             OrderKind::Ai => A::ToggleAi,
             OrderKind::IdleEngineer => A::IdleEngineer,
+            OrderKind::AttackGround | OrderKind::FireState | OrderKind::PauseBuild => return None,
         })
     }
 
     pub fn rgb(self) -> [f32; 3] {
         match self {
-            OrderKind::Attack | OrderKind::Overcharge | OrderKind::LaunchMissile => [1.0, 0.35, 0.28],
+            OrderKind::Attack | OrderKind::Overcharge | OrderKind::LaunchMissile | OrderKind::AttackGround => [1.0, 0.35, 0.28],
             OrderKind::Move | OrderKind::Patrol | OrderKind::Load | OrderKind::Unload => [0.40, 0.85, 1.0],
             OrderKind::Assist | OrderKind::Guard | OrderKind::Repair => [0.45, 1.0, 0.55],
             OrderKind::Reclaim => [1.0, 0.85, 0.35],
@@ -1219,6 +1233,21 @@ impl PlaySession {
             push(OrderKind::Unload, !self.selected_transports().is_empty());
             push(OrderKind::Overcharge, !self.selected_with(|u| u.role == Role::Commander).is_empty());
             push(OrderKind::LaunchMissile, !self.selected_with(|u| u.role == Role::MissileSilo).is_empty());
+            // Phase 35: ground fire, fire state (lit unless firing at will) and build pause.
+            let armed = self.selected_with(|u| u.can_fire_surface);
+            push(OrderKind::AttackGround, !armed.is_empty());
+            let gunners = self.selected_with(|u| !u.weapons.is_empty());
+            if !gunners.is_empty() {
+                let holding = gunners
+                    .iter()
+                    .any(|id| self.world.unit(*id).is_some_and(|u| u.fire_state != crate::skirmish::FireState::FireAtWill));
+                out.push((OrderKind::FireState, holding));
+            }
+            let workers = self.selected_with(|u| u.build.is_some() || !u.production.is_empty() || u.build_paused);
+            if !workers.is_empty() {
+                let paused = workers.iter().any(|id| self.world.unit(*id).is_some_and(|u| u.build_paused));
+                out.push((OrderKind::PauseBuild, paused));
+            }
             let shields = self.selected_shield_units();
             if !shields.is_empty() {
                 let on = shields.iter().any(|id| self.world.unit(*id).is_some_and(|u| u.shield_on));
@@ -1268,6 +1297,23 @@ impl PlaySession {
             OrderKind::Fog => self.trigger_hud_action(crate::hud::HudAction::ToggleFog, false),
             OrderKind::Ai => self.toggle_spectate(),
             OrderKind::IdleEngineer => self.trigger_hud_action(crate::hud::HudAction::IdleEngineer, false),
+            OrderKind::FireState => {
+                let units = self.selected_with(|u| !u.weapons.is_empty());
+                let cur = units.first().and_then(|id| self.world.unit(*id)).map(|u| u.fire_state).unwrap_or_default();
+                let state = cur.next();
+                if !units.is_empty() {
+                    self.world.issue(self.human_army, Command::SetFireState { units, state });
+                    self.status_banner = format!("Fire state: {state:?}");
+                }
+            }
+            OrderKind::PauseBuild => {
+                let units = self.selected_with(|u| u.build.is_some() || !u.production.is_empty() || u.build_paused);
+                let paused = !units.iter().any(|id| self.world.unit(*id).is_some_and(|u| u.build_paused));
+                if !units.is_empty() {
+                    self.world.issue(self.human_army, Command::SetBuildPaused { units, paused });
+                    self.status_banner = if paused { "Construction paused".into() } else { "Construction resumed".into() };
+                }
+            }
             _ => {}
         }
     }
@@ -1292,6 +1338,10 @@ impl PlaySession {
                 (!mobiles.is_empty()).then(|| Command::Patrol { units: mobiles, x: p.0, y: p.1, queue }),
                 "Patrol ordered".into(),
             ),
+            OrderKind::AttackGround => {
+                let armed = self.selected_with(|u| u.can_fire_surface);
+                ((!armed.is_empty()).then_some(Command::AttackGround { units: armed, x: p.0, y: p.1, queue }), "Ground fire".into())
+            }
             OrderKind::Assist => match ally_at {
                 Some(t) if !builders.is_empty() => {
                     (Some(Command::Assist { units: builders, target: t, queue }), format!("Assisting #{t}"))
@@ -1302,8 +1352,8 @@ impl PlaySession {
                 Some((t, role, _)) if (role.is_factory() || role.is_builder()) && !builders.is_empty() => {
                     (Some(Command::Assist { units: builders, target: t, queue }), format!("Guarding #{t}"))
                 }
-                Some((t, _, pos)) if !mobiles.is_empty() => (
-                    Some(Command::Move { units: mobiles.into_iter().filter(|&m| m != t).collect(), x: pos.0, y: pos.1, queue }),
+                Some((t, _, _)) if !mobiles.is_empty() => (
+                    Some(Command::Guard { units: mobiles.into_iter().filter(|&m| m != t).collect(), target: t, queue }),
                     format!("Guarding #{t}"),
                 ),
                 _ => (None, "Guard: click a friendly unit".into()),

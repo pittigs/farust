@@ -494,8 +494,9 @@ pub const LOF_CLEARANCE: i64 = SCALE / 4;
 /// footprints blocking pathing).
 /// 3 = Phase 30 air fuel & staging; 4 = Phase 31 engineering stations & pod drones;
 /// 5 = Phase 32 mobile factories, mobile staging & hatching eggs; 6 = Phase 33 Novax
-/// satellite, EMP stun, death explosions & kamikaze weapons; 7 = Phase 34 prop reclaim.
-pub const RULES_VERSION: u32 = 7;
+/// satellite, EMP stun, death explosions & kamikaze weapons; 7 = Phase 34 prop reclaim;
+/// 8 = Phase 35 fire states, ground fire, guard & build pause.
+pub const RULES_VERSION: u32 = 8;
 
 /// Phase 29: milliradians per degree, scaled by 1000 (17.453 mrad / deg).
 const MRAD_PER_DEG_MILLI: i64 = 17_453;
@@ -1853,6 +1854,47 @@ pub enum UnitOrder {
     Enhance(String),
     /// Phase 30: (aircraft) fly to this air staging platform, dock, refuel and repair.
     Dock(UnitId),
+    /// Phase 35: keep firing at a map position (FA ground fire).
+    AttackGround { x: i64, y: i64 },
+    /// Phase 35: follow and protect a friendly unit.
+    Guard(UnitId),
+}
+
+/// Phase 35: automatic engagement rule of a unit (FA `RULEUCC_RetaliateToggle`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FireState {
+    /// Engage anything in range (FA default).
+    #[default]
+    FireAtWill,
+    /// Only shoot back at the unit that last hit it.
+    ReturnFire,
+    /// Never fire automatically; explicit attack / ground-fire orders only.
+    HoldFire,
+}
+
+impl FireState {
+    pub fn code(self) -> u8 {
+        match self {
+            FireState::FireAtWill => 0,
+            FireState::ReturnFire => 1,
+            FireState::HoldFire => 2,
+        }
+    }
+    pub fn from_code(c: u8) -> Option<Self> {
+        match c {
+            0 => Some(FireState::FireAtWill),
+            1 => Some(FireState::ReturnFire),
+            2 => Some(FireState::HoldFire),
+            _ => None,
+        }
+    }
+    pub fn next(self) -> Self {
+        match self {
+            FireState::FireAtWill => FireState::ReturnFire,
+            FireState::ReturnFire => FireState::HoldFire,
+            FireState::HoldFire => FireState::FireAtWill,
+        }
+    }
 }
 
 /// Player / AI input. Applied at the start of the next tick in issue order.
@@ -1887,6 +1929,14 @@ pub enum Command {
     Dock { units: Vec<UnitId>, staging: UnitId, queue: bool },
     /// Phase 30: toggle automatic return to air staging on low fuel.
     SetAutoRefuel { units: Vec<UnitId>, enabled: bool },
+    /// Phase 35: engagement rule.
+    SetFireState { units: Vec<UnitId>, state: FireState },
+    /// Phase 35: fire at a map position until given another order.
+    AttackGround { units: Vec<UnitId>, x: i64, y: i64, queue: bool },
+    /// Phase 35: follow and protect a friendly unit.
+    Guard { units: Vec<UnitId>, target: UnitId, queue: bool },
+    /// Phase 35: pause / resume construction and production.
+    SetBuildPaused { units: Vec<UnitId>, paused: bool },
     /// Phase 18: `transports` fly to `(x, y)` and drop their cargo.
     Unload { transports: Vec<UnitId>, x: i64, y: i64, queue: bool },
     /// Phase 18: install ACU/SCU enhancement `name` (blueprint `Enhancements` key).
@@ -2041,6 +2091,10 @@ pub struct Unit {
     pub stunned: u32,
     /// Phase 33: never auto- or manually targeted (orbital satellites).
     pub untargetable: bool,
+    /// Phase 35: automatic engagement rule.
+    pub fire_state: FireState,
+    /// Phase 35: construction / production paused.
+    pub build_paused: bool,
 }
 
 impl Unit {
@@ -3784,6 +3838,56 @@ impl Skirmish {
                 }
                 true
             }
+            Command::SetFireState { units, state } => {
+                let mut any = false;
+                for id in units {
+                    if let Some(u) = self.units.get_mut(&id).filter(|u| u.army == army && u.alive) {
+                        u.fire_state = state;
+                        any = true;
+                    }
+                }
+                any
+            }
+            Command::SetBuildPaused { units, paused } => {
+                let mut any = false;
+                for id in units {
+                    if let Some(u) = self.units.get_mut(&id).filter(|u| u.army == army && u.alive) {
+                        u.build_paused = paused;
+                        any = true;
+                    }
+                }
+                any
+            }
+            Command::AttackGround { units, x, y, queue } => {
+                let p = self.clamp_to_map(x, y);
+                let mut v: Vec<UnitId> = units
+                    .iter()
+                    .copied()
+                    .filter(|id| self.unit(*id).is_some_and(|u| u.army == army && u.can_fire_surface && u.carried_by.is_none()))
+                    .collect();
+                v.sort_unstable();
+                v.dedup();
+                for id in &v {
+                    self.push_order(*id, UnitOrder::AttackGround { x: p.0, y: p.1 }, queue);
+                }
+                !v.is_empty()
+            }
+            Command::Guard { units, target, queue } => {
+                if !self.unit(target).is_some_and(|t| t.alive && self.are_allies(army, t.army)) {
+                    return false;
+                }
+                let mut v: Vec<UnitId> = units
+                    .iter()
+                    .copied()
+                    .filter(|&id| id != target && self.unit(id).is_some_and(|u| u.army == army && u.speed > 0 && u.carried_by.is_none()))
+                    .collect();
+                v.sort_unstable();
+                v.dedup();
+                for id in &v {
+                    self.push_order(*id, UnitOrder::Guard(target), queue);
+                }
+                !v.is_empty()
+            }
             Command::SetAutoRefuel { units, enabled } => {
                 let mut any = false;
                 for id in units {
@@ -3977,6 +4081,8 @@ impl Skirmish {
                 pod_timer: 0,
                 stunned: 0,
                 untargetable: t.ext.untargetable,
+                fire_state: FireState::FireAtWill,
+                build_paused: false,
             },
         );
         // Phase 31: a finished engineering station comes with its pod drones.
@@ -4711,7 +4817,7 @@ impl Skirmish {
                     ),
                     None => continue,
                 };
-            if !alive || self.units[&id].stunned > 0 {
+            if !alive || self.units[&id].stunned > 0 || self.units[&id].build_paused {
                 continue;
             }
 
@@ -5259,7 +5365,9 @@ impl Skirmish {
                 }
                 UnitOrder::AttackMove { x, y } | UnitOrder::Patrol { x, y } => {
                     let acquire = u.max_range + ACQUIRE_BONUS;
+                    let holding = u.fire_state != FireState::FireAtWill;
                     let found = match pre_acquired.and_then(|m| m.get(&id)) {
+                        _ if holding => None,
                         Some(&hit) => hit,
                         None if u.max_range > 0 => self.nearest_enemy_filtered(army, pos, acquire, can_aa, can_surf),
                         None => None,
@@ -5371,6 +5479,36 @@ impl Skirmish {
                         return None;
                     }
                     return Some(((x, y), SCALE));
+                }
+                UnitOrder::AttackGround { x, y } => {
+                    let reach = (u.max_range - SCALE).max(SCALE) as i128;
+                    if dist_sq(pos, (x, y)) <= reach * reach {
+                        return None;
+                    }
+                    return Some(((x, y), SCALE));
+                }
+                UnitOrder::Guard(gid) => {
+                    let Some(g) = self.unit(gid).filter(|g| g.alive && self.are_allies(army, g.army)) else {
+                        self.units.get_mut(&id).unwrap().orders.pop_front();
+                        continue;
+                    };
+                    let gp = (g.pos.x, g.pos.y);
+                    // Engage threats near the guarded unit (unless holding fire), else follow.
+                    if u.max_range > 0 && u.fire_state == FireState::FireAtWill {
+                        let threat = self.nearest_enemy_filtered(army, gp, u.max_range + ACQUIRE_BONUS, can_aa, can_surf);
+                        if let Some(e) = threat {
+                            if self.in_weapon_range(&self.units[&id], e) && u.domain != NavDomain::Air {
+                                return None;
+                            }
+                            let ep = self.unit(e).map(|t| (t.pos.x, t.pos.y)).unwrap();
+                            return Some((ep, SCALE));
+                        }
+                    }
+                    let near = (g.radius + u.radius + 5 * SCALE) as i128;
+                    if dist_sq(pos, gp) <= near * near {
+                        return None;
+                    }
+                    return Some((gp, 3 * SCALE));
                 }
                 UnitOrder::Dock(sid) => {
                     if !self.is_staging_of(sid, army) {
@@ -6304,13 +6442,25 @@ impl Skirmish {
             if !has_guns {
                 continue;
             }
+            // Phase 35: ground fire — shoot at the position (splash shells, direct shells into
+            // the ground, terrain-checked beams).
+            if let Some(UnitOrder::AttackGround { x, y }) = self.units[&id].orders.front().cloned() {
+                self.fire_at_ground(id, (x, y), &shield_ids);
+                continue;
+            }
+            let (fire_state, last_attacker) = {
+                let u = &self.units[&id];
+                (u.fire_state, u.last_hit_by_unit)
+            };
             let target = explicit
                 .filter(|t| self.in_weapon_range(&self.units[&id], *t))
-                .or_else(|| {
-                    target_map
-                        .get(&id)
-                        .copied()
-                        .filter(|t| self.unit(*t).is_some())
+                .or_else(|| match fire_state {
+                    FireState::FireAtWill => target_map.get(&id).copied().filter(|t| self.unit(*t).is_some()),
+                    FireState::ReturnFire => last_attacker.filter(|t| {
+                        self.unit(*t).is_some_and(|e| e.alive && e.targetable_by(army) && !self.are_allies(army, e.army))
+                            && self.in_weapon_range(&self.units[&id], *t)
+                    }),
+                    FireState::HoldFire => None,
                 });
             let tinfo = target.and_then(|t| {
                 self.unit(t).map(|u| {
@@ -6443,6 +6593,49 @@ impl Skirmish {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    /// Phase 35: every ready weapon of `id` in range of ground point `g` fires at it.
+    fn fire_at_ground(&mut self, id: UnitId, g: (i64, i64), shield_ids: &[UnitId]) {
+        let Some((army, pos, alt, height)) = self.units.get(&id).map(|u| (u.army, (u.pos.x, u.pos.y), u.altitude, u.height)) else {
+            return;
+        };
+        let _ = shield_ids;
+        let n = self.units[&id].weapons.len();
+        for wi in 0..n {
+            let w = self.units[&id].weapons[wi].clone();
+            if w.cooldown > 0 {
+                self.units.get_mut(&id).unwrap().weapons[wi].cooldown -= 1;
+                continue;
+            }
+            if !w.anti_surface || w.kamikaze || dist_sq(pos, g) > w.range_sq {
+                continue;
+            }
+            let tick = self.tick;
+            {
+                let me = self.units.get_mut(&id).unwrap();
+                me.weapons[wi].cooldown = w.reset;
+                me.weapons[wi].yaw = combat::atan2_mrad(g.0 - pos.0, g.1 - pos.1);
+                me.turret_yaw_mrad = me.weapons[wi].yaw;
+                me.last_shot = Some((0, tick));
+            }
+            self.shots_fired += 1;
+            let gz = self.terrain.height_at(g.0, g.1);
+            self.emit_event(SimEvent::WeaponFired {
+                from: (pos.0, pos.1, alt + SCALE),
+                to: (g.0, g.1, gz),
+                army,
+                heavy: w.splash_radius > 0,
+                anti_air: false,
+            });
+            if w.splash_radius > 0 {
+                let spd = if w.muzzle_velocity > 0 { w.muzzle_velocity } else { 14 * SCALE / TICK_HZ as i64 };
+                self.spawn_projectile_full(army, Vec2 { x: pos.0, y: pos.1 }, Vec2 { x: g.0, y: g.1 }, spd, w.damage, w.splash_radius, false, false, false, false);
+            } else if !w.beam {
+                let muzzle = (pos.0, pos.1, self.terrain.height_at(pos.0, pos.1) + alt + (height * 3 / 4).max(SCALE / 2));
+                self.spawn_direct_projectile(army, id, muzzle, (g.0, g.1, gz), w.muzzle_velocity.max(SCALE / 2), w.damage);
             }
         }
     }
@@ -7018,6 +7211,7 @@ impl Skirmish {
             m(&mut h, &u.drone_of.unwrap_or(0).to_le_bytes());
             m(&mut h, &u.pod_timer.to_le_bytes());
             m(&mut h, &u.stunned.to_le_bytes());
+            m(&mut h, &[u.fire_state.code(), u8::from(u.build_paused)]);
             m(&mut h, &(u.orders.len() as u32).to_le_bytes());
             m(&mut h, &(u.production.len() as u32).to_le_bytes());
             m(&mut h, &(u.path.len() as u32).to_le_bytes());
@@ -7954,6 +8148,76 @@ pub(crate) mod tests {
         assert_eq!(w.armies[0].mass - control.armies[0].mass, 20 * SCALE, "refunds the wall's mass cost");
         assert!(!w.is_wall_cell((100 * SCALE, 100 * SCALE)), "path grid re-opened");
         assert!(w.unit(eng).unwrap().orders.is_empty());
+    }
+
+    #[test]
+    fn fire_states_hold_return_and_fire_at_will() {
+        let setup = |a_state: FireState, b_state: FireState| {
+            let mut w = wall_world();
+            let a = w.spawn_unit(0, "RT", (100 * SCALE, 100 * SCALE)).unwrap();
+            let b = w.spawn_unit(1, "BT", (112 * SCALE, 100 * SCALE)).unwrap();
+            w.issue(0, Command::SetFireState { units: vec![a], state: a_state });
+            w.issue(1, Command::SetFireState { units: vec![b], state: b_state });
+            w.step();
+            (w, a, b)
+        };
+        let hurt = |w: &Skirmish, id: UnitId| w.unit(id).is_none_or(|u| u.hp < u.max_hp);
+        let (mut w, a, b) = setup(FireState::HoldFire, FireState::HoldFire);
+        w.run(30);
+        assert!(!hurt(&w, a) && !hurt(&w, b), "both holding fire");
+        let (mut w, a, b) = setup(FireState::ReturnFire, FireState::HoldFire);
+        w.run(30);
+        assert!(!hurt(&w, b), "return-fire waits to be shot at");
+        w.issue(1, Command::Attack { units: vec![b], target: a, queue: false });
+        w.run(30);
+        assert!(hurt(&w, a) && hurt(&w, b), "attacked, it shoots back");
+        let (mut w, _a, b) = setup(FireState::FireAtWill, FireState::HoldFire);
+        w.run(30);
+        assert!(hurt(&w, b), "fire at will engages on its own");
+    }
+
+    #[test]
+    fn ground_fire_hits_what_stands_at_the_point_even_when_holding_fire() {
+        let mut w = wall_world();
+        let arty = w.spawn_unit(0, "RA", (100 * SCALE, 100 * SCALE)).unwrap();
+        let target = w.spawn_unit(1, "BENG", (120 * SCALE, 100 * SCALE)).unwrap();
+        w.issue(0, Command::SetFireState { units: vec![arty], state: FireState::HoldFire });
+        w.run(10);
+        assert_eq!(w.shots_fired(), 0);
+        w.issue(0, Command::AttackGround { units: vec![arty], x: 120 * SCALE, y: 100 * SCALE, queue: false });
+        w.run(40);
+        assert!(w.shots_fired() >= 1, "ground fire shoots");
+        assert!(w.unit(target).is_none_or(|u| u.hp < u.max_hp), "the shell lands on the unit at the point");
+        assert!(matches!(w.unit(arty).unwrap().orders.front(), Some(UnitOrder::AttackGround { .. })), "ground fire persists");
+    }
+
+    #[test]
+    fn guards_follow_and_defend_and_paused_factories_stop() {
+        let mut w = wall_world();
+        let vip = w.spawn_unit(0, "RENG", (60 * SCALE, 60 * SCALE)).unwrap();
+        let guard = w.spawn_unit(0, "RT", (50 * SCALE, 60 * SCALE)).unwrap();
+        w.issue(0, Command::Guard { units: vec![guard], target: vip, queue: false });
+        w.issue(0, Command::Move { units: vec![vip], x: 140 * SCALE, y: 60 * SCALE, queue: false });
+        w.run(250);
+        let (g, v) = (w.unit(guard).unwrap().pos, w.unit(vip).unwrap().pos);
+        assert!(dist_sq((g.x, g.y), (v.x, v.y)) <= (12 * SCALE as i128).pow(2), "guard kept up ({g:?} vs {v:?})");
+        let raider = w.spawn_unit(1, "BENG", (v.x + 10 * SCALE, v.y)).unwrap();
+        w.run(60);
+        assert!(w.unit(raider).is_none_or(|u| u.hp < u.max_hp), "guard engaged the threat");
+
+        let mut w = wall_world();
+        let fac = w.spawn_unit(0, "RF", (100 * SCALE, 100 * SCALE)).unwrap();
+        w.catalog.types.get_mut("RT").unwrap().build_work = 2_000;
+        w.issue(0, Command::Produce { factory: fac, unit_type: "RT".into(), count: 1 });
+        w.run(20);
+        let p1 = w.unit(fac).unwrap().build.as_ref().unwrap().project.progress;
+        w.issue(0, Command::SetBuildPaused { units: vec![fac], paused: true });
+        w.run(30);
+        let p2 = w.unit(fac).unwrap().build.as_ref().unwrap().project.progress;
+        assert!(p2 <= p1 + 20, "paused factory makes no progress ({p1} -> {p2})");
+        w.issue(0, Command::SetBuildPaused { units: vec![fac], paused: false });
+        w.run(20);
+        assert!(w.unit(fac).unwrap().build.as_ref().is_none_or(|b| b.project.progress > p2), "resumes");
     }
 
     #[test]

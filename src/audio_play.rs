@@ -235,7 +235,9 @@ fn order_cue(cmd: &Command) -> &'static str {
         Command::Produce { .. } => UI_ORDER_PRODUCE,
         Command::Stop { .. } | Command::ToggleShield { .. } => UI_ORDER_STOP,
         Command::Load { .. } | Command::Unload { .. } | Command::Dock { .. } => UI_ORDER_MOVE,
-        Command::SetAutoRefuel { .. } => UI_ORDER_STOP,
+        Command::SetAutoRefuel { .. } | Command::SetFireState { .. } | Command::SetBuildPaused { .. } => UI_ORDER_STOP,
+        Command::AttackGround { .. } => UI_ORDER_ATTACK,
+        Command::Guard { .. } => UI_ORDER_MOVE,
         Command::Enhance { .. } => UI_ORDER_BUILD,
         Command::SetRepeat { .. } | Command::CancelProduce { .. } => UI_ORDER_PRODUCE,
     }
