@@ -78,6 +78,8 @@ pub struct ArmyDecl {
     pub control: Control,
     pub at: Option<Place>,
     pub no_acu: bool,
+    /// Phase 53: AI play style (`personality rush`).
+    pub personality: crate::skirmish_ai::Personality,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -564,11 +566,7 @@ impl Mission {
                         .ok_or_else(|| err("unknown victory condition".into()))?
                 }
                 "army" => {
-                    let index = t
-                        .get(1)
-                        .and_then(|i| i.parse::<usize>().ok())
-                        .filter(|i| *i < 8)
-                        .ok_or_else(|| err("army index 0..7".into()))?;
+                    let index = t.get(1).and_then(|i| i.parse::<usize>().ok()).filter(|i| *i < 8).ok_or_else(|| err("army index 0..7".into()))?;
                     let mut d = ArmyDecl {
                         index,
                         faction: "uef".into(),
@@ -576,6 +574,7 @@ impl Mission {
                         control: Control::Ai("normal".into()),
                         at: None,
                         no_acu: false,
+                        personality: crate::skirmish_ai::Personality::Balanced,
                     };
                     let mut i = 2;
                     while i < t.len() {
@@ -597,6 +596,10 @@ impl Mission {
                                 i += 1;
                             }
                             "human" => d.control = Control::Human,
+                            "personality" => {
+                                d.personality = crate::skirmish_ai::Personality::parse(t.get(i + 1).map(String::as_str).unwrap_or("")).map_err(err)?;
+                                i += 1;
+                            }
                             "ai" => {
                                 let v = t
                                     .get(i + 1)
@@ -897,18 +900,15 @@ pub fn build_world(
 
 /// AI-driven armies: `(army, difficulty)`; `human_as` also hands the human army to an AI
 /// (headless runs).
-pub fn ai_armies(
-    m: &Mission,
-    human_as: Option<&str>,
-) -> Result<Vec<(ArmyId, crate::skirmish_ai::Difficulty)>, String> {
+pub fn ai_armies(m: &Mission, human_as: Option<&str>) -> Result<Vec<crate::skirmish_ai::ScriptedAi>, String> {
     m.armies
         .iter()
         .filter_map(|d| match &d.control {
-            Control::Ai(diff) => Some((d.index, diff.as_str())),
-            Control::Human => human_as.map(|h| (d.index, h)),
+            Control::Ai(diff) => Some((d, diff.as_str())),
+            Control::Human => human_as.map(|h| (d, h)),
             Control::None => None,
         })
-        .map(|(i, diff)| Ok((i as ArmyId, diff.parse()?)))
+        .map(|(d, diff)| Ok(crate::skirmish_ai::ScriptedAi::with_personality(d.index as ArmyId, diff.parse()?, d.personality)))
         .collect()
 }
 
@@ -939,10 +939,7 @@ pub fn cmd_mission(args: &[String]) -> Result<(), String> {
     m.ensure_catalog_types(&mut catalog, &game_dir)?;
     let map = MapContext::load(&game_dir, &m.map)?;
     let mut w = build_world(&m, catalog, &map, seed)?;
-    let mut ais: Vec<crate::skirmish_ai::ScriptedAi> = ai_armies(&m, flag("--human-ai").as_deref())?
-        .into_iter()
-        .map(|(a, d)| crate::skirmish_ai::ScriptedAi::with_difficulty(a, d))
-        .collect();
+    let mut ais: Vec<crate::skirmish_ai::ScriptedAi> = ai_armies(&m, flag("--human-ai").as_deref())?;
     let mut rec = flag("--record").map(|_| {
         let mut r =
             crate::replay::ReplayRecorder::new(&map.map_id, seed, crate::savegame::setups_of(&w));

@@ -112,6 +112,9 @@ cargo run --release -- play SCMP_001 --mute               # F3 mute, F4/F5 volum
 cargo run --release -- view-unit URL0402 --anim walk --anim-time 0.7
 cargo run --release -- host 127.0.0.1:15000 SCMP_001 --players 2 --play   # + join 127.0.0.1:15000 --play
 cargo run --release -- host 127.0.0.1:15000 SCMP_001 --players 3 --headless-ticks 600
+cargo run --release -- host 127.0.0.1:15000 SCMP_001 --players 2 --observers 1 --play  # 3rd joiner spectates
+cargo run --release -- host 127.0.0.1:15000 SCMP_001 --players 2 --play --rejoin-grace 30  # dropped players may reconnect
+cargo run --release -- join 127.0.0.1:15000 --rejoin 1 --play        # reconnect as army 1 (or --rejoin observer)
 cargo run --release -- audio render-mix fa-unpack/audio/mix.wav SCMP_001 --from 7200 --ticks 1200
 ```
 
@@ -277,4 +280,55 @@ cargo run --release -- join 127.0.0.1:15000 --udp --netem loss=5,dup=2,reorder=3
 cargo run --release -- rendezvous 0.0.0.0:15050
 cargo run --release -- host --code --udp SCMP_001 --rendezvous 127.0.0.1:15050
 cargo run --release -- join --code XXXX-XXXX --udp --rendezvous 127.0.0.1:15050
+```
+
+## Step 42 — done: HDR, bloom, unit glow, AA & gamma
+
+- **HDR & Bloom Pipeline** (`src/viewer.rs`, `src/play.rs`, `src/perf_cmds.rs`, `src/map_author.rs`): Renders the 3D scene into `Rgba16Float`, runs a 5-mip Karis bright-pass + Jimenez downsample + additive tent upsample bloom chain scaled by `.scmap` `Bloom`, applies Narkowicz ACES filmic tonemapping with exposure from `.scmap` `LightingMultiplier` plus user gamma (`0.80..1.40`), and supports `off` / `fxaa` / `msaa4` anti-aliasing (auto-fallback to FXAA when `Rgba16Float` MSAA 4× is unsupported) before compositing the 2D HUD in LDR.
+- **Data-Driven Unit Glow** (`src/dds_decode.rs`, `src/scene.rs`, `src/play.rs`, `src/render_prep.rs`): Extracts `*_SpecTeam.dds` specular (`G`) and glow (`B`) masks into a linear `Rg8Unorm` texture so glowing visors, cores, and vents bloom alongside additive VFX and shield hits.
+- **Graphics Settings** (`src/settings.rs`, `src/menu.rs`, `src/loc.rs`): `bloom=on|off`, `aa=off|fxaa|msaa4`, and `gamma=0.80..1.40` in `settings.ini` + Options (lock-free atomic cache; `FARUST_BLOOM` / `FARUST_AA` / `FARUST_GAMMA` overrides). Render-only: sim hashes unchanged.
+
+```sh
+cargo run --release -- play SCMP_001 --snapshot fa-unpack/renders/hdr_battle.png --snapshot-ticks 7200
+FARUST_BLOOM=off cargo run --release -- play SCMP_001 --snapshot fa-unpack/renders/hdr_nobloom.png --snapshot-ticks 7200
+FARUST_AA=fxaa cargo run --release -- bench-render SCMP_001 --units 4096,8192 --frames 30 --no-sim
+cargo run --release -- view-unit UAL0001 --snapshot fa-unpack/renders/ual0001_glow.png
+```
+
+## Step 47 — done: replay vault, bookmarks & sharing
+
+- **Replay Vault Index & Thumbnails** (`src/vault.rs`, `src/menu.rs`, `src/main.rs`):
+  incremental `index.farust-idx` cache (metadata, winner, mods/mission, rules-version
+  compatibility badge, `160×160` map+start-spot PNG thumbnails) with free-text and
+  qualifier search (`map:`, `player:`, `faction:`, `winner:`, `from:`, `to:`).
+- **Event Bookmarks** (`src/vault.rs`, `src/controls.rs`, `src/hud.rs`, `src/play.rs`):
+  headless re-sim detects ACU deaths, experimental completions, nuke launches, and major
+  kill bursts; replay timeline displays colored bookmark markers, `<BM`/`BM>` navigation,
+  and jumps both time and camera to the event.
+- **Rendezvous Replay Sharing** (`src/rendezvous.rs`):
+  backward-compatible v1 upload/download endpoints (8 MiB per-replay cap, total storage
+  quota, `FARPL1` parse validation, content-hash `XXXX-XXXX` share codes) integrated into
+  both the CLI and the Replays menu screen.
+
+```sh
+cargo run --release -- replay index --search "map:SCMP_009 winner:uef"
+cargo run --release -- rendezvous 0.0.0.0:15050 --replay-dir /path/to/replays
+cargo run --release -- replay upload match.farust-replay --rendezvous 127.0.0.1:15050
+cargo run --release -- replay download XXXX-XXXX --rendezvous 127.0.0.1:15050
+cargo run --release -- menu --screen replays
+```
+
+## Step 51 — done: mod manager & lobby mod sync
+
+- **Mod manager** (main menu → MODS, `src/menu.rs`, `src/mods.rs`): enable/disable mods
+  (persisted in `settings.ini`), blueprint/load conflict detection.
+- **Automatic mod transfer** (`src/net.rs`): peers missing a host mod receive it as a
+  hash-verified bundle into the per-user cache before the match starts.
+- **Data-driven weapons/abilities**: see `examples/mods/heavy_strikers`.
+
+```sh
+cargo run --release -- mods enable examples/mods/heavy_strikers
+cargo run --release -- mods conflicts
+cargo run --release -- host 127.0.0.1:15000 SCMP_001 --players 2 --mod examples/mods/heavy_strikers
+FARUST_MODS_DIR=/tmp/empty-mods cargo run --release -- join 127.0.0.1:15000   # receives the mod
 ```

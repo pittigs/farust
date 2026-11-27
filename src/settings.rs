@@ -61,6 +61,57 @@ impl ShadowQuality {
     }
 }
 
+/// Phase 42 anti-aliasing mode (`off`, `fxaa`, `msaa4`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AaMode {
+    Off,
+    Fxaa,
+    #[default]
+    Msaa4,
+}
+
+impl AaMode {
+    pub const ALL: [AaMode; 3] = [Self::Off, Self::Fxaa, Self::Msaa4];
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Fxaa => "fxaa",
+            Self::Msaa4 => "msaa4",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::Fxaa => "FXAA",
+            Self::Msaa4 => "MSAA 4x",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "off" | "none" | "0" => Some(Self::Off),
+            "fxaa" => Some(Self::Fxaa),
+            "msaa4" | "msaa" | "msaa4x" | "4x" => Some(Self::Msaa4),
+            _ => None,
+        }
+    }
+
+    /// MSAA sample count for the 3D HDR scene target (`4` for `Msaa4`, `1` otherwise).
+    pub fn sample_count(self) -> u32 {
+        match self {
+            Self::Msaa4 => 4,
+            Self::Off | Self::Fxaa => 1,
+        }
+    }
+}
+
+/// Gamma bounds in hundredths (`80..=140` => `0.80..=1.40`, default `100` => `1.00`).
+pub const GAMMA_MIN_X100: u16 = 80;
+pub const GAMMA_MAX_X100: u16 = 140;
+pub const GAMMA_DEFAULT_X100: u16 = 100;
+
 /// Front-end & in-match HUD visual theme (`modern` = default FARust gunmetal/cyan,
 /// `classic` = old-school Forged Alliance bottom console + faction skins).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -126,6 +177,12 @@ pub struct Settings {
     pub colorblind: bool,
     pub mouse_swap: bool,
     pub subtitles: bool,
+    /// Phase 42 HDR post-processing: bloom, anti-aliasing (`off|fxaa|msaa4`), gamma (`80..=140` => `0.80..=1.40`).
+    pub bloom: bool,
+    pub aa: AaMode,
+    pub gamma_x100: u16,
+    /// Phase 51: persisted enabled blueprint mods (`mods=uid1,uid2`).
+    pub mods: Vec<String>,
     /// Phase 23: remappable key bindings (`key.<action>=Ctrl+Shift+K`).
     pub keys: crate::keymap::KeyMap,
 }
@@ -151,6 +208,10 @@ impl Default for Settings {
             colorblind: false,
             mouse_swap: false,
             subtitles: true,
+            bloom: true,
+            aa: AaMode::Msaa4,
+            gamma_x100: GAMMA_DEFAULT_X100,
+            mods: Vec::new(),
             keys: crate::keymap::KeyMap::default(),
         }
     }
@@ -158,11 +219,14 @@ impl Default for Settings {
 
 /// Every key written to / understood in `settings.ini`, in file order (followed by one
 /// `key.<action>` line per bindable action, see [`crate::keymap`]).
-pub const KEYS: [&str; 18] = [
+pub const KEYS: [&str; 22] = [
     "resolution",
     "fullscreen",
     "vsync",
     "shadow_quality",
+    "bloom",
+    "aa",
+    "gamma",
     "master_volume",
     "music_volume",
     "sfx_volume",
@@ -177,6 +241,7 @@ pub const KEYS: [&str; 18] = [
     "colorblind",
     "mouse_swap",
     "subtitles",
+    "mods",
 ];
 
 fn parse_bool(v: &str) -> Result<bool, String> {
@@ -185,6 +250,22 @@ fn parse_bool(v: &str) -> Result<bool, String> {
         "0" | "false" | "no" | "off" => Ok(false),
         other => Err(format!("'{other}' is not a boolean (true/false)")),
     }
+}
+
+pub fn parse_gamma_x100(v: &str) -> Result<u16, String> {
+    let f: f32 = v
+        .trim()
+        .parse()
+        .map_err(|_| format!("'{}' is not a gamma number 0.8..1.4", v.trim()))?;
+    if !f.is_finite() || !(0.8..=1.4).contains(&f) {
+        return Err(format!("{f} is out of gamma range 0.8..1.4"));
+    }
+    Ok((f * 100.0).round().clamp(GAMMA_MIN_X100 as f32, GAMMA_MAX_X100 as f32) as u16)
+}
+
+pub fn format_gamma_x100(g: u16) -> String {
+    let clamped = g.clamp(GAMMA_MIN_X100, GAMMA_MAX_X100);
+    format!("{:.2}", clamped as f32 / 100.0)
 }
 
 fn parse_percent(v: &str) -> Result<u8, String> {
@@ -257,6 +338,24 @@ pub fn validate_language(v: &str) -> Result<String, String> {
     Ok(norm)
 }
 
+/// Parses a comma-separated mod spec list (`mods=uid1,uid2`), deduplicating case-insensitively.
+pub fn parse_mod_list(v: &str) -> Result<Vec<String>, String> {
+    let mut out: Vec<String> = Vec::new();
+    for raw in v.split(',') {
+        let item = raw.trim();
+        if item.is_empty() {
+            continue;
+        }
+        if item.bytes().any(|b| b < 0x20 || b == 0x7f || b == b'=') {
+            return Err(format!("invalid mod entry '{item}'"));
+        }
+        if !out.iter().any(|x| x.eq_ignore_ascii_case(item)) {
+            out.push(item.to_string());
+        }
+    }
+    Ok(out)
+}
+
 impl Settings {
     /// Applies one `key=value` pair; returns an error (and leaves the field unchanged)
     /// for unknown keys or invalid values.
@@ -290,6 +389,13 @@ impl Settings {
             "colorblind" => self.colorblind = parse_bool(v)?,
             "mouse_swap" => self.mouse_swap = parse_bool(v)?,
             "subtitles" => self.subtitles = parse_bool(v)?,
+            "bloom" => self.bloom = parse_bool(v)?,
+            "aa" => {
+                self.aa =
+                    AaMode::parse(v).ok_or_else(|| format!("'{v}' is not off/fxaa/msaa4"))?
+            }
+            "gamma" => self.gamma_x100 = parse_gamma_x100(v)?,
+            "mods" => self.mods = parse_mod_list(v)?,
             other => match other.strip_prefix("key.") {
                 Some(id) => self.keys.set_from_setting(id, v)?,
                 None => return Err(format!("unknown key '{other}'")),
@@ -320,6 +426,10 @@ impl Settings {
             "colorblind" => b(self.colorblind),
             "mouse_swap" => b(self.mouse_swap),
             "subtitles" => b(self.subtitles),
+            "bloom" => if self.bloom { "on" } else { "off" }.to_string(),
+            "aa" => self.aa.key().to_string(),
+            "gamma" => format_gamma_x100(self.gamma_x100),
+            "mods" => self.mods.join(","),
             other => {
                 let id = other.strip_prefix("key.")?;
                 let action = crate::keymap::action_by_id(id)?;
@@ -438,11 +548,74 @@ pub fn set_active(s: Option<Settings>) {
         *g = s;
     }
     ACCESS_FLAGS.store(0, std::sync::atomic::Ordering::Relaxed);
+    RENDER_POST_CACHE.store(0, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Phase 39: cached accessibility flags (bit 0 = known, 1 = colour-blind, 2 = mouse swap,
 /// 3 = subtitles). Read per unit per frame, so never clone the settings on the hot path.
 static ACCESS_FLAGS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Phase 42: cached HDR post-processing settings (bit 0 = known, bit 1 = bloom,
+/// bits 2..=3 = AaMode, bits 8..=15 = gamma_x100). Read per frame without locking/cloning.
+static RENDER_POST_CACHE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+fn render_post_packed() -> u32 {
+    use std::sync::atomic::Ordering::Relaxed;
+    let p = RENDER_POST_CACHE.load(Relaxed);
+    if p & 1 != 0 {
+        return p;
+    }
+    let s = input_settings();
+    let bloom = std::env::var("FARUST_BLOOM")
+        .ok()
+        .and_then(|v| parse_bool(&v).ok())
+        .unwrap_or(s.bloom);
+    let aa = std::env::var("FARUST_AA")
+        .ok()
+        .and_then(|v| AaMode::parse(&v))
+        .unwrap_or(s.aa);
+    let gamma_x100 = std::env::var("FARUST_GAMMA")
+        .ok()
+        .and_then(|v| parse_gamma_x100(&v).ok())
+        .unwrap_or(s.gamma_x100)
+        .clamp(GAMMA_MIN_X100, GAMMA_MAX_X100);
+    let aa_bits: u32 = match aa {
+        AaMode::Off => 0,
+        AaMode::Fxaa => 1,
+        AaMode::Msaa4 => 2,
+    };
+    let packed = 1 | (u32::from(bloom) << 1) | (aa_bits << 2) | (u32::from(gamma_x100) << 8);
+    RENDER_POST_CACHE.store(packed, Relaxed);
+    packed
+}
+
+/// Phase 42: lock-free cached `(bloom_enabled, aa_mode, gamma)` for the renderer hot path.
+pub fn render_post() -> (bool, AaMode, f32) {
+    let p = render_post_packed();
+    let bloom = (p & 2) != 0;
+    let aa = match (p >> 2) & 3 {
+        0 => AaMode::Off,
+        1 => AaMode::Fxaa,
+        _ => AaMode::Msaa4,
+    };
+    let gamma = ((p >> 8) & 0xFF).clamp(u32::from(GAMMA_MIN_X100), u32::from(GAMMA_MAX_X100)) as f32 / 100.0;
+    (bloom, aa, gamma)
+}
+
+#[allow(dead_code)]
+pub fn bloom_enabled() -> bool {
+    render_post().0
+}
+
+#[allow(dead_code)]
+pub fn aa_mode() -> AaMode {
+    render_post().1
+}
+
+#[allow(dead_code)]
+pub fn gamma() -> f32 {
+    render_post().2
+}
 
 fn access_flags() -> u8 {
     use std::sync::atomic::Ordering::Relaxed;
@@ -585,6 +758,10 @@ mod tests {
             colorblind: true,
             mouse_swap: true,
             subtitles: false,
+            bloom: false,
+            aa: AaMode::Fxaa,
+            gamma_x100: 125,
+            mods: vec!["heavy-tanks-001".into(), "extra-units".into()],
             keys: {
                 let mut k = crate::keymap::KeyMap::default();
                 k.set_from_setting("build_factory", "Ctrl+Shift+K").unwrap();
@@ -717,5 +894,46 @@ mod tests {
         assert_eq!(validate_language("en_US").as_deref(), Ok("us"));
         assert_eq!(validate_language("de-DE").as_deref(), Ok("de"));
         assert_eq!(validate_language("fr").as_deref(), Ok("fr"));
+    }
+
+    #[test]
+    fn phase42_hdr_post_settings_round_trip_and_cache() {
+        assert_eq!(AaMode::parse("OFF"), Some(AaMode::Off));
+        assert_eq!(AaMode::parse("fxaa"), Some(AaMode::Fxaa));
+        assert_eq!(AaMode::parse("MSAA4"), Some(AaMode::Msaa4));
+        assert_eq!(AaMode::parse("taa"), None);
+        assert_eq!(AaMode::Off.sample_count(), 1);
+        assert_eq!(AaMode::Fxaa.sample_count(), 1);
+        assert_eq!(AaMode::Msaa4.sample_count(), 4);
+
+        assert_eq!(parse_gamma_x100("0.8"), Ok(80));
+        assert_eq!(parse_gamma_x100("1.00"), Ok(100));
+        assert_eq!(parse_gamma_x100("1.4"), Ok(140));
+        assert!(parse_gamma_x100("0.79").is_err());
+        assert!(parse_gamma_x100("1.41").is_err());
+        assert!(parse_gamma_x100("nan").is_err());
+
+        let (s, w) = Settings::parse("bloom=off\naa=fxaa\ngamma=1.15\n");
+        assert!(w.is_empty(), "{w:?}");
+        assert!(!s.bloom);
+        assert_eq!(s.aa, AaMode::Fxaa);
+        assert_eq!(s.gamma_x100, 115);
+        assert_eq!(s.get("bloom").as_deref(), Some("off"));
+        assert_eq!(s.get("aa").as_deref(), Some("fxaa"));
+        assert_eq!(s.get("gamma").as_deref(), Some("1.15"));
+
+        let (bad, bw) = Settings::parse("bloom=maybe\naa=ssaa\ngamma=2.5\n");
+        assert_eq!(bw.len(), 3, "{bw:?}");
+        assert!(bad.bloom);
+        assert_eq!(bad.aa, AaMode::Msaa4);
+        assert_eq!(bad.gamma_x100, GAMMA_DEFAULT_X100);
+
+        let prev = active();
+        set_active(Some(s));
+        let (bl, aa, gam) = render_post();
+        assert!(!bl);
+        assert_eq!(aa, AaMode::Fxaa);
+        assert!((gam - 1.15).abs() < 1e-5);
+        set_active(prev);
     }
 }

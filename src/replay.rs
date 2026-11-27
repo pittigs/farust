@@ -379,6 +379,12 @@ pub(crate) fn encode_command(out: &mut Vec<u8>, cmd: &Command) {
             write_ids(out, units);
             out.push(u8::from(*paused));
         }
+        Command::Ping { kind, x, y } => {
+            out.push(29);
+            out.push(*kind);
+            out.extend_from_slice(&x.to_le_bytes());
+            out.extend_from_slice(&y.to_le_bytes());
+        }
         Command::MoveWaypoint { units, index, x, y } => {
             out.push(27);
             write_ids(out, units);
@@ -540,6 +546,7 @@ pub(crate) fn decode_command(data: &[u8], pos: &mut usize) -> Result<Command, St
             units: read_ids(data, pos)?,
             paused: read_u8(data, pos)? != 0,
         }),
+        29 => Ok(Command::Ping { kind: read_u8(data, pos)?, x: read_i64(data, pos)?, y: read_i64(data, pos)? }),
         27 => Ok(Command::MoveWaypoint {
             units: read_ids(data, pos)?,
             index: read_u32(data, pos)?,
@@ -876,6 +883,7 @@ mod tests {
             Command::SetBuildPaused { units: vec![8], paused: true },
             Command::MoveWaypoint { units: vec![1, 9], index: 2, x: 777, y: -3 },
             Command::Ferry { transports: vec![30], from: (1_000, 2_000), to: (-5, 90_000), queue: true },
+            Command::Ping { kind: 2, x: 4_000, y: -7 },
         ];
         let mut buf = Vec::new();
         for c in &all {

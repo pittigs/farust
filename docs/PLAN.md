@@ -439,10 +439,20 @@ bumps `SIM_VERSION`, re-baselines golden hashes deliberately, and keeps
   fuzzing); sim hashes unchanged (`sim-run` `35db8f2bd7a6faf2`, `skirmish SCMP_001`
   `192e89b083b978cb`). Done.
 
-### Phase 38 — Observer & caster tools (planned)
-- Live spectator slots in the lobby, observer HUD (all-army economy, army
-  value graph, APM), follow-unit camera, picture-in-picture minimap.
-- Exit: a 2-player match with 1 live observer completes without desync.
+### Phase 38 — Observer & caster tools (done: live observers + observer HUD)
+- `host … --players N --observers K` (K ≤ 8): after the N players the host accepts K more
+  peers as live observers (army ids from `net::OBSERVER_ARMY_BASE` = 200). They receive
+  every lockstep turn and hash-check like players, but their (empty) command slots are
+  ignored by the sim, so they cannot influence the match. `join … --play` as an observer
+  spectates with fog off and no local AIs. Handshake wire format unchanged.
+- Observer HUD (any spectate session — live observer, `play --spectate`, replays): a
+  top-right panel listing every army's mass/energy income, unit count, army value (mass
+  cost of living mobile units, commander excluded) and APM over a rolling minute
+  (`Skirmish::apm`, a presentation-only command log that is never hashed).
+- Exit met: `host --players 2 --observers 1` with a player and an observer joined: all
+  three peers end on hash `4f868f25ff409113`, identical to the same match with no observer
+  (`live_observer_follows_a_2_player_match_without_desync_or_influence` covers it in tests).
+- Not done: army-value graph over time, follow-unit camera, picture-in-picture minimap.
 
 ### Phase 39 — Onboarding & accessibility (done)
 - Tutorial: `missions/tutorial.farust-mission` (built into the binary, main menu → TUTORIAL)
@@ -493,10 +503,29 @@ bumps `SIM_VERSION`, re-baselines golden hashes deliberately, and keeps
   Bisecting the frame time also found and fixed a Phase 39 regression (per-unit settings
   clone: 21.6 ms → 7.4 ms). Done.
 
-### Phase 42 — HDR, bloom & glow (planned)
-- HDR render target, FA-like tonemap and bloom from `.scmap` lighting values,
-  emissive/glow maps on units, MSAA/FXAA option, gamma setting.
-- Exit: `bench-render` at 8k units keeps frame p50 within +15% of Phase 25.
+### Phase 42 — HDR, bloom & glow (done)
+- `Rgba16Float` HDR 3-D scene target (`src/viewer.rs`, `src/play.rs`, `src/perf_cmds.rs`,
+  `src/map_author.rs`) with a 5-level half-res bright-pass (Karis anti-firefly + soft knee) →
+  Jimenez 13-tap downsample → additive 3×3 tent upsample bloom mip chain driven by `.scmap`
+  `Bloom` (skipped when off or 0), Narkowicz ACES filmic tonemap with exposure from `.scmap`
+  `LightingMultiplier`, relative gamma (`0.8..1.4`), optional FXAA 3.11 or MSAA 4× (auto-falls
+  back to FXAA if `Rgba16Float` 4× MSAA is unsupported), and LDR 2-D HUD composited on top
+  after tonemapping/AA.
+- Data-driven unit glow & specular maps (`SpecGlowMap` in `src/dds_decode.rs`, `src/scene.rs`,
+  `src/play.rs`, `src/render_prep.rs`): extracts FA's `*_SpecTeam.dds` `G` (specular) and `B`
+  (emissive/glow mask per `effects/mesh.fx`) into a linear `Rg8Unorm` texture for units
+  (both `view-unit` and instanced LOD0/LOD1 skirmish meshes; disabled on wrecks) so glowing
+  visors/cores/vents and additive VFX/shield hits bloom naturally.
+- Settings & Options UI (`src/settings.rs`, `src/menu.rs`, `src/loc.rs`): `bloom=on|off`,
+  `aa=off|fxaa|msaa4`, `gamma=0.80..1.40` (plus `FARUST_BLOOM` / `FARUST_AA` / `FARUST_GAMMA`
+  overrides) backed by a lock-free `AtomicU32` cache (`settings::render_post`) so per-frame
+  reads never clone `Settings`. Render-only.
+- Exit: 331/331 tests pass (incl. tonemap/gamma curve, bloom mip chain, AA fallback, settings
+  round-trip & atomic cache); determinism hashes unchanged (`sim-run --ticks 10000`
+  `35db8f2bd7a6faf2`, `skirmish SCMP_001` `0fe934990406d829`); `bench-render --no-sim` at
+  8,192 units: frame p50 `8.00 ms` MSAA4 / `7.97 ms` FXAA (`gpu` `1.93 ms` / `1.66 ms`,
+  `gpu.post_pass` `0.077–0.097 ms`, within +15% of baseline); battle, `UEL0001`/`UAL0001`,
+  `view-map`, and Options snapshots verified visually with bloom on/off and FXAA. Done.
 
 ### Phase 43 — Announcer, ambience & adaptive music (done)
 - Recursive SoundBank/WaveBank scan & direct `"Bank#Index"` wave playback
@@ -559,11 +588,30 @@ bumps `SIM_VERSION`, re-baselines golden hashes deliberately, and keeps
 - Not done: menu lobby (`net_lobby.rs`) still runs its pre-game handshake over TCP; symmetric-NAT
   port prediction (falls back to TCP relay).
 
-### Phase 45 — Reconnect & late join (planned)
-- Rejoin after a drop: savegame snapshot transfer + catch-up re-sim, AI
-  hands control back, observers can join a live match.
-- Exit: killing and restarting one peer mid-match ends on the same final
-  hash as an uninterrupted run.
+### Phase 45 — Reconnect & late join (done, direct TCP hosts)
+- Direct TCP hosts keep listening for the whole match (protocol v17). A peer that connects
+  with `MSG_REJOIN` receives the handshake (`join_turn`) plus every turn bundle so far and
+  re-simulates them (the "snapshot" is the deterministic turn history; every re-simulated
+  turn is still hash-verified against the recorded hashes, including its own old ones).
+  Packets before `join_turn` are produced but never sent, so a headless peer's local AI
+  rebuilds exactly the state it had.
+- `host --rejoin-grace SECS` (default 20 s with `--play`, 0 headless, max 30 s): when a
+  player drops, the host holds the turn for it to reconnect; if it does, the match goes on
+  as if nothing happened. After the grace the AI takes over as before (Phase 21).
+- Late return after the takeover: the host announces `NetControl::Rejoined { army, turn }`
+  `input_delay + 1` turns ahead; every peer hands the army back from the AI at that turn.
+- `join ADDR --rejoin ARMY|observer`: reconnect as a player, or join a running match as a
+  new live observer. `join --play --rejoin` re-simulates at full speed before the window
+  opens (`NetHandle::start_rejoined`). Live observers keep the observer HUD.
+- Exit met: `host 127.0.0.1:15612 SCMP_001 --players 2 --headless-ticks 24000 --rejoin-grace 20`,
+  client killed with `kill -9` at turn 2032, restarted with `join … --rejoin 1`: both peers
+  end at tick 12272 on `1c15072179b37e4e`, identical to the uninterrupted run. A late
+  `--rejoin observer` (turn 2353) ends on the same hash. Tests:
+  `killed_peer_rejoins_within_grace_and_ends_on_the_uninterrupted_hash`,
+  `late_rejoin_takes_control_back_from_the_ai_and_a_late_observer_follows`.
+- Limits: invite-code / UDP / menu-lobby hosts do not accept rejoins yet; the host's
+  recording of a rejoined interactive client starts at the rejoin turn; the interactive
+  rejoin path is covered by the shared `catch_up` logic but was not exercised in a window.
 
 ### Phase 46 — Steamworks lobby & friend invites (planned, blocked)
 - Formerly the Phase 28 candidate. Needs a dedicated Steam Direct App ID;
@@ -572,10 +620,33 @@ bumps `SIM_VERSION`, re-baselines golden hashes deliberately, and keeps
   `steam` cargo feature so the default build stays dependency-light.
 - Exit: a friend invite from the Steam overlay lands in the FARust lobby.
 
-### Phase 47 — Replay vault & sharing (planned)
-- Replay index with metadata, thumbnails and search, optional upload to and
-  download from the rendezvous server, event bookmarks (kills, experimentals).
-- Exit: a replay uploaded by one client plays back verified on another.
+### Phase 47 — Replay vault & sharing (done)
+- Replay vault index (`src/vault.rs`, `index.farust-idx` `FARVX1` v1 alongside recorded
+  replays, override with `--vault` / `FARUST_VAULT_DIR`): caches map id/name, date,
+  duration, armies (names/factions/teams), winner, sim `RULES_VERSION` (flags older
+  replays as "needs older build"), mods, mission title, size, share code, and
+  `160×160` PNG thumbnails (`thumbs/*.png`, `.scmap` preview + start spots + winner
+  ring) with incremental `(mtime, size)` rebuilds and free-text / qualifier search
+  (`map:`, `player:`, `faction:`, `winner:`, `from:`, `to:`).
+- Event bookmarks (`BookmarkKind`: `ACU` deaths, `EXP` completions, `NUKE` launches,
+  top `CLASH` kill bursts with tick + world position) collected via headless re-sim
+  during indexing without changing the `FARPL1` replay format; shown on the replay
+  timeline with clickable pips, hover labels, `<BM`/`BM>` buttons, and camera jump
+  (`src/controls.rs`, `src/hud.rs`, `src/play.rs`).
+- Sharing (`src/rendezvous.rs`, backward-compatible v1 messages `19..=22`): server-side
+  replay upload/download capped at 8 MiB per replay and configurable total quota (default
+  256 MiB), validated with `FARPL1` magic + `Replay::from_bytes`, content-hash
+  deduplicated into unambiguous `XXXX-XXXX` codes stored strictly inside the configured
+  storage dir; CLI `farust replay <index|upload|download>` (`src/main.rs`) and upgraded
+  Replays vault screen with search, thumbnails, clickable bookmarks, and Share /
+  Download-by-code (`src/menu.rs`).
+- Exit: 344/344 release tests pass (index round-trip, incremental sync, search filters,
+  headless ACU-death/winner extraction, bookmark seek, menu vault UI, and loopback
+  upload/download + invalid/oversized/quota rejection); `SCMP_009` replay recorded →
+  uploaded (`5K4B-DK6D`) → downloaded into a second vault (`FARUST_VAULT_DIR`) →
+  `replay verify` verified (`74eb2ae300b25619`); `menu --screen replays --snapshot`
+  renders real map thumbnails and bookmarks; determinism unchanged (`sim-run`
+  `35db8f2bd7a6faf2`, `skirmish SCMP_001` `0fe934990406d829`). Done.
 
 ### Arc E — Content & authoring (48–51)
 
@@ -628,11 +699,30 @@ bumps `SIM_VERSION`, re-baselines golden hashes deliberately, and keeps
   272/272 tests pass; golden hashes unchanged (`sim-run` `35db8f2bd7a6faf2`,
   `skirmish SCMP_001` `192e89b083b978cb`). Done.
 
-### Phase 51 — Mod manager & lobby mod sync (planned)
-- In-game mod manager (enable/disable, conflicts), automatic mod transfer
-  between lobby peers with hash verification, mod-defined weapons/abilities
-  as data.
-- Exit: a client missing the host's mod receives it and the match starts.
+### Phase 51 — Mod manager & lobby mod sync (done)
+- Mod manager (main menu → MODS; `farust mods [enable SPEC | disable SPEC | conflicts]`):
+  discovered mods with name/uid/version/author/description/blueprint count, enable/disable
+  persisted as `mods=` in `settings.ini`, conflicts shown (two enabled mods overriding the
+  same blueprint, or a mod that fails to load).
+- Lobby/handshake mod sync (protocol v16, now v17 together with Phase 45): the handshake
+  carries the host's mod identities; a peer missing one requests it, the host streams a
+  `FARMD1` bundle in 512 KiB chunks (≤ 32 MiB / 4096 files per mod, relative paths only,
+  no `..`), the client verifies the content hash against the host identity before
+  installing it into the per-user cache (`$FARUST_MODS_CACHE_DIR`, else
+  `$FARUST_MODS_DIR/.downloaded`, else `~/.cache/farust/mods`, never the game install) and
+  activates it for the match. A hash mismatch aborts with an error. Works for direct,
+  invite-code, UDP and menu-lobby hosts.
+- Mod weapons/abilities as data: blueprint overrides of damage, range, rate of fire,
+  muzzle velocity, splash, EMP stun, shields and intel flow into the catalog; example mod
+  `examples/mods/heavy_strikers` (UEF Striker override).
+- Exit met: `host … --mod examples/mods/heavy_strikers` with a client whose mods dir is
+  empty → client logs `synced 1 mod(s) from host: Heavy Strikers v1 … #ce017db6d0b58146`,
+  both peers end 6000 ticks on `9d122458cf26b109` (without the mod: `0b0fd8b5080e4fc7`).
+  Tests: `loopback_mod_sync_transfers_mod_and_matches_sim_hash`, bundle path safety,
+  hash-mismatch rejection, settings persistence, conflict detection,
+  `mod_weapon_and_ability_override_changes_sim_outcome`.
+- Built by an Antigravity delegate that ran out of quota mid-way; finished here (duplicate
+  menu block removed, test fixtures fixed, merged with Phase 45 → protocol v17).
 
 ### Arc F — AI III (52–53)
 
@@ -656,22 +746,47 @@ bumps `SIM_VERSION`, re-baselines golden hashes deliberately, and keeps
 - Tried and rejected (no gain or worse): earlier tech thresholds, earlier extractor
   upgrades, harder commitment (100 / 220 %), capping land factories on island maps.
 
-### Phase 53 — AI personalities & co-op commands (planned)
-- Personalities (turtle, rush, air, tech), allied AI that responds to pings
-  ("attack here", "send engineers"), difficulty-scaled cheats as an option.
-- Exit: pinged requests are acted on within 30 s in co-op matches.
+### Phase 53 — AI personalities & co-op commands (done)
+- Pings are sim commands (`Command::Ping`, replay tag 29, rules v10, protocol v15) as
+  well as chat lines, so every lockstep peer's allied AI sees the same pings. AIs that
+  coordinate with their team answer the newest ally ping within 30 s: attack → push the
+  army there, alert → defend there, move → lend two engineers that assist the ally's
+  nearest builder (released after 2 min).
+- Personalities over any difficulty (`--personality rush,turtle` per army on `skirmish` /
+  `play`, `personality X` on mission `army` lines): rush (early waves, no tech), turtle
+  (extra point defenses / shields, home guard, attacks only at 170 %), air (air
+  factories scale with income), tech (tech push, experimentals from 45 mass/s).
+- Exit: a 2v1 test where the human pings and the allied AI's army closes in on an attack
+  ping, lends two engineers on a move ping and gathers at an alert ping, all within 300
+  ticks (339/339 tests). Default skirmish hash unchanged. Done.
+- Not done: difficulty-scaled resource cheats (need a per-army replay-header option),
+  personalities in `ai-arena` matchups.
 
 ### Arc G — Scale, platforms & release (54–57)
 
-### Phase 54 — Parallel sim II, 10k units (planned)
-- Deterministic parallel phases for projectiles, damage application and
-  economy via per-thread buffers merged in canonical order.
-- Exit: `bench-scale --units 10000` ≥ 60 ticks/s with exact `1t == Nt` hash.
+### Phase 54 — Sim throughput at 10k units (done)
+- Per-unit economy cached on the unit (`eco` = mass/energy per tick, storage; refreshed on
+  upgrade) so income and storage caps are one catalog-free pass; shields only visit
+  shielded units; construction skips plain mobile units with nothing to build. All pure
+  optimisations: every hash is unchanged.
+- Exit: `bench-scale SCMP_001 --units 10000 --ticks 100 --threads 16`: 67 ticks/s
+  (60 before) with exact `1t == 16t` (`15575a588a785eda`); construction 1.68 → 0.75 ms,
+  economy 1.26 → 0.47 ms per tick. 2,048 units: 179 / 338 ticks/s (was 170 / 305). Done.
+- Next candidates (not done): parallel weapon fire decisions (they do not depend on
+  same-tick damage, so a parallel decide + ordered apply is exact; 2.9 ms at 10k units),
+  flow-field reuse across goals (4.3 ms).
 
-### Phase 55 — GPU-driven rendering (planned)
-- Compute-shader culling + LOD selection, indirect draws, GPU instance
-  buffers updated incrementally.
-- Exit: 10k units at ≥ 60 fps at strategic zoom on the reference machine.
+### Phase 55 — 10k-unit rendering (done, without GPU-driven culling)
+- Measured first: with Phase 42's HDR pipeline, 10,000 units render at frame p50 9.4 ms
+  (≈ 106 fps; GPU 2.0 ms, CPU prep 6.3 ms) at the bench camera, so the 60 fps target holds
+  without moving culling to compute shaders.
+- Fixed the real stutter: new projectiles found their shooter (for the shell / missile
+  look) by scanning every unit; shells now carry their shooter id (artillery included —
+  not hashed, no rules change), cutting `render.begin.proj` from 3.47 to 0.42 ms average
+  and the worst prep frame from 110 ms to 10 ms at 10k units.
+- Exit: `bench-render SCMP_001 --units 10000 --frames 30 --no-sim`: frame p50 9.37 ms,
+  p95 9.94 ms. Done for the target; compute-shader culling / indirect draws (the original
+  plan) are not implemented — CPU instance preparation (≈ 6 ms) is the next lever.
 
 ### Phase 56 — Windows & macOS ports (planned)
 - Native audio output (WASAPI / CoreAudio) behind the existing silent

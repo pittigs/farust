@@ -495,8 +495,9 @@ pub const LOF_CLEARANCE: i64 = SCALE / 4;
 /// 3 = Phase 30 air fuel & staging; 4 = Phase 31 engineering stations & pod drones;
 /// 5 = Phase 32 mobile factories, mobile staging & hatching eggs; 6 = Phase 33 Novax
 /// satellite, EMP stun, death explosions & kamikaze weapons; 7 = Phase 34 prop reclaim;
-/// 8 = Phase 35 fire states, ground fire, guard & build pause; 9 = Phase 36 ferries.
-pub const RULES_VERSION: u32 = 9;
+/// 8 = Phase 35 fire states, ground fire, guard & build pause; 9 = Phase 36 ferries;
+/// 10 = Phase 53 pings as sim commands (allied AIs react).
+pub const RULES_VERSION: u32 = 10;
 
 /// Phase 29: milliradians per degree, scaled by 1000 (17.453 mrad / deg).
 const MRAD_PER_DEG_MILLI: i64 = 17_453;
@@ -1680,7 +1681,8 @@ impl Catalog {
     /// apply the process-wide enabled mods ([`mods::active`]) and add the Phase 24
     /// data-driven roster.
     pub fn load(game_dir: &Path) -> Result<Self, String> {
-        Self::load_with_mods(game_dir, mods::active()?)
+        let active = mods::active()?;
+        Self::load_with_mods(game_dir, &active)
     }
 
     /// Every `*_unit.bp` in `units.scd`, keyed by upper-case blueprint id.
@@ -1974,6 +1976,8 @@ pub enum Command {
     MoveWaypoint { units: Vec<UnitId>, index: u32, x: i64, y: i64 },
     /// Phase 36: set up a ferry route for air transports.
     Ferry { transports: Vec<UnitId>, from: (i64, i64), to: (i64, i64), queue: bool },
+    /// Phase 53: map ping for allies (0 alert / 1 move / 2 attack); allied AIs react.
+    Ping { kind: u8, x: i64, y: i64 },
     /// Phase 18: `transports` fly to `(x, y)` and drop their cargo.
     Unload { transports: Vec<UnitId>, x: i64, y: i64, queue: bool },
     /// Phase 18: install ACU/SCU enhancement `name` (blueprint `Enhancements` key).
@@ -2132,6 +2136,9 @@ pub struct Unit {
     pub fire_state: FireState,
     /// Phase 35: construction / production paused.
     pub build_paused: bool,
+    /// Phase 54: cached type economy `[mass/tick, energy/tick, mass storage, energy
+    /// storage]` (refreshed on upgrade) so per-tick passes avoid catalog lookups.
+    eco: [i64; 4],
 }
 
 impl Unit {
@@ -2495,6 +2502,8 @@ pub struct Skirmish {
     props_gone: Vec<(u32, u32)>,
     /// Phase 48: running mission script (triggers evaluated after every tick's cleanup).
     mission: Option<Box<crate::mission::MissionRuntime>>,
+    /// Phase 53: recent map pings `(tick, army, kind, position)`, oldest first (≤ 32).
+    pings: VecDeque<(u64, ArmyId, u8, (i64, i64))>,
     flow_cache: FlowFieldCache,
     spatial: Arc<SpatialGrid>,
     spatial_snap: Arc<Vec<UnitSpatialSnap>>,
@@ -2514,10 +2523,16 @@ pub struct Skirmish {
     paths_solved: u64,
     commands_applied: u64,
     commands_rejected: u64,
+    /// Phase 38: (tick, army) of recently applied commands, for the observer APM readout.
+    /// Presentation only: never hashed, trimmed to the last [`APM_WINDOW_TICKS`].
+    apm_log: VecDeque<(u64, ArmyId)>,
     result: Option<GameResult>,
     /// Phase 18 game options (victory condition, unit cap).
     options: GameOptions,
 }
+
+/// Phase 38: rolling window of the observer APM readout (one minute).
+pub const APM_WINDOW_TICKS: u64 = 60 * TICK_HZ;
 
 /// Integer square root (floor) for non-negative `i128`.
 pub fn isqrt(v: i128) -> i64 {
@@ -2577,6 +2592,7 @@ impl Skirmish {
             props: BTreeMap::new(),
             props_gone: Vec::new(),
             mission: None,
+            pings: VecDeque::new(),
             flow_cache: FlowFieldCache::new(),
             spatial,
             spatial_snap: Arc::new(Vec::new()),
@@ -2595,6 +2611,7 @@ impl Skirmish {
             paths_solved: 0,
             commands_applied: 0,
             commands_rejected: 0,
+            apm_log: VecDeque::new(),
             result: None,
             options: GameOptions::default(),
         };
@@ -2707,6 +2724,11 @@ impl Skirmish {
         self.set_domain_grids(map.naval_grid.clone(), map.amphib_grid.clone(), map.hydro_points.clone());
         self.set_terrain(HeightField::from_scmap(&map.scmap));
         self.set_props(map.props.clone());
+    }
+
+    /// Phase 53: recent map pings `(tick, army, kind, position)`, oldest first.
+    pub fn pings(&self) -> impl Iterator<Item = &(u64, ArmyId, u8, (i64, i64))> {
+        self.pings.iter()
     }
 
     /// Phase 48: runs `mission` in this world from now on.
@@ -3136,6 +3158,33 @@ impl Skirmish {
     pub fn commands_rejected(&self) -> u64 {
         self.commands_rejected
     }
+
+    /// Phase 38: actions per minute of `army` over the last [`APM_WINDOW_TICKS`] (or the
+    /// elapsed game time if shorter). Counts accepted commands only.
+    pub fn apm(&self, army: ArmyId) -> u32 {
+        let cutoff = self.tick.saturating_sub(APM_WINDOW_TICKS);
+        let n = self.apm_log.iter().filter(|&&(t, a)| a == army && t >= cutoff).count() as u64;
+        let window = self.tick.clamp(TICK_HZ * 10, APM_WINDOW_TICKS);
+        (n * 60 * TICK_HZ / window) as u32
+    }
+
+    /// Phase 38: live observer summary of one army: (mobile unit count, structure count,
+    /// army value = summed mass cost of living mobile non-commander units, in whole mass).
+    pub fn army_summary(&self, army: ArmyId) -> (u32, u32, i64) {
+        let (mut mobile, mut structs, mut value) = (0u32, 0u32, 0i64);
+        for u in self.units.values().filter(|u| u.alive && u.army == army) {
+            if u.role.is_structure() {
+                structs += 1;
+            } else {
+                mobile += 1;
+                // The commander is priceless (and would swamp the comparison): not counted.
+                if u.role != Role::Commander {
+                    value += self.catalog.get(&u.type_id).map_or(0, |t| t.cost_mass);
+                }
+            }
+        }
+        (mobile, structs, value / SCALE)
+    }
     pub fn result(&self) -> Option<GameResult> {
         self.result
     }
@@ -3527,6 +3576,11 @@ impl Skirmish {
             && self.apply_command(army, cmd);
         if ok {
             self.commands_applied += 1;
+            self.apm_log.push_back((self.tick, army));
+            let cutoff = self.tick.saturating_sub(APM_WINDOW_TICKS);
+            while self.apm_log.front().is_some_and(|&(t, _)| t < cutoff) {
+                self.apm_log.pop_front();
+            }
         } else {
             self.commands_rejected += 1;
         }
@@ -4077,6 +4131,17 @@ impl Skirmish {
                 }
                 !v.is_empty()
             }
+            Command::Ping { kind, x, y } => {
+                if kind > 2 {
+                    return false;
+                }
+                let p = self.clamp_to_map(x, y);
+                if self.pings.len() >= 32 {
+                    self.pings.pop_front();
+                }
+                self.pings.push_back((self.tick, army, kind, p));
+                true
+            }
             Command::MoveWaypoint { units, index, x, y } => {
                 let p = self.clamp_to_map(x, y);
                 let mut any = false;
@@ -4310,6 +4375,7 @@ impl Skirmish {
                 untargetable: t.ext.untargetable,
                 fire_state: FireState::FireAtWill,
                 build_paused: false,
+                eco: [t.mass_per_tick, t.energy_per_tick, t.storage_mass, t.storage_energy],
             },
         );
         // Phase 31: a finished engineering station comes with its pod drones.
@@ -4466,10 +4532,8 @@ impl Skirmish {
     fn recompute_caps(&mut self) {
         let mut caps = vec![(0i64, 0i64); self.armies.len()];
         for u in self.units.values().filter(|u| u.alive) {
-            if let Some(t) = self.catalog.get(&u.type_id) {
-                caps[u.army as usize].0 += t.storage_mass;
-                caps[u.army as usize].1 += t.storage_energy;
-            }
+            caps[u.army as usize].0 += u.eco[2];
+            caps[u.army as usize].1 += u.eco[3];
         }
         for (a, (m, e)) in self.armies.iter_mut().zip(caps) {
             a.mass_cap = m;
@@ -4566,17 +4630,25 @@ impl Skirmish {
     }
 
     fn step_income(&mut self) {
-        self.recompute_caps();
+        // Storage caps and income in one pass over the cached per-unit economy.
+        let mut caps = vec![(0i64, 0i64); self.armies.len()];
         let mut income = vec![(0i64, 0i64); self.armies.len()];
         for u in self.units.values().filter(|u| u.alive) {
-            if let Some(t) = self.catalog.get(&u.type_id) {
+            let a = u.army as usize;
+            caps[a].0 += u.eco[2];
+            caps[a].1 += u.eco[3];
+            if u.eco[0] != 0 || u.eco[1] != 0 {
                 let mult = 100 + u.adjacency_bonus_pct;
-                income[u.army as usize].0 += t.mass_per_tick * mult / 100;
-                income[u.army as usize].1 += t.energy_per_tick * mult / 100;
+                income[a].0 += u.eco[0] * mult / 100;
+                income[a].1 += u.eco[1] * mult / 100;
             }
             // Phase 18: Resource Allocation enhancements.
-            income[u.army as usize].0 += u.enh.mass_per_tick;
-            income[u.army as usize].1 += u.enh.energy_per_tick;
+            income[a].0 += u.enh.mass_per_tick;
+            income[a].1 += u.enh.energy_per_tick;
+        }
+        for (a, (m, e)) in self.armies.iter_mut().zip(caps) {
+            a.mass_cap = m;
+            a.energy_cap = e;
         }
         let mut overflow = vec![(0i64, 0i64); self.armies.len()];
         for (i, (a, (m, e))) in self.armies.iter_mut().zip(income).enumerate() {
@@ -4632,7 +4704,7 @@ impl Skirmish {
     }
 
     fn step_shields(&mut self) {
-        let ids: Vec<UnitId> = self.units.keys().copied().collect();
+        let ids: Vec<UnitId> = self.units.values().filter(|u| u.shield_max_hp > 0).map(|u| u.id).collect();
         for id in ids {
             let (army, max_sh, upkeep, regen, on, cur_sh, cd) = match self.units.get(&id) {
                 Some(u) if u.alive && u.shield_max_hp > 0 => (
@@ -4803,6 +4875,7 @@ impl Skirmish {
         }
         u.max_range = new_t.max_range();
         u.height = new_t.size[1].max(SCALE / 4);
+        u.eco = [new_t.mass_per_tick, new_t.energy_per_tick, new_t.storage_mass, new_t.storage_energy];
         if new_t.role.is_structure() {
             self.walls_dirty = true;
         }
@@ -5035,6 +5108,18 @@ impl Skirmish {
         }
 
         for id in ids {
+            // Phase 54: plain mobile units with nothing to build skip the whole pass.
+            if self.units.get(&id).is_some_and(|u| {
+                u.role == Role::Mobile
+                    && u.build.is_none()
+                    && u.production.is_empty()
+                    && !matches!(
+                        u.orders.front(),
+                        Some(UnitOrder::Build { .. } | UnitOrder::Repair(_) | UnitOrder::Assist(_) | UnitOrder::Reclaim { .. } | UnitOrder::Upgrade(_) | UnitOrder::Enhance(_))
+                    )
+            }) {
+                continue;
+            }
             let (alive, role, army, pos, radius, rate, head, adj, silocnt, type_id) =
                 match self.units.get(&id) {
                     Some(u) => (
@@ -6789,11 +6874,13 @@ impl Skirmish {
                             false,
                             t_air,
                         );
-                        if let Some((ticks, radius)) = stun
-                            && let Some(p) = self.projectiles.get_mut(&(self.next_projectile_id - 1))
-                        {
-                            p.stun_ticks = ticks;
-                            p.stun_radius = radius;
+                        if let Some(p) = self.projectiles.get_mut(&(self.next_projectile_id - 1)) {
+                            // Phase 55: renderers resolve the shell look from its shooter.
+                            p.shooter = id;
+                            if let Some((ticks, radius)) = stun {
+                                p.stun_ticks = ticks;
+                                p.stun_radius = radius;
+                            }
                         }
                     } else if t_air {
                         // Anti-air stays hitscan (FA AA is homing / flak).
@@ -8442,6 +8529,37 @@ pub(crate) mod tests {
         assert_eq!(left, 1, "the far rock still stands");
         assert_eq!(gone, vec![(1, 2), (3, 4)], "reclaimed props reported in order for the renderer");
         assert_eq!(run(true).4, h1, "prop reclaim is deterministic");
+    }
+
+    #[test]
+    fn observer_apm_and_army_summary_track_commands_without_touching_the_hash() {
+        let mut a = test_world(7);
+        let mut b = test_world(7);
+        let army = a.armies()[0].id;
+        let unit = a.units().find(|u| u.army == army && !u.role.is_structure()).map(|u| u.id).unwrap();
+        for k in 0..30 {
+            a.apply_command_direct(army, Command::Move { units: vec![unit], x: (100 + k) * SCALE, y: 100 * SCALE, queue: false });
+            b.apply_command_direct(army, Command::Move { units: vec![unit], x: (100 + k) * SCALE, y: 100 * SCALE, queue: false });
+            a.step();
+            b.step();
+        }
+        assert_eq!(a.state_hash(), b.state_hash());
+        // 30 commands in 30 ticks: the window floor is 10 s, so 30 actions over 10 s -> 180 APM.
+        assert_eq!(a.apm(army), 180);
+        assert_eq!(a.apm(army + 1), 0);
+        let (mobile, _s, value) = a.army_summary(army);
+        let expect: i64 = a
+            .units()
+            .filter(|u| u.alive && u.army == army && !u.role.is_structure() && u.role != Role::Commander)
+            .map(|u| a.catalog().get(&u.type_id).unwrap().cost_mass)
+            .sum();
+        assert!(mobile >= 1);
+        assert_eq!(value, expect / SCALE, "army value excludes the commander");
+        // Old entries age out of the one-minute window.
+        for _ in 0..(APM_WINDOW_TICKS + 5) {
+            a.step();
+        }
+        assert_eq!(a.apm(army), 0);
     }
 
     #[test]

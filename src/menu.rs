@@ -1,7 +1,6 @@
 //! Phase 20 front-end shell: Main Menu, Skirmish, Multiplayer (Host/Join/Lobby), Replays,
 //! and Options on a single `winit` event loop that hands over cleanly to `play::PlayApp`.
 
-use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::{Duration, Instant};
@@ -27,6 +26,7 @@ use crate::ui_kit::{
     Align, Canvas, ClassicPalette, Fonts, Frame, ImageStore, Rect, WState, WindowGpu, body, bold, render_png,
     theme, title,
 };
+use crate::vault::{self, Bookmark, VaultEntry, VaultIndex, VaultQuery};
 
 const UNIT_CAPS: [u32; 6] = [250, 500, 1000, 1500, 2000, 0];
 
@@ -42,6 +42,8 @@ pub enum ScreenId {
     Multiplayer,
     MpLobby,
     Replays,
+    /// Phase 51: In-game mod manager (enable/disable, conflicts).
+    Mods,
     Options,
     /// Phase 23: Options -> Keys (key remapping).
     Keys,
@@ -57,10 +59,11 @@ impl FromStr for ScreenId {
             "multiplayer" | "mp" => Ok(ScreenId::Multiplayer),
             "mp-host" | "mp-lobby" | "mplobby" | "host" => Ok(ScreenId::MpLobby),
             "replays" | "replay" => Ok(ScreenId::Replays),
+            "mods" | "mod" | "mod-manager" => Ok(ScreenId::Mods),
             "options" | "settings" => Ok(ScreenId::Options),
             "keys" | "keybinds" | "keybindings" | "controls" => Ok(ScreenId::Keys),
             other => Err(format!(
-                "unknown menu screen '{other}' (main, skirmish, multiplayer, mp-lobby, replays, options, keys)"
+                "unknown menu screen '{other}' (main, skirmish, multiplayer, mp-lobby, replays, mods, options, keys)"
             )),
         }
     }
@@ -130,8 +133,18 @@ pub fn run(game_dir: &Path, opts: MenuOptions) -> Result<(), String> {
 #[derive(Debug, Clone)]
 struct ReplayItem {
     path: PathBuf,
-    name: String,
-    replay: Replay,
+    thumb_key: String,
+    entry: VaultEntry,
+}
+
+#[derive(Debug, Clone)]
+struct ModListItem {
+    spec: String,
+    loaded: Option<crate::mods::Mod>,
+    error: Option<String>,
+    dir: Option<PathBuf>,
+    blueprint_ids: Vec<String>,
+    enabled: bool,
 }
 
 enum MpSession {
@@ -149,6 +162,8 @@ enum FocusField {
     MpChat,
     OptPlayerName,
     OptLastHost,
+    ReplaySearch,
+    ReplayDownloadCode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -194,12 +209,25 @@ enum Action {
     SelectReplay(usize),
     VerifyReplay,
     WatchReplay,
+    WatchReplayBookmark(usize),
     RefreshReplays,
+    ClearReplaySearch,
+    ShareReplay,
+    DownloadReplay,
+    // Phase 51 Mod Manager
+    SelectMod(usize),
+    ToggleMod(usize),
+    ToggleSelectedMod,
+    DisableAllMods,
+    RefreshMods,
     // Options
     CycleResolution,
     ToggleFullscreen,
     ToggleVsync,
     CycleShadow,
+    ToggleBloom,
+    CycleAa,
+    SliderGamma(u16),
     CycleUiTheme,
     CycleLanguage,
     SliderMaster(u8),
@@ -228,9 +256,18 @@ struct MenuState {
     lobby: Option<LobbyState>,
     ai_difficulty: Difficulty,
     game_options: GameOptions,
+    vault_dir: PathBuf,
+    vault_index: VaultIndex,
     replays: Vec<ReplayItem>,
+    replay_search: String,
+    replay_download_code: String,
     replay_selected: usize,
     replay_scroll: usize,
+    /// Phase 51 Mod Manager screen state.
+    mods_items: Vec<ModListItem>,
+    mods_conflicts: Vec<crate::mods::ModConflict>,
+    mods_selected: usize,
+    mods_scroll: usize,
     /// Phase 23 Keys screen: action being rebound (`add` = keep existing chords).
     keys_capture: Option<(crate::keymap::Action, bool)>,
     keys_scroll: usize,
@@ -294,7 +331,7 @@ impl MenuState {
             )
         });
         let map_count = lobby.as_ref().map(|l| l.maps.len()).unwrap_or(0);
-        let replays = scan_replays();
+        let vault_dir = vault::default_vault_dir();
         let rendezvous = settings::effective_rendezvous(Some(&settings));
 
         let mut st = Self {
@@ -307,9 +344,17 @@ impl MenuState {
             lobby,
             ai_difficulty: Difficulty::Normal,
             game_options: GameOptions::default(),
-            replays,
+            vault_dir,
+            vault_index: VaultIndex::default(),
+            replays: Vec::new(),
+            replay_search: String::new(),
+            replay_download_code: String::new(),
             replay_selected: 0,
             replay_scroll: 0,
+            mods_items: Vec::new(),
+            mods_conflicts: Vec::new(),
+            mods_selected: 0,
+            mods_scroll: 0,
             keys_capture: None,
             keys_scroll: 0,
             shift_held: false,
@@ -326,6 +371,11 @@ impl MenuState {
             status_err: false,
             map_count,
         };
+        #[cfg(not(test))]
+        {
+            st.refresh_replays(opts.screen == ScreenId::Replays);
+            st.refresh_mods();
+        }
         st.ensure_lobby_preview_image();
         if let Some(ref target) = opts.connect_lobby {
             st.mp_join_addr = target.clone();
@@ -459,6 +509,230 @@ impl MenuState {
         self.focus = FocusField::None;
     }
 
+    fn refresh_replays(&mut self, full_index: bool) {
+        let game_opt = self.game_dir.is_dir().then_some(self.game_dir.as_path());
+        self.vault_index = VaultIndex::load_or_empty(&self.vault_dir);
+        let _ = self.vault_index.sync(
+            &self.vault_dir,
+            game_opt,
+            vault::SyncOptions {
+                run_sim: full_index,
+                generate_thumbs: full_index,
+                force_rebuild: false,
+            },
+        );
+        self.apply_replay_filter();
+        if full_index {
+            self.ensure_replay_thumbnails();
+        }
+    }
+
+    fn apply_replay_filter(&mut self) {
+        let q = VaultQuery::parse(&self.replay_search);
+        let selected_name = self
+            .replays
+            .get(self.replay_selected)
+            .map(|r| r.entry.file_name.clone());
+        self.replays = self
+            .vault_index
+            .search(&q)
+            .into_iter()
+            .map(|e| ReplayItem {
+                path: e.path_in(&self.vault_dir),
+                thumb_key: format!("rthumb:{:016x}", e.content_hash),
+                entry: e.clone(),
+            })
+            .collect();
+        if let Some(name) = selected_name
+            && let Some(pos) = self.replays.iter().position(|r| r.entry.file_name == name)
+        {
+            self.replay_selected = pos;
+        } else if self.replay_selected >= self.replays.len() {
+            self.replay_selected = 0;
+        }
+        let max_scroll = self.replays.len().saturating_sub(1);
+        self.replay_scroll = self.replay_scroll.min(max_scroll);
+    }
+
+    fn ensure_replay_thumbnails(&mut self) {
+        let game_opt = self.game_dir.is_dir().then_some(self.game_dir.as_path());
+        for it in &self.replays {
+            if self.images.contains(&it.thumb_key) {
+                continue;
+            }
+            let loaded = it
+                .entry
+                .thumb_path_in(&self.vault_dir)
+                .and_then(|p| vault::load_rgba_png(&p).ok());
+            let img = loaded.unwrap_or_else(|| {
+                vault::render_thumbnail(
+                    game_opt,
+                    &it.entry.map_id,
+                    &it.entry.setups(),
+                    it.entry.winner.as_ref().and_then(|w| w.army_id()),
+                    None,
+                )
+            });
+            self.images.insert(&it.thumb_key, img);
+        }
+    }
+
+    fn refresh_mods(&mut self) {
+        let enabled_specs: Vec<String> = self.settings.mods.clone();
+        let mut items: Vec<ModListItem> = Vec::new();
+        let mut matched_specs: Vec<bool> = vec![false; enabled_specs.len()];
+
+        for (dir, res) in crate::mods::discover() {
+            let folder = dir
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| dir.display().to_string());
+            match res {
+                Ok(m) => {
+                    let mut is_enabled = false;
+                    for (si, sp) in enabled_specs.iter().enumerate() {
+                        if sp.eq_ignore_ascii_case(&m.uid)
+                            || sp.eq_ignore_ascii_case(&m.name)
+                            || sp.eq_ignore_ascii_case(&folder)
+                            || Path::new(sp) == dir.as_path()
+                        {
+                            is_enabled = true;
+                            matched_specs[si] = true;
+                        }
+                    }
+                    let (bp_ids, bp_err) = match m.blueprints() {
+                        Ok(bps) => (bps.into_iter().map(|(id, _)| id).collect(), None),
+                        Err(e) => (Vec::new(), Some(e)),
+                    };
+                    let spec = crate::mods::canonical_spec_for(&m, &m.uid);
+                    items.push(ModListItem {
+                        spec,
+                        loaded: Some(m),
+                        error: bp_err,
+                        dir: Some(dir),
+                        blueprint_ids: bp_ids,
+                        enabled: is_enabled,
+                    });
+                }
+                Err(e) => {
+                    let mut is_enabled = false;
+                    for (si, sp) in enabled_specs.iter().enumerate() {
+                        if sp.eq_ignore_ascii_case(&folder) || Path::new(sp) == dir.as_path() {
+                            is_enabled = true;
+                            matched_specs[si] = true;
+                        }
+                    }
+                    items.push(ModListItem {
+                        spec: folder,
+                        loaded: None,
+                        error: Some(e),
+                        dir: Some(dir),
+                        blueprint_ids: Vec::new(),
+                        enabled: is_enabled,
+                    });
+                }
+            }
+        }
+
+        // Also include any enabled specs outside mods_dir (external dirs or missing mods).
+        for (si, sp) in enabled_specs.iter().enumerate() {
+            if matched_specs[si] {
+                continue;
+            }
+            match crate::mods::resolve(sp) {
+                Ok(m) => {
+                    let (bp_ids, bp_err) = match m.blueprints() {
+                        Ok(bps) => (bps.into_iter().map(|(id, _)| id).collect(), None),
+                        Err(e) => (Vec::new(), Some(e)),
+                    };
+                    let dir = m.dir.clone();
+                    items.push(ModListItem {
+                        spec: sp.clone(),
+                        loaded: Some(m),
+                        error: bp_err,
+                        dir,
+                        blueprint_ids: bp_ids,
+                        enabled: true,
+                    });
+                }
+                Err(e) => {
+                    items.push(ModListItem {
+                        spec: sp.clone(),
+                        loaded: None,
+                        error: Some(e),
+                        dir: None,
+                        blueprint_ids: Vec::new(),
+                        enabled: true,
+                    });
+                }
+            }
+        }
+
+        self.mods_items = items;
+        if self.mods_selected >= self.mods_items.len() {
+            self.mods_selected = 0;
+        }
+        self.mods_scroll = self.mods_scroll.min(self.mods_items.len().saturating_sub(1));
+        self.recompute_mod_conflicts();
+    }
+
+    fn recompute_mod_conflicts(&mut self) {
+        let mut conflicts = Vec::new();
+        let mut enabled_loaded = Vec::new();
+        for it in &self.mods_items {
+            if !it.enabled {
+                continue;
+            }
+            if let Some(ref e) = it.error {
+                let label = it
+                    .loaded
+                    .as_ref()
+                    .map(|m| m.name.clone())
+                    .unwrap_or_else(|| it.spec.clone());
+                conflicts.push(crate::mods::ModConflict::LoadError { spec: label, error: e.clone() });
+            } else if let Some(ref m) = it.loaded {
+                enabled_loaded.push(m.clone());
+            }
+        }
+        conflicts.extend(crate::mods::detect_conflicts(&enabled_loaded));
+        self.mods_conflicts = conflicts;
+    }
+
+    fn persist_mods_selection(&mut self) {
+        let specs: Vec<String> = self
+            .mods_items
+            .iter()
+            .filter(|it| it.enabled)
+            .map(|it| it.spec.clone())
+            .collect();
+        self.settings.mods = specs.clone();
+        self.draft.mods = specs.clone();
+        #[cfg(not(test))]
+        {
+            if let Some(p) = settings::settings_path() {
+                if let Err(e) = self.settings.save_to(&p) {
+                    self.set_status(format!("Failed to save settings.ini: {e}"), true);
+                    return;
+                }
+            }
+            settings::set_active(Some(self.settings.clone()));
+            crate::mods::set_runtime_enabled(specs);
+        }
+        self.recompute_mod_conflicts();
+        let enabled_n = self.settings.mods.len();
+        if self.mods_conflicts.is_empty() {
+            self.set_status(format!("{enabled_n} mod(s) enabled (saved to settings.ini)"), false);
+        } else {
+            self.set_status(
+                format!(
+                    "{enabled_n} mod(s) enabled - {} CONFLICT(S) DETECTED",
+                    self.mods_conflicts.len()
+                ),
+                true,
+            );
+        }
+    }
+
     fn navigate(&mut self, to: ScreenId) {
         self.focus = FocusField::None;
         let from = self.screen;
@@ -480,11 +754,34 @@ impl MenuState {
                 self.set_status("Click a binding and press a key (Shift+click adds an alternative)", false);
             }
             ScreenId::Replays => {
-                self.replays = scan_replays();
-                if self.replay_selected >= self.replays.len() {
-                    self.replay_selected = 0;
+                #[cfg(not(test))]
+                self.refresh_replays(true);
+                #[cfg(test)]
+                self.apply_replay_filter();
+                self.set_status(
+                    format!(
+                        "{} replay(s) in vault ({})",
+                        self.replays.len(),
+                        self.vault_dir.display()
+                    ),
+                    false,
+                );
+            }
+            ScreenId::Mods => {
+                #[cfg(not(test))]
+                self.refresh_mods();
+                #[cfg(test)]
+                self.recompute_mod_conflicts();
+                let en = self.mods_items.iter().filter(|m| m.enabled).count();
+                let cf = self.mods_conflicts.len();
+                if cf > 0 {
+                    self.set_status(format!("{en} enabled mod(s) - {cf} conflict(s) detected"), true);
+                } else {
+                    self.set_status(
+                        format!("{} mod(s) discovered ({en} enabled) in {}", self.mods_items.len(), crate::mods::mods_dir().display()),
+                        false,
+                    );
                 }
-                self.set_status(format!("{} replay file(s) found", self.replays.len()), false);
             }
             ScreenId::Skirmish => {
                 if let Some(ref mut lob) = self.lobby {
@@ -537,6 +834,7 @@ impl MenuState {
             ScreenId::Multiplayer => self.draw_mp_hub(c),
             ScreenId::MpLobby => self.draw_mp_lobby(c),
             ScreenId::Replays => self.draw_replays(c),
+            ScreenId::Mods => self.draw_mods(c),
             ScreenId::Options => self.draw_options(c),
             ScreenId::Keys => self.draw_keys(c),
         }
@@ -549,6 +847,7 @@ impl MenuState {
             ScreenId::Multiplayer => self.mp_hub_widgets(w, h),
             ScreenId::MpLobby => self.mp_lobby_widgets(w, h),
             ScreenId::Replays => self.replay_widgets(w, h),
+            ScreenId::Mods => self.mods_widgets(w, h),
             ScreenId::Options => self.options_widgets(w, h),
             ScreenId::Keys => self.keys_widgets(w, h),
         }
@@ -559,15 +858,16 @@ impl MenuState {
     fn main_widgets(&self, w: f32, h: f32) -> Vec<(Rect, Action)> {
         let bx = (w * 0.08).max(48.0);
         let bw = 280.0;
-        let bh = 42.0;
-        let gap = 10.0;
-        let by0 = (h * 0.30).max(186.0);
+        let bh = 40.0;
+        let gap = 8.0;
+        let by0 = (h * 0.30).max(185.0);
         let items = [
             ("CAMPAIGN", Action::StartCampaign),
             ("SKIRMISH", Action::Go(ScreenId::Skirmish)),
             ("TUTORIAL", Action::StartTutorial),
             ("MULTIPLAYER", Action::Go(ScreenId::Multiplayer)),
             ("REPLAYS", Action::Go(ScreenId::Replays)),
+            ("MODS", Action::Go(ScreenId::Mods)),
             ("OPTIONS", Action::Go(ScreenId::Options)),
             ("QUIT TO DESKTOP", Action::Quit),
         ];
@@ -591,7 +891,9 @@ impl MenuState {
 
         let lang = self.preview_lang();
         let tr = |k: &str, fb: &str| crate::loc::tr_lang(&lang, k, fb);
-        let nav_box = Rect::new(bx - 16.0, (h * 0.30).max(186.0) - 18.0, 312.0, 390.0);
+        let by0 = (h * 0.30).max(185.0);
+        // Phase 49/51: eight entries of 40 px + 8 px gaps, plus 18 px padding top and bottom.
+        let nav_box = Rect::new(bx - 16.0, by0 - 18.0, 312.0, 8.0 * 48.0 - 8.0 + 36.0);
         c.panel(nav_box);
         let labels = [
             tr("ui.campaign", "CAMPAIGN"),
@@ -599,6 +901,7 @@ impl MenuState {
             tr("ui.tutorial", "TUTORIAL"),
             tr("ui.multiplayer", "MULTIPLAYER"),
             tr("ui.replays", "REPLAYS"),
+            tr("ui.mods", "MODS"),
             tr("ui.options", "OPTIONS"),
             tr("ui.quit_desktop", "QUIT TO DESKTOP"),
         ];
@@ -617,12 +920,18 @@ impl MenuState {
             let rp = Rect::new(rx, nav_box.y, 380.0, nav_box.h);
             let inner = c.titled_panel(rp, &tr("ui.profile", "COMMANDER PROFILE"));
             let mut y = inner.y + 4.0;
+            let mods_lbl = if self.settings.mods.is_empty() {
+                "Stock FA".to_string()
+            } else {
+                format!("{} enabled", self.settings.mods.len())
+            };
             for (k, v) in [
                 ("Commander", self.settings.player_name.clone()),
                 ("Faction", faction_label(self.settings.default_faction)),
                 ("Resolution", format!("{}x{}", self.settings.resolution.0, self.settings.resolution.1)),
                 ("Installed Maps", self.map_count.to_string()),
                 ("Local Replays", self.replays.len().to_string()),
+                ("Active Mods", mods_lbl),
                 ("Audio Volume", format!("{}%", self.settings.master_volume)),
             ] {
                 c.text(inner.x, y, bold(14.0), k, theme::DIM);
@@ -726,7 +1035,7 @@ impl MenuState {
 
     fn draw_mp_hub(&self, c: &mut Canvas) {
         let f = Frame::new(c.w, c.h);
-        c.chrome(&f, "MULTIPLAYER", "TCP Deterministic Lockstep (v4) - Direct + Invite Code Relay");
+        c.chrome(&f, "MULTIPLAYER", "TCP Deterministic Lockstep (v16) - Direct + Invite Code Relay + Auto Mod Sync");
         let cnt = f.content;
         let col_w = ((cnt.w - 28.0) * 0.5).min(540.0);
         let left_x = cnt.x + (cnt.w - (col_w * 2.0 + 28.0)) * 0.5;
@@ -864,6 +1173,20 @@ impl MenuState {
                 max_map_w,
             );
             c.text(cnt.x + 14.0, cnt.y + 12.0, bold(16.0), &hdr_txt, theme::GOLD);
+            let mods_line = if st.mods.is_empty() {
+                "MODS: Stock FA".to_string()
+            } else {
+                let names: Vec<String> = st.mods.iter().map(|m| format!("{} v{}", m.name, m.version)).collect();
+                format!("MODS (auto-sync): {}", names.join(", "))
+            };
+            let mods_fit = c.fonts.fit(body(12.5), &mods_line, left_w - 28.0);
+            c.text(
+                cnt.x + 14.0,
+                cnt.bottom() - 24.0,
+                body(12.5),
+                &mods_fit,
+                if st.mods.is_empty() { theme::DIM } else { theme::ACCENT },
+            );
             c.text(cnt.x + 14.0, cnt.y + 88.0, bold(13.0), "SLOTS & PLAYERS", theme::DIM);
 
             let mw = left_w - 24.0;
@@ -1013,63 +1336,322 @@ impl MenuState {
         c.footer_status(&f, &bar_msg, if self.status_err { theme::BAD } else { theme::DIM });
     }
 
-    // ---- Replay Browser ------------------------------------------------------
+    // ---- Replay Vault Browser (Phase 20 / 47) --------------------------------
 
     fn replay_widgets(&self, w: f32, h: f32) -> Vec<(Rect, Action)> {
         let f = Frame::new(w, h);
         let c = f.content;
-        let list_w = (c.w * 0.44).clamp(320.0, 560.0);
+        let list_w = (c.w * 0.45).clamp(350.0, 560.0);
         let mut out = Vec::new();
-        let row_y0 = c.y + 52.0;
-        let max_rows = ((c.h - 68.0) / 28.0).floor().max(1.0) as usize;
+
+        // Search input + optional Clear button at top of left list panel.
+        let search_y = c.y + 42.0;
+        let has_search = !self.replay_search.is_empty();
+        let clear_w = if has_search { 56.0 } else { 0.0 };
+        let search_w = (list_w - 24.0 - if has_search { clear_w + 6.0 } else { 0.0 }).max(120.0);
+        out.push((
+            Rect::new(c.x + 12.0, search_y, search_w, 28.0),
+            Action::Focus(FocusField::ReplaySearch),
+        ));
+        if has_search {
+            out.push((
+                Rect::new(c.x + 12.0 + search_w + 6.0, search_y, clear_w, 28.0),
+                Action::ClearReplaySearch,
+            ));
+        }
+
+        // Scrollable replay rows (each 56px tall with 48x48 thumbnail).
+        let row_y0 = search_y + 36.0;
+        let row_step = 60.0;
+        let max_rows = ((c.bottom() - 10.0 - row_y0) / row_step).floor().max(1.0) as usize;
         for r in 0..max_rows {
             let idx = self.replay_scroll + r;
             if idx >= self.replays.len() {
                 break;
             }
+            let ry = row_y0 + r as f32 * row_step;
+            if ry + 56.0 > c.bottom() - 6.0 {
+                break;
+            }
             out.push((
-                Rect::new(c.x + 12.0, row_y0 + r as f32 * 28.0, list_w - 24.0, 25.0),
+                Rect::new(c.x + 12.0, ry, list_w - 24.0, 56.0),
                 Action::SelectReplay(idx),
             ));
         }
+
+        // Right panel: bookmark buttons + bottom Share / Download bar.
+        let rx = cnt_right_x(c.x, list_w);
+        let rw = (c.right() - rx).max(260.0);
+        let det_x = rx + 14.0;
+        let det_w = (rw - 28.0).max(220.0);
+
+        let share_bar_y = c.bottom() - 42.0;
         let has_sel = self.replays.get(self.replay_selected).is_some();
-        out.push((f.footer_button(0, false, 160.0), Action::BackToMain));
-        out.push((f.footer_button(1, false, 160.0), Action::RefreshReplays));
+
+        // Clickable event bookmarks inside the details panel (between armies and share bar).
+        if let Some(it) = self.replays.get(self.replay_selected) {
+            let bm_y0 = replay_bookmarks_top(c.y, &it.entry);
+            let max_bm_y = share_bar_y - 16.0;
+            let mut by = bm_y0 + 22.0;
+            for (bi, _) in it.entry.bookmarks.iter().enumerate() {
+                if by + 22.0 > max_bm_y {
+                    break;
+                }
+                out.push((
+                    Rect::new(det_x, by, det_w, 21.0),
+                    Action::WatchReplayBookmark(bi),
+                ));
+                by += 24.0;
+            }
+        }
+
+        // Share / Download-by-code controls along bottom of right details panel.
+        let share_btn_w = if has_sel { 112.0 } else { 0.0 };
+        let dl_btn_w = 112.0;
+        let gap = 8.0;
+        let mut sx = det_x;
         if has_sel {
-            out.push((f.footer_button(1, true, 190.0), Action::VerifyReplay));
-            out.push((f.footer_button(0, true, 190.0), Action::WatchReplay));
+            out.push((Rect::new(sx, share_bar_y, share_btn_w, 30.0), Action::ShareReplay));
+            sx += share_btn_w + gap;
+        }
+        let code_w = (det_x + det_w - sx - dl_btn_w - gap).max(90.0);
+        out.push((
+            Rect::new(sx, share_bar_y, code_w, 30.0),
+            Action::Focus(FocusField::ReplayDownloadCode),
+        ));
+        out.push((
+            Rect::new(sx + code_w + gap, share_bar_y, dl_btn_w, 30.0),
+            Action::DownloadReplay,
+        ));
+
+        // Footer buttons.
+        out.push((f.footer_button(0, false, 150.0), Action::BackToMain));
+        out.push((f.footer_button(1, false, 150.0), Action::RefreshReplays));
+        if has_sel {
+            out.push((f.footer_button(1, true, 180.0), Action::VerifyReplay));
+            out.push((f.footer_button(0, true, 180.0), Action::WatchReplay));
         }
         out
     }
 
     fn draw_replays(&self, c: &mut Canvas) {
         let f = Frame::new(c.w, c.h);
-        c.chrome(&f, "REPLAYS", &format!("{} saved replays", self.replays.len()));
+        let total = self.vault_index.entries.len().max(self.replays.len());
+        let subtitle = if self.replay_search.is_empty() {
+            format!("{} replays in vault", self.replays.len())
+        } else {
+            format!("{} of {} replays matching filter", self.replays.len(), total)
+        };
+        c.chrome(&f, "REPLAY VAULT", &subtitle);
         let cnt = f.content;
-        let list_w = (cnt.w * 0.44).clamp(320.0, 560.0);
+        let list_w = (cnt.w * 0.45).clamp(350.0, 560.0);
         let list_r = Rect::new(cnt.x, cnt.y, list_w, cnt.h);
         c.titled_panel(list_r, "RECORDED MATCHES");
 
+        let rx = cnt_right_x(cnt.x, list_w);
+        let rw = (cnt.right() - rx).max(260.0);
+        let det_in = c.titled_panel(Rect::new(rx, cnt.y, rw, cnt.h), "REPLAY DETAILS");
+
         if self.replays.is_empty() {
-            c.text(cnt.x + 16.0, cnt.y + 62.0, body(15.0), "No .farust-replay files found.", theme::DIM);
-            c.text(cnt.x + 16.0, cnt.y + 88.0, body(14.0), "Matches auto-record to fa-unpack/replays/.", theme::DIM);
+            let msg = if self.replay_search.is_empty() {
+                "No .farust-replay files in vault."
+            } else {
+                "No replays match the search filter."
+            };
+            c.text(cnt.x + 16.0, cnt.y + 92.0, body(15.0), msg, theme::DIM);
+            c.text(
+                cnt.x + 16.0,
+                cnt.y + 118.0,
+                body(13.0),
+                "Filter tips: map:SCMP_009  faction:uef  winner:cybran  from:2026-01-01",
+                theme::FAINT,
+            );
         }
 
-        let mut actions_seen = false;
+        // Details panel metadata, big thumbnail, armies, bookmarks header.
+        if let Some(it) = self.replays.get(self.replay_selected) {
+            let e = &it.entry;
+            let thumb_sz = 148.0f32.min((det_in.w * 0.34).max(110.0));
+            let thumb_r = Rect::new(det_in.x, det_in.y + 4.0, thumb_sz, thumb_sz);
+            c.rect(thumb_r, theme::FIELD);
+            if !c.image(&it.thumb_key, thumb_r.inset(1.0), [1.0; 4]) {
+                c.text_in(thumb_r, body(12.0), &e.map_id, theme::DIM, Align::Center);
+            }
+            c.outline(thumb_r, 1.5, theme::BORDER);
+
+            let mx = thumb_r.right() + 14.0;
+            let mw = (det_in.right() - mx).max(120.0);
+            let mut my = det_in.y + 4.0;
+            let map_line = if e.map_name.eq_ignore_ascii_case(&e.map_id) {
+                e.map_id.clone()
+            } else {
+                format!("{} ({})", e.map_name, e.map_id)
+            };
+            c.text(mx, my, bold(16.0), &c.fonts.fit(bold(16.0), &map_line, mw), theme::GOLD);
+            my += 23.0;
+
+            let rules_col = if e.needs_older_build() { theme::BAD } else { theme::GOOD };
+            let win_col = if e.winner.is_some() { theme::GOOD } else { theme::DIM };
+            let rows: Vec<(&str, String, [f32; 4])> = vec![
+                ("Date", vault::format_utc_datetime(e.mtime_secs), theme::TEXT),
+                ("Duration", format!("{} ({} ticks)", e.duration_mmss(), e.duration_ticks), theme::ACCENT),
+                ("Winner", e.winner_label(), win_col),
+                ("Rules", e.rules_status(), rules_col),
+                ("Size", format!("{:.1} KiB · {} cmds", e.file_size as f64 / 1024.0, e.commands), theme::TEXT),
+                (
+                    "Mode",
+                    match &e.mission_name {
+                        Some(m) => format!("Mission: {m}"),
+                        None if !e.mods.is_empty() => format!("{} · {} mod(s)", e.victory.label(), e.mods.len()),
+                        None => format!("{} · Cap {}", e.victory.label(), if e.unit_cap == 0 { "Unlim".into() } else { e.unit_cap.to_string() }),
+                    },
+                    theme::TEXT,
+                ),
+            ];
+            for (k, v, col) in rows {
+                c.text(mx, my, bold(13.0), k, theme::DIM);
+                let val_r = Rect::new(mx + 74.0, my - 1.0, (mw - 74.0).max(40.0), 19.0);
+                let fit = c.fonts.fit(body(13.0), &v, val_r.w);
+                c.text_in(val_r, body(13.0), &fit, col, Align::Left);
+                my += 20.0;
+            }
+            if let Some(ref code) = e.share_code {
+                c.text(mx, my, bold(13.0), "Share", theme::DIM);
+                c.text(mx + 74.0, my, bold(13.0), code, theme::GOLD);
+            }
+
+            // Armies section below thumbnail.
+            let mut ay = det_in.y + 162.0;
+            c.text(det_in.x, ay, bold(13.0), "ARMIES", theme::GOLD);
+            ay += 20.0;
+            let cols = if e.armies.len() > 2 { 2 } else { 1 };
+            let col_w = det_in.w / cols as f32;
+            let win_id = e.winner.as_ref().and_then(|w| w.army_id());
+            for (i, a) in e.armies.iter().enumerate() {
+                let col = i % cols;
+                let row = i / cols;
+                let ax = det_in.x + col as f32 * col_w;
+                let ry = ay + row as f32 * 20.0;
+                c.rect(Rect::new(ax, ry + 3.0, 11.0, 11.0), theme::SLOT_COLORS[i % 8]);
+                let tag = if win_id == Some(i as u8) { " [WIN]" } else { "" };
+                let line = format!("{} ({}, T{}){tag}", a.name, vault::sim_faction_label(a.faction), a.team + 1);
+                let fit = c.fonts.fit(body(13.0), &line, col_w - 22.0);
+                c.text(ax + 17.0, ry, body(13.0), &fit, if !tag.is_empty() { theme::GOOD } else { theme::TEXT });
+            }
+
+            // Event bookmarks header (rows are painted in the widget pass below).
+            let bm_y = replay_bookmarks_top(cnt.y, e);
+            c.text(
+                det_in.x,
+                bm_y,
+                bold(13.0),
+                &format!("EVENT BOOKMARKS ({}) — click to jump", e.bookmarks.len()),
+                theme::GOLD,
+            );
+            if e.bookmarks.is_empty() {
+                let hint = if e.needs_older_build() {
+                    "Re-sim unavailable: recorded under older sim rules."
+                } else if !e.sim_indexed {
+                    "Click REFRESH to analyze match events."
+                } else {
+                    "No major bookmark events recorded in this replay."
+                };
+                c.text(det_in.x, bm_y + 22.0, body(13.0), hint, theme::DIM);
+            }
+        } else {
+            c.text(det_in.x, det_in.y + 12.0, body(15.0), "Select a replay on the left, or download by share code below.", theme::DIM);
+        }
+
+        // Paint interactive widgets (search box, list rows with thumbnails, bookmarks, share/download, footer).
         for (r, act) in self.replay_widgets(c.w, c.h) {
             let st = WState { hover: c.is_hover(r), ..Default::default() };
             match act {
+                Action::Focus(FocusField::ReplaySearch) => {
+                    c.text_field(
+                        r,
+                        &self.replay_search,
+                        self.focus == FocusField::ReplaySearch,
+                        "Search map, player, faction, winner, from:YYYY-MM-DD...",
+                        st,
+                    );
+                }
+                Action::ClearReplaySearch => c.button(r, "CLR", st),
                 Action::SelectReplay(idx) => {
-                    actions_seen = true;
                     let it = &self.replays[idx];
+                    let e = &it.entry;
                     let sel = idx == self.replay_selected;
                     c.list_row(r, sel, st.hover);
-                    let secs = it.replay.final_tick / crate::sim::TICK_HZ;
-                    let left = c.fonts.fit(body(14.0), &it.name, r.w - 130.0);
-                    let right = format!("{}  {:02}:{:02}", it.replay.header.map_id, secs / 60, secs % 60);
-                    c.text_in(Rect::new(r.x + 8.0, r.y, r.w - 130.0, r.h), body(14.0), &left, if sel { theme::TEXT } else { theme::DIM }, Align::Left);
-                    c.text_in(Rect::new(r.right() - 122.0, r.y, 114.0, r.h), body(13.0), &right, theme::ACCENT, Align::Right);
+                    let tr = Rect::new(r.x + 4.0, r.y + 4.0, 48.0, 48.0);
+                    c.rect(tr, theme::FIELD);
+                    if !c.image(&it.thumb_key, tr.inset(1.0), [1.0; 4]) {
+                        c.text_in(tr, body(10.0), "MAP", theme::FAINT, Align::Center);
+                    }
+                    c.outline(tr, 1.0, if sel { theme::ACCENT } else { theme::BORDER });
+
+                    let tx = tr.right() + 8.0;
+                    let tw = (r.right() - tx - 8.0).max(60.0);
+                    let dur_text = e.duration_mmss();
+                    let top_title = if e.map_name.eq_ignore_ascii_case(&e.map_id) {
+                        e.map_id.clone()
+                    } else {
+                        format!("{} ({})", e.map_name, e.map_id)
+                    };
+                    let fit_top = c.fonts.fit(bold(13.5), &top_title, (tw - 58.0).max(40.0));
+                    c.text(tx, r.y + 4.0, bold(13.5), &fit_top, if sel { theme::TEXT } else { theme::DIM });
+                    c.text_in(
+                        Rect::new(r.right() - 60.0, r.y + 4.0, 52.0, 18.0),
+                        body(12.5),
+                        &dur_text,
+                        theme::ACCENT,
+                        Align::Right,
+                    );
+
+                    let mid = c.fonts.fit(body(12.0), &e.armies_summary(), tw);
+                    c.text(tx, r.y + 22.0, body(12.0), &mid, theme::DIM);
+
+                    let mut meta_parts = vec![e.date_ymd.clone()];
+                    if let Some(ref w) = e.winner {
+                        meta_parts.push(format!("Win:{}", w.short_label()));
+                    }
+                    if !e.bookmarks.is_empty() {
+                        meta_parts.push(format!("{} BM", e.bookmarks.len()));
+                    }
+                    if let Some(ref sc) = e.share_code {
+                        meta_parts.push(sc.clone());
+                    }
+                    if e.needs_older_build() {
+                        meta_parts.push(format!("OLD v{}", e.rules));
+                    }
+                    let bot = c.fonts.fit(body(11.5), &meta_parts.join(" · "), tw);
+                    let bot_col = if e.needs_older_build() { theme::BAD } else { theme::GOLD };
+                    c.text(tx, r.y + 39.0, body(11.5), &bot, bot_col);
                 }
+                Action::WatchReplayBookmark(bi) => {
+                    if let Some(it) = self.replays.get(self.replay_selected)
+                        && let Some(bm) = it.entry.bookmarks.get(bi)
+                    {
+                        c.list_row(r, false, st.hover);
+                        let pill = Rect::new(r.x + 3.0, r.y + 3.0, 44.0, r.h - 6.0);
+                        c.rect(pill, bm.kind.color());
+                        c.text_in(pill, bold(10.5), bm.kind.tag(), [0.05, 0.06, 0.08, 1.0], Align::Center);
+                        let ts = crate::controls::fmt_ticks(bm.tick);
+                        c.text(pill.right() + 6.0, r.y + 3.0, bold(12.0), &ts, theme::ACCENT);
+                        let lx = pill.right() + 56.0;
+                        let fit = c.fonts.fit(body(12.5), &bm.label, (r.right() - lx - 6.0).max(40.0));
+                        c.text(lx, r.y + 3.0, body(12.5), &fit, theme::TEXT);
+                    }
+                }
+                Action::ShareReplay => c.button(r, "SHARE", st),
+                Action::Focus(FocusField::ReplayDownloadCode) => {
+                    c.text_field(
+                        r,
+                        &self.replay_download_code,
+                        self.focus == FocusField::ReplayDownloadCode,
+                        "Download code (XXXX-XXXX)",
+                        st,
+                    );
+                }
+                Action::DownloadReplay => c.button(r, "DOWNLOAD", st),
                 Action::BackToMain => c.button(r, "BACK", st),
                 Action::RefreshReplays => c.button(r, "REFRESH", st),
                 Action::VerifyReplay => c.button(r, "VERIFY HASH", st),
@@ -1077,45 +1659,272 @@ impl MenuState {
                 _ => {}
             }
         }
-        let _ = actions_seen;
+        c.footer_status(&f, &self.status, if self.status_err { theme::BAD } else { theme::GOOD });
+    }
 
-        let rx = cnt.x + list_w + 20.0;
-        let rw = (cnt.right() - rx).max(200.0);
-        let det_in = c.titled_panel(Rect::new(rx, cnt.y, rw, cnt.h), "REPLAY DETAILS");
-        if let Some(it) = self.replays.get(self.replay_selected) {
-            let rep = &it.replay;
-            let secs = rep.final_tick / crate::sim::TICK_HZ;
-            let cap = if rep.header.options.unit_cap == 0 {
-                "Unlimited".to_string()
-            } else {
-                rep.header.options.unit_cap.to_string()
-            };
-            let mut y = det_in.y + 4.0;
-            for (k, v) in [
-                ("File", it.path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()),
-                ("Map", rep.header.map_id.clone()),
-                ("Duration", format!("{:02}:{:02} ({} ticks)", secs / 60, secs % 60, rep.final_tick)),
-                ("Victory", rep.header.options.victory.label().to_string()),
-                ("Unit Cap", cap),
-                ("Seed", rep.header.seed.to_string()),
-                ("Commands", rep.commands.len().to_string()),
-                ("Checkpoints", rep.checkpoints.len().to_string()),
-                ("Final Hash", format!("{:016x}", rep.final_hash)),
-            ] {
-                c.text(det_in.x, y, bold(14.0), k, theme::DIM);
-                c.text_in(Rect::new(det_in.x + 120.0, y - 2.0, det_in.w - 120.0, 22.0), body(14.0), &c.fonts.fit(body(14.0), &v, det_in.w - 124.0), theme::TEXT, Align::Left);
-                y += 26.0;
+    // ---- Phase 51 Mod Manager ------------------------------------------------
+
+    fn mods_widgets(&self, w: f32, h: f32) -> Vec<(Rect, Action)> {
+        let f = Frame::new(w, h);
+        let c = f.content;
+        let list_w = (c.w * 0.48).clamp(360.0, 580.0);
+        let mut out = Vec::new();
+
+        let row_y0 = c.y + 44.0;
+        let row_step = 60.0;
+        let max_rows = ((c.bottom() - 10.0 - row_y0) / row_step).floor().max(1.0) as usize;
+        for r in 0..max_rows {
+            let idx = self.mods_scroll + r;
+            if idx >= self.mods_items.len() {
+                break;
             }
-            y += 10.0;
-            c.text(det_in.x, y, bold(14.0), "ARMIES", theme::GOLD);
-            y += 24.0;
-            for (i, a) in rep.header.setups.iter().enumerate() {
-                c.rect(Rect::new(det_in.x, y + 3.0, 12.0, 12.0), theme::SLOT_COLORS[i % 8]);
-                c.text(det_in.x + 20.0, y, body(14.0), &format!("{}  ({})  Team {}", a.name, faction_label(a.faction), a.team + 1), theme::TEXT);
-                y += 22.0;
+            let ry = row_y0 + r as f32 * row_step;
+            if ry + 56.0 > c.bottom() - 6.0 {
+                break;
+            }
+            let row_x = c.x + 12.0;
+            let row_w = list_w - 24.0;
+            // Click row body to select; click left ON/OFF button to toggle.
+            out.push((Rect::new(row_x, ry, row_w, 56.0), Action::SelectMod(idx)));
+            out.push((Rect::new(row_x + 6.0, ry + 14.0, 52.0, 28.0), Action::ToggleMod(idx)));
+        }
+
+        out.push((f.footer_button(0, false, 150.0), Action::BackToMain));
+        out.push((f.footer_button(1, false, 150.0), Action::RefreshMods));
+        if self.mods_items.iter().any(|m| m.enabled) {
+            out.push((f.footer_button(1, true, 165.0), Action::DisableAllMods));
+        }
+        if self.mods_items.get(self.mods_selected).is_some() {
+            out.push((f.footer_button(0, true, 185.0), Action::ToggleSelectedMod));
+        }
+        out
+    }
+
+    fn mod_has_conflict(&self, it: &ModListItem) -> bool {
+        if !it.enabled {
+            return it.error.is_some();
+        }
+        if it.error.is_some() {
+            return true;
+        }
+        let Some(ref m) = it.loaded else {
+            return true;
+        };
+        self.mods_conflicts.iter().any(|c| match c {
+            crate::mods::ModConflict::BlueprintOverride { mods, .. } => {
+                mods.iter().any(|(n, _)| n == &m.name)
+            }
+            crate::mods::ModConflict::DuplicateUid { uid, .. } => {
+                uid.eq_ignore_ascii_case(&m.uid)
+            }
+            crate::mods::ModConflict::LoadError { spec, .. } => {
+                spec == &m.name || spec == &it.spec
+            }
+        })
+    }
+
+    fn draw_mods(&self, c: &mut Canvas) {
+        let f = Frame::new(c.w, c.h);
+        let enabled_n = self.mods_items.iter().filter(|m| m.enabled).count();
+        let conflict_n = self.mods_conflicts.len();
+        // The mods folder is shown per mod in the details panel (a long path would run into
+        // the screen title here).
+        let subtitle = format!(
+            "{} installed · {} enabled · {} conflict(s)",
+            self.mods_items.len(),
+            enabled_n,
+            conflict_n
+        );
+        c.chrome(&f, "MOD MANAGER", &subtitle);
+        let cnt = f.content;
+        let list_w = (cnt.w * 0.48).clamp(360.0, 580.0);
+        c.titled_panel(Rect::new(cnt.x, cnt.y, list_w, cnt.h), "DISCOVERED MODS");
+
+        let rx = cnt_right_x(cnt.x, list_w);
+        let rw = (cnt.right() - rx).max(260.0);
+        let det_in = c.titled_panel(Rect::new(rx, cnt.y, rw, cnt.h), "MOD DETAILS & CONFLICTS");
+
+        if self.mods_items.is_empty() {
+            c.text(cnt.x + 16.0, cnt.y + 58.0, body(15.0), "No mods discovered.", theme::DIM);
+            c.text(
+                cnt.x + 16.0,
+                cnt.y + 84.0,
+                body(13.0),
+                "Place mod folders (mod_info.lua + units/**/*.bp) in:",
+                theme::FAINT,
+            );
+            let dir_s = c.fonts.fit(body(13.0), &crate::mods::mods_dir().display().to_string(), list_w - 32.0);
+            c.text(cnt.x + 16.0, cnt.y + 106.0, body(13.0), &dir_s, theme::ACCENT);
+        }
+
+        // Right panel top: selected mod metadata
+        let conflict_top = (det_in.bottom() - 190.0).max(det_in.y + 180.0);
+        if let Some(it) = self.mods_items.get(self.mods_selected) {
+            let mut my = det_in.y + 4.0;
+            let title_str = it
+                .loaded
+                .as_ref()
+                .map(|m| format!("{}  v{}", m.name, m.version))
+                .unwrap_or_else(|| it.spec.clone());
+            c.text(det_in.x, my, bold(16.0), &c.fonts.fit(bold(16.0), &title_str, det_in.w), theme::GOLD);
+            my += 24.0;
+
+            let rows: Vec<(&str, String, [f32; 4])> = if let Some(ref m) = it.loaded {
+                vec![
+                    ("Status", if it.enabled { "Enabled (persisted)".into() } else { "Disabled".into() }, if it.enabled { theme::GOOD } else { theme::DIM }),
+                    ("UID", m.uid.clone(), theme::TEXT),
+                    ("Author", if m.author.is_empty() { "-".into() } else { m.author.clone() }, theme::TEXT),
+                    ("Blueprints", format!("{} file(s): {}", m.files.len(), if it.blueprint_ids.is_empty() { "-".into() } else { it.blueprint_ids.join(", ") }), theme::ACCENT),
+                    ("Content Hash", format!("#{:016x}", m.hash), theme::DIM),
+                    ("Path", it.dir.as_ref().map(|d| d.display().to_string()).unwrap_or_else(|| "(in-memory)".into()), theme::DIM),
+                ]
+            } else {
+                vec![
+                    ("Status", "Load Error".into(), theme::BAD),
+                    ("Spec", it.spec.clone(), theme::TEXT),
+                    ("Path", it.dir.as_ref().map(|d| d.display().to_string()).unwrap_or_else(|| "-".into()), theme::DIM),
+                ]
+            };
+
+            for (k, v, col) in rows {
+                if my + 20.0 > conflict_top - 48.0 {
+                    break;
+                }
+                c.text(det_in.x, my, bold(13.0), k, theme::DIM);
+                let val_r = Rect::new(det_in.x + 102.0, my - 1.0, (det_in.w - 102.0).max(60.0), 19.0);
+                let fit = c.fonts.fit(body(13.0), &v, val_r.w);
+                c.text_in(val_r, body(13.0), &fit, col, Align::Left);
+                my += 21.0;
+            }
+            if let Some(ref m) = it.loaded
+                && !m.description.is_empty()
+                && my + 22.0 < conflict_top - 10.0
+            {
+                my += 4.0;
+                c.text(det_in.x, my, bold(13.0), "DESCRIPTION", theme::DIM);
+                my += 19.0;
+                let desc = c.fonts.fit(body(13.0), &m.description, det_in.w);
+                c.text(det_in.x, my, body(13.0), &desc, theme::TEXT);
+            }
+            if let Some(ref err) = it.error
+                && my + 22.0 < conflict_top - 10.0
+            {
+                my += 4.0;
+                let err_fit = c.fonts.fit(body(13.0), &format!("Error: {err}"), det_in.w);
+                c.text(det_in.x, my, body(13.0), &err_fit, theme::BAD);
             }
         } else {
-            c.text(det_in.x, det_in.y + 12.0, body(15.0), "Select a replay on the left.", theme::DIM);
+            c.text(det_in.x, det_in.y + 8.0, body(14.0), "Select a mod on the left to inspect its blueprints and metadata.", theme::DIM);
+        }
+
+        // Right panel bottom: Conflicts list
+        c.rect(Rect::new(det_in.x, conflict_top - 6.0, det_in.w, 1.0), theme::BORDER);
+        let c_hdr = format!("CONFLICTS ({})", self.mods_conflicts.len());
+        let c_col = if self.mods_conflicts.is_empty() { theme::GOOD } else { theme::BAD };
+        c.text(det_in.x, conflict_top + 2.0, bold(13.5), &c_hdr, c_col);
+        if self.mods_conflicts.is_empty() {
+            c.text(
+                det_in.x,
+                conflict_top + 26.0,
+                body(13.0),
+                "No blueprint or load conflicts among enabled mods.",
+                theme::GOOD,
+            );
+            c.text(
+                det_in.x,
+                conflict_top + 48.0,
+                body(12.5),
+                "Multiplayer peers missing enabled mods receive them automatically with hash verification.",
+                theme::DIM,
+            );
+        } else {
+            let mut cy = conflict_top + 24.0;
+            for conflict in &self.mods_conflicts {
+                if cy + 20.0 > det_in.bottom() - 4.0 {
+                    break;
+                }
+                let line = format!("! {conflict}");
+                let fit = c.fonts.fit(body(12.5), &line, det_in.w);
+                c.text(det_in.x, cy, body(12.5), &fit, theme::BAD);
+                cy += 21.0;
+            }
+        }
+
+        // Interactive widgets
+        for (r, act) in self.mods_widgets(c.w, c.h) {
+            let st = WState { hover: c.is_hover(r), ..Default::default() };
+            match act {
+                Action::SelectMod(idx) => {
+                    let it = &self.mods_items[idx];
+                    let sel = idx == self.mods_selected;
+                    let has_err = self.mod_has_conflict(it);
+                    c.list_row(r, sel, st.hover);
+                    if has_err {
+                        c.outline(r, 1.5, theme::BAD);
+                    }
+                    let tx = r.x + 66.0;
+                    let tw = (r.right() - tx - 8.0).max(60.0);
+                    let (top_l, top_r, mid, bot) = if let Some(ref m) = it.loaded {
+                        let badge = if it.error.is_some() {
+                            "ERROR".to_string()
+                        } else if has_err {
+                            format!("{} bp · CONFLICT", m.files.len())
+                        } else {
+                            format!("{} bp", m.files.len())
+                        };
+                        let author = if m.author.is_empty() { "unknown" } else { &m.author };
+                        (
+                            format!("{} v{}", m.name, m.version),
+                            badge,
+                            format!("uid: {} · by {author}", m.uid),
+                            if m.description.is_empty() { "(no description)".to_string() } else { m.description.clone() },
+                        )
+                    } else {
+                        (
+                            it.spec.clone(),
+                            "LOAD ERROR".to_string(),
+                            it.error.clone().unwrap_or_else(|| "failed to load".into()),
+                            String::new(),
+                        )
+                    };
+                    let badge_w = 108.0;
+                    let fit_top = c.fonts.fit(bold(13.5), &top_l, (tw - badge_w).max(40.0));
+                    c.text(tx, r.y + 4.0, bold(13.5), &fit_top, if sel { theme::TEXT } else { theme::DIM });
+                    c.text_in(
+                        Rect::new(r.right() - badge_w - 6.0, r.y + 4.0, badge_w, 18.0),
+                        bold(11.5),
+                        &top_r,
+                        if has_err { theme::BAD } else { theme::ACCENT },
+                        Align::Right,
+                    );
+                    let fit_mid = c.fonts.fit(body(12.0), &mid, tw);
+                    c.text(tx, r.y + 22.0, body(12.0), &fit_mid, if it.loaded.is_none() { theme::BAD } else { theme::DIM });
+                    if !bot.is_empty() {
+                        let fit_bot = c.fonts.fit(body(11.5), &bot, tw);
+                        c.text(tx, r.y + 38.0, body(11.5), &fit_bot, theme::FAINT);
+                    }
+                }
+                Action::ToggleMod(idx) => {
+                    let on = self.mods_items[idx].enabled;
+                    c.button(
+                        r,
+                        if on { "ON" } else { "OFF" },
+                        WState { primary: on, active: on, ..st },
+                    );
+                }
+                Action::BackToMain => c.button(r, "BACK", st),
+                Action::RefreshMods => c.button(r, "REFRESH", st),
+                Action::DisableAllMods => c.button(r, "DISABLE ALL", st),
+                Action::ToggleSelectedMod => {
+                    let on = self.mods_items.get(self.mods_selected).is_some_and(|m| m.enabled);
+                    c.button(
+                        r,
+                        if on { "DISABLE MOD" } else { "ENABLE MOD" },
+                        WState { primary: !on, active: on, ..st },
+                    );
+                }
+                _ => {}
+            }
         }
         c.footer_status(&f, &self.status, if self.status_err { theme::BAD } else { theme::GOOD });
     }
@@ -1130,31 +1939,36 @@ impl MenuState {
         let rx = c.x + col_w + 24.0;
         let lw = 150.0;
         let ctrl_w = (col_w - lw - 28.0).max(160.0);
-        let mut y = c.y + 54.0;
-        let step = 42.0;
+        let mut y = c.y + 52.0;
+        let step = ((c.h - 68.0) / 12.0).clamp(32.0, 42.0);
+        let row_h = (step - 10.0).clamp(24.0, 30.0);
         let mut out = vec![
-            (Rect::new(lx + 14.0 + lw, y, ctrl_w, 30.0), Action::CycleResolution),
-            (Rect::new(lx + 14.0 + lw, y + step, ctrl_w, 30.0), Action::ToggleFullscreen),
-            (Rect::new(lx + 14.0 + lw, y + step * 2.0, ctrl_w, 30.0), Action::ToggleVsync),
-            (Rect::new(lx + 14.0 + lw, y + step * 3.0, ctrl_w, 30.0), Action::CycleShadow),
-            (Rect::new(lx + 14.0 + lw, y + step * 4.0, ctrl_w, 30.0), Action::SliderMaster(self.draft.master_volume)),
-            (Rect::new(lx + 14.0 + lw, y + step * 5.0, ctrl_w, 30.0), Action::SliderMusic(self.draft.music_volume)),
-            (Rect::new(lx + 14.0 + lw, y + step * 6.0, ctrl_w, 30.0), Action::SliderSfx(self.draft.sfx_volume)),
-            (Rect::new(lx + 14.0 + lw, y + step * 7.0, ctrl_w, 30.0), Action::CycleUiTheme),
-            (Rect::new(lx + 14.0 + lw, y + step * 8.0, ctrl_w, 30.0), Action::CycleLanguage),
+            (Rect::new(lx + 14.0 + lw, y, ctrl_w, row_h), Action::CycleResolution),
+            (Rect::new(lx + 14.0 + lw, y + step, ctrl_w, row_h), Action::ToggleFullscreen),
+            (Rect::new(lx + 14.0 + lw, y + step * 2.0, ctrl_w, row_h), Action::ToggleVsync),
+            (Rect::new(lx + 14.0 + lw, y + step * 3.0, ctrl_w, row_h), Action::CycleShadow),
+            (Rect::new(lx + 14.0 + lw, y + step * 4.0, ctrl_w, row_h), Action::ToggleBloom),
+            (Rect::new(lx + 14.0 + lw, y + step * 5.0, ctrl_w, row_h), Action::CycleAa),
+            (Rect::new(lx + 14.0 + lw, y + step * 6.0, ctrl_w, row_h), Action::SliderGamma(self.draft.gamma_x100)),
+            (Rect::new(lx + 14.0 + lw, y + step * 7.0, ctrl_w, row_h), Action::SliderMaster(self.draft.master_volume)),
+            (Rect::new(lx + 14.0 + lw, y + step * 8.0, ctrl_w, row_h), Action::SliderMusic(self.draft.music_volume)),
+            (Rect::new(lx + 14.0 + lw, y + step * 9.0, ctrl_w, row_h), Action::SliderSfx(self.draft.sfx_volume)),
+            (Rect::new(lx + 14.0 + lw, y + step * 10.0, ctrl_w, row_h), Action::CycleUiTheme),
+            (Rect::new(lx + 14.0 + lw, y + step * 11.0, ctrl_w, row_h), Action::CycleLanguage),
         ];
         let _ = &mut y;
+        let rstep = 42.0;
         let rctrl_w = (col_w - lw - 28.0).max(160.0);
         out.extend([
             (Rect::new(rx + 14.0 + lw, y, rctrl_w, 30.0), Action::Focus(FocusField::OptPlayerName)),
-            (Rect::new(rx + 14.0 + lw, y + step, rctrl_w, 30.0), Action::CycleDefaultFaction),
-            (Rect::new(rx + 14.0 + lw, y + step * 2.0, rctrl_w, 30.0), Action::ToggleEdgeScroll),
-            (Rect::new(rx + 14.0 + lw, y + step * 3.0, rctrl_w, 30.0), Action::Focus(FocusField::OptLastHost)),
-            (Rect::new(rx + 14.0 + lw, y + step * 4.0, rctrl_w, 30.0), Action::ToggleCardHotkeys),
-            (Rect::new(rx + 14.0 + lw, y + step * 5.0, rctrl_w, 30.0), Action::Go(ScreenId::Keys)),
-            (Rect::new(rx + 14.0 + lw, y + step * 6.0, rctrl_w, 30.0), Action::ToggleColorblind),
-            (Rect::new(rx + 14.0 + lw, y + step * 7.0, rctrl_w, 30.0), Action::ToggleMouseSwap),
-            (Rect::new(rx + 14.0 + lw, y + step * 8.0, rctrl_w, 30.0), Action::ToggleSubtitles),
+            (Rect::new(rx + 14.0 + lw, y + rstep, rctrl_w, 30.0), Action::CycleDefaultFaction),
+            (Rect::new(rx + 14.0 + lw, y + rstep * 2.0, rctrl_w, 30.0), Action::ToggleEdgeScroll),
+            (Rect::new(rx + 14.0 + lw, y + rstep * 3.0, rctrl_w, 30.0), Action::Focus(FocusField::OptLastHost)),
+            (Rect::new(rx + 14.0 + lw, y + rstep * 4.0, rctrl_w, 30.0), Action::ToggleCardHotkeys),
+            (Rect::new(rx + 14.0 + lw, y + rstep * 5.0, rctrl_w, 30.0), Action::Go(ScreenId::Keys)),
+            (Rect::new(rx + 14.0 + lw, y + rstep * 6.0, rctrl_w, 30.0), Action::ToggleColorblind),
+            (Rect::new(rx + 14.0 + lw, y + rstep * 7.0, rctrl_w, 30.0), Action::ToggleMouseSwap),
+            (Rect::new(rx + 14.0 + lw, y + rstep * 8.0, rctrl_w, 30.0), Action::ToggleSubtitles),
             (f.footer_button(0, false, 160.0), Action::BackToMain),
             (f.footer_button(1, false, 160.0), Action::ResetOptions),
             (f.footer_button(0, true, 220.0), Action::SaveOptions),
@@ -1199,6 +2013,20 @@ impl MenuState {
                 Action::CycleShadow => {
                     label(&tr("ui.shadows", "Shadows"));
                     c.cycler(r, self.draft.shadow_quality.key(), st);
+                }
+                Action::ToggleBloom => {
+                    label(&tr("ui.bloom", "Bloom"));
+                    c.checkbox(r, self.draft.bloom, st);
+                }
+                Action::CycleAa => {
+                    label(&tr("ui.aa", "Anti-Aliasing"));
+                    c.cycler(r, self.draft.aa.label(), st);
+                }
+                Action::SliderGamma(_) => {
+                    label(&tr("ui.gamma", "Gamma"));
+                    let frac = (self.draft.gamma_x100.saturating_sub(settings::GAMMA_MIN_X100)) as f32
+                        / (settings::GAMMA_MAX_X100 - settings::GAMMA_MIN_X100) as f32;
+                    c.slider(r, frac.clamp(0.0, 1.0), &settings::format_gamma_x100(self.draft.gamma_x100), st);
                 }
                 Action::CycleUiTheme => {
                     label(&tr("ui.ui_theme", "UI Theme"));
@@ -1455,22 +2283,25 @@ impl MenuState {
             Action::SelectReplay(idx) => {
                 if idx < self.replays.len() {
                     self.replay_selected = idx;
-                    self.set_status("Ready to verify or watch replay", false);
+                    self.set_status("Ready to verify, watch, or share replay", false);
                 }
             }
+            Action::ClearReplaySearch => {
+                self.replay_search.clear();
+                self.apply_replay_filter();
+                self.set_status("Search cleared", false);
+            }
             Action::RefreshReplays => {
-                self.replays = scan_replays();
-                if self.replay_selected >= self.replays.len() {
-                    self.replay_selected = 0;
-                }
-                self.set_status(format!("Refreshed ({} replays)", self.replays.len()), false);
+                self.refresh_replays(true);
+                self.set_status(format!("Vault refreshed ({} replays)", self.replays.len()), false);
             }
             Action::VerifyReplay => {
                 if let Some(it) = self.replays.get(self.replay_selected) {
                     let t0 = Instant::now();
-                    let res = Catalog::load(&self.game_dir).and_then(|cat| {
-                        let map = MapContext::load(&self.game_dir, &it.replay.header.map_id)?;
-                        it.replay.verify(cat, &map)
+                    let res = Replay::load(&it.path).and_then(|rep| {
+                        let cat = Catalog::load(&self.game_dir)?;
+                        let map = MapContext::load(&self.game_dir, &rep.header.map_id)?;
+                        rep.verify(cat, &map)
                     });
                     match res {
                         Ok(r) => self.set_status(
@@ -1483,8 +2314,77 @@ impl MenuState {
             }
             Action::WatchReplay => {
                 if let Some(it) = self.replays.get(self.replay_selected).cloned() {
-                    return MenuEvent::StartReplay(it.replay);
+                    match Replay::load(&it.path) {
+                        Ok(rep) => return MenuEvent::StartReplay(Box::new(rep), it.entry.bookmarks, None),
+                        Err(e) => self.set_status(format!("Cannot open replay: {e}"), true),
+                    }
                 }
+            }
+            Action::WatchReplayBookmark(bi) => {
+                if let Some(it) = self.replays.get(self.replay_selected).cloned() {
+                    match Replay::load(&it.path) {
+                        Ok(rep) => return MenuEvent::StartReplay(Box::new(rep), it.entry.bookmarks, Some(bi)),
+                        Err(e) => self.set_status(format!("Cannot open replay: {e}"), true),
+                    }
+                }
+            }
+            Action::ShareReplay => {
+                if let Some(it) = self.replays.get(self.replay_selected).cloned() {
+                    let rv = if !self.mp_rendezvous.trim().is_empty() {
+                        self.mp_rendezvous.trim().to_string()
+                    } else {
+                        settings::effective_rendezvous(Some(&self.settings))
+                    };
+                    match std::fs::read(&it.path)
+                        .map_err(|e| format!("read {}: {e}", it.path.display()))
+                        .and_then(|bytes| crate::rendezvous::upload_replay(&rv, &bytes, Duration::from_secs(10)))
+                    {
+                        Ok(up) => {
+                            if self.vault_index.set_share_code(&it.entry.file_name, &up.code) {
+                                let _ = self.vault_index.save(&self.vault_dir);
+                                self.apply_replay_filter();
+                            }
+                            let copied = copy_to_clipboard(&up.code);
+                            let note = if copied { " (copied)" } else { "" };
+                            self.set_status(
+                                format!("Shared! Code: {}{note} ({:.1} KiB)", up.code, up.size as f64 / 1024.0),
+                                false,
+                            );
+                        }
+                        Err(e) => self.set_status(format!("Share failed: {e}"), true),
+                    }
+                }
+            }
+            Action::DownloadReplay => self.download_replay_by_code(),
+            Action::SelectMod(idx) => {
+                if idx < self.mods_items.len() {
+                    self.mods_selected = idx;
+                }
+            }
+            Action::ToggleMod(idx) => {
+                if idx < self.mods_items.len() {
+                    self.mods_selected = idx;
+                    self.mods_items[idx].enabled = !self.mods_items[idx].enabled;
+                    self.persist_mods_selection();
+                }
+            }
+            Action::ToggleSelectedMod => {
+                if self.mods_selected < self.mods_items.len() {
+                    let idx = self.mods_selected;
+                    self.mods_items[idx].enabled = !self.mods_items[idx].enabled;
+                    self.persist_mods_selection();
+                }
+            }
+            Action::DisableAllMods => {
+                for it in &mut self.mods_items {
+                    it.enabled = false;
+                }
+                self.persist_mods_selection();
+            }
+            Action::RefreshMods => {
+                self.refresh_mods();
+                let en = self.mods_items.iter().filter(|m| m.enabled).count();
+                self.set_status(format!("Refreshed: {} mod(s) found ({en} enabled)", self.mods_items.len()), false);
             }
             Action::CycleResolution => {
                 let i = RESOLUTIONS.iter().position(|r| *r == self.draft.resolution).unwrap_or(0);
@@ -1495,6 +2395,17 @@ impl MenuState {
             Action::CycleShadow => {
                 let i = ShadowQuality::ALL.iter().position(|q| *q == self.draft.shadow_quality).unwrap_or(0);
                 self.draft.shadow_quality = ShadowQuality::ALL[(i + 1) % ShadowQuality::ALL.len()];
+            }
+            Action::ToggleBloom => self.draft.bloom = !self.draft.bloom,
+            Action::CycleAa => {
+                let i = settings::AaMode::ALL.iter().position(|m| *m == self.draft.aa).unwrap_or(0);
+                self.draft.aa = settings::AaMode::ALL[(i + 1) % settings::AaMode::ALL.len()];
+            }
+            Action::SliderGamma(_) => {
+                let track_w = (rect.w - 56.0).max(20.0);
+                let frac = ((px - rect.x) / track_w).clamp(0.0, 1.0);
+                let span = (settings::GAMMA_MAX_X100 - settings::GAMMA_MIN_X100) as f32;
+                self.draft.gamma_x100 = settings::GAMMA_MIN_X100 + (frac * span).round() as u16;
             }
             Action::CycleUiTheme => {
                 let i = UiTheme::ALL.iter().position(|t| *t == self.draft.ui_theme).unwrap_or(0);
@@ -1566,15 +2477,22 @@ impl MenuState {
             return false;
         }
         for (r, act) in self.options_widgets(w, h) {
-            if matches!(act, Action::SliderMaster(_) | Action::SliderMusic(_) | Action::SliderSfx(_))
-                && r.contains(px, py)
+            if matches!(
+                act,
+                Action::SliderMaster(_) | Action::SliderMusic(_) | Action::SliderSfx(_) | Action::SliderGamma(_)
+            ) && r.contains(px, py)
             {
                 let track_w = (r.w - 56.0).max(20.0);
-                let val = (((px - r.x) / track_w).clamp(0.0, 1.0) * 100.0).round() as u8;
+                let frac = ((px - r.x) / track_w).clamp(0.0, 1.0);
+                let val = (frac * 100.0).round() as u8;
                 match act {
                     Action::SliderMaster(_) => self.draft.master_volume = val,
                     Action::SliderMusic(_) => self.draft.music_volume = val,
                     Action::SliderSfx(_) => self.draft.sfx_volume = val,
+                    Action::SliderGamma(_) => {
+                        let span = (settings::GAMMA_MAX_X100 - settings::GAMMA_MIN_X100) as f32;
+                        self.draft.gamma_x100 = settings::GAMMA_MIN_X100 + (frac * span).round() as u16;
+                    }
                     _ => {}
                 }
                 return true;
@@ -1765,6 +2683,47 @@ impl MenuState {
         }
     }
 
+    fn download_replay_by_code(&mut self) {
+        let code = self.replay_download_code.trim().to_string();
+        if code.is_empty() {
+            self.set_status("Enter a share code (XXXX-XXXX) to download", true);
+            return;
+        }
+        let rv = if !self.mp_rendezvous.trim().is_empty() {
+            self.mp_rendezvous.trim().to_string()
+        } else {
+            settings::effective_rendezvous(Some(&self.settings))
+        };
+        match crate::rendezvous::download_replay_into_vault(
+            &rv,
+            &code,
+            &self.vault_dir,
+            Duration::from_secs(10),
+        ) {
+            Ok((saved, dl)) => {
+                self.replay_download_code.clear();
+                self.refresh_replays(true);
+                if let Some(fname) = saved.file_name().map(|s| s.to_string_lossy().to_string()) {
+                    if self.vault_index.set_share_code(&fname, &dl.code) {
+                        let _ = self.vault_index.save(&self.vault_dir);
+                        self.apply_replay_filter();
+                    }
+                    if let Some(pos) = self.replays.iter().position(|r| r.entry.file_name == fname) {
+                        self.replay_selected = pos;
+                    }
+                }
+                self.set_status(
+                    format!(
+                        "Downloaded {} ({}, {} ticks) into vault",
+                        dl.code, dl.replay.header.map_id, dl.replay.final_tick
+                    ),
+                    false,
+                );
+            }
+            Err(e) => self.set_status(format!("Download failed: {e}"), true),
+        }
+    }
+
     fn active_field_mut(&mut self) -> Option<&mut String> {
         match self.focus {
             FocusField::MpHostAddr => Some(&mut self.mp_host_addr),
@@ -1773,9 +2732,25 @@ impl MenuState {
             FocusField::MpChat => Some(&mut self.mp_chat_input),
             FocusField::OptPlayerName => Some(&mut self.draft.player_name),
             FocusField::OptLastHost => Some(&mut self.draft.last_host),
+            FocusField::ReplaySearch => Some(&mut self.replay_search),
+            FocusField::ReplayDownloadCode => Some(&mut self.replay_download_code),
             FocusField::None => None,
         }
     }
+}
+
+fn cnt_right_x(cx: f32, list_w: f32) -> f32 {
+    cx + list_w + 18.0
+}
+
+fn replay_bookmarks_top(cnt_y: f32, e: &VaultEntry) -> f32 {
+    let det_top = cnt_y + 40.0;
+    let army_rows = if e.armies.len() > 2 {
+        e.armies.len().div_ceil(2)
+    } else {
+        e.armies.len()
+    };
+    det_top + 162.0 + 20.0 + army_rows as f32 * 20.0 + 10.0
 }
 
 fn copy_to_clipboard(text: &str) -> bool {
@@ -1809,7 +2784,7 @@ enum MenuEvent {
     Quit,
     SettingsChanged,
     StartSkirmish(crate::lobby::LobbyLaunch),
-    StartReplay(Replay),
+    StartReplay(Box<Replay>, Vec<Bookmark>, Option<usize>),
     StartCampaign,
     StartTutorial,
 }
@@ -1904,8 +2879,8 @@ impl ShellApp {
                 }
                 Err(e) => self.state.set_status(format!("Tutorial failed: {e}"), true),
             },
-            MenuEvent::StartReplay(rep) => {
-                match build_replay_from_menu(&self.state.game_dir, rep) {
+            MenuEvent::StartReplay(rep, bookmarks, jump_bm) => {
+                match build_replay_from_menu(&self.state.game_dir, *rep, bookmarks, jump_bm) {
                     Ok((mut sess, map, meshes)) => {
                         sess.muted = self.state.settings.master_volume == 0;
                         self.enter_match(event_loop, sess, map, meshes);
@@ -2100,6 +3075,12 @@ impl ApplicationHandler for ShellApp {
                                 (self.state.replay_scroll as i64 + d as i64).clamp(0, max as i64) as usize;
                             redraw = true;
                         }
+                        ScreenId::Mods => {
+                            let max = self.state.mods_items.len().saturating_sub(8);
+                            self.state.mods_scroll =
+                                (self.state.mods_scroll as i64 + d as i64).clamp(0, max as i64) as usize;
+                            redraw = true;
+                        }
                         _ => {}
                     }
                 }
@@ -2131,29 +3112,38 @@ impl ApplicationHandler for ShellApp {
                         PhysicalKey::Code(KeyCode::Enter | KeyCode::NumpadEnter) => {
                             if self.state.focus == FocusField::MpChat {
                                 self.state.submit_mp_chat();
+                            } else if self.state.focus == FocusField::ReplayDownloadCode {
+                                self.state.download_replay_by_code();
+                                self.state.focus = FocusField::None;
                             } else {
                                 self.state.focus = FocusField::None;
                             }
                             redraw = true;
                         }
                         PhysicalKey::Code(KeyCode::Backspace) => {
+                            let is_search = self.state.focus == FocusField::ReplaySearch;
                             if let Some(f) = self.state.active_field_mut() {
                                 f.pop();
+                            }
+                            if is_search {
+                                self.state.apply_replay_filter();
                             }
                             redraw = true;
                         }
                         _ => {
-                            if let Some(t) = &event.text
-                                && let Some(f) = self.state.active_field_mut()
-                            {
-                                for ch in t.chars() {
-                                    if ch.is_ascii_graphic() || ch == ' ' {
-                                        if f.len() < 48 {
+                            if let Some(t) = &event.text {
+                                let is_search = self.state.focus == FocusField::ReplaySearch;
+                                if let Some(f) = self.state.active_field_mut() {
+                                    for ch in t.chars() {
+                                        if (ch.is_ascii_graphic() || ch == ' ') && f.len() < 48 {
                                             f.push(ch);
                                         }
                                     }
+                                    if is_search {
+                                        self.state.apply_replay_filter();
+                                    }
+                                    redraw = true;
                                 }
-                                redraw = true;
                             }
                         }
                     }
@@ -2259,10 +3249,7 @@ fn build_mission_from_source(
     let world = crate::mission::build_world(&m, catalog, &map, crate::sim::DEFAULT_SEED)?;
     let human = m.human_army().unwrap_or(0) as crate::skirmish::ArmyId;
     let mut session = PlaySession::new(world, human, false, 1);
-    session.ais = crate::mission::ai_armies(&m, None)?
-        .into_iter()
-        .map(|(a, d)| crate::skirmish_ai::ScriptedAi::with_difficulty(a, d))
-        .collect();
+    session.ais = crate::mission::ai_armies(&m, None)?;
     Ok((session, map, meshes))
 }
 
@@ -2279,6 +3266,8 @@ fn build_campaign_from_menu(game_dir: &Path) -> Result<(PlaySession, MapContext,
 fn build_replay_from_menu(
     game_dir: &Path,
     rep: Replay,
+    bookmarks: Vec<Bookmark>,
+    jump_bm: Option<usize>,
 ) -> Result<(PlaySession, MapContext, UnitMeshCache), String> {
     let mut catalog = Catalog::load(game_dir)?;
     if let Some(src) = &rep.header.mission {
@@ -2287,7 +3276,14 @@ fn build_replay_from_menu(
     let map = MapContext::load(game_dir, &rep.header.map_id)?;
     let meshes = UnitMeshCache::load(Some(game_dir), &catalog);
     let world = savegame::origin_world(catalog, &map, &rep)?;
-    Ok((PlaySession::new_replay(world, rep, 1), map, meshes))
+    let mut session = PlaySession::new_replay(world, rep, 1);
+    if !bookmarks.is_empty() {
+        session.set_replay_bookmarks(bookmarks);
+    }
+    if let Some(bi) = jump_bm {
+        session.jump_to_bookmark(bi);
+    }
+    Ok((session, map, meshes))
 }
 
 fn start_net_host_match(
@@ -2322,44 +3318,6 @@ fn start_net_client_match(
     Ok((session, map, meshes))
 }
 
-fn scan_replays() -> Vec<ReplayItem> {
-    let mut dirs = Vec::new();
-    let d_replays = savegame::data_dir("replays");
-    if d_replays.is_dir() {
-        dirs.push(d_replays);
-    }
-    let cwd = PathBuf::from(".");
-    if cwd.is_dir() {
-        dirs.push(cwd);
-    }
-    let mut seen = BTreeSet::new();
-    let mut out = Vec::new();
-    for dir in dirs {
-        let Ok(rd) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in rd.filter_map(Result::ok) {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some(savegame::REPLAY_EXT) {
-                continue;
-            }
-            let key = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
-            if !seen.insert(key) {
-                continue;
-            }
-            if let Ok(replay) = Replay::load(&path) {
-                let name = path
-                    .file_stem()
-                    .map(|s| s.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "replay".into());
-                out.push(ReplayItem { path, name, replay });
-            }
-        }
-    }
-    out.sort_by(|a, b| b.name.cmp(&a.name));
-    out
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -2367,9 +3325,46 @@ fn scan_replays() -> Vec<ReplayItem> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::replay::{ReplayHeader, ReplayRecorder};
-    use crate::skirmish::ArmySetup;
+    use crate::replay::ReplayHeader;
     use crate::ui_kit::hit_test;
+
+    fn sample_vault_entry(name: &str, map_id: &str) -> VaultEntry {
+        VaultEntry {
+            file_name: name.into(),
+            file_size: 2048,
+            mtime_secs: 1_760_000_000,
+            mtime_nanos: 0,
+            content_hash: 0x1234_5678,
+            map_id: map_id.into(),
+            map_name: format!("{map_id} Valley"),
+            date_ymd: "2026-10-09".into(),
+            duration_ticks: 1800,
+            seed: 42,
+            victory: VictoryCondition::Assassination,
+            unit_cap: 500,
+            rules: crate::skirmish::RULES_VERSION,
+            armies: vec![
+                vault::VaultArmy { name: "Alpha".into(), faction: 0, team: 0, start: (0, 0) },
+                vault::VaultArmy { name: "Beta".into(), faction: 2, team: 1, start: (1000, 1000) },
+            ],
+            winner: Some(vault::VaultWinner::Army { id: 0, name: "Alpha".into(), faction: 0, team: 0 }),
+            mods: vec![],
+            mission_name: None,
+            commands: 42,
+            checkpoints: 6,
+            final_hash: 0x1234,
+            bookmarks: vec![vault::Bookmark {
+                tick: 1750,
+                kind: vault::BookmarkKind::AcuDeath,
+                army: Some(1),
+                pos: (1000, 1000),
+                label: "Beta (Cybran) ACU destroyed".into(),
+            }],
+            sim_indexed: true,
+            thumb_file: None,
+            share_code: Some("ABCD-2345".into()),
+        }
+    }
 
     #[test]
     fn screen_id_parses_all_variants() {
@@ -2379,6 +3374,7 @@ mod tests {
         assert_eq!(ScreenId::from_str("multiplayer").unwrap(), ScreenId::Multiplayer);
         assert_eq!(ScreenId::from_str("mp-lobby").unwrap(), ScreenId::MpLobby);
         assert_eq!(ScreenId::from_str("replays").unwrap(), ScreenId::Replays);
+        assert_eq!(ScreenId::from_str("mods").unwrap(), ScreenId::Mods);
         assert_eq!(ScreenId::from_str("options").unwrap(), ScreenId::Options);
         assert_eq!(ScreenId::from_str("keys").unwrap(), ScreenId::Keys);
         assert!(ScreenId::from_str("bogus").is_err());
@@ -2391,19 +3387,12 @@ mod tests {
             &MenuOptions::default(),
         )
         .unwrap();
-        let rep = ReplayRecorder::new(
-            "SCMP_001",
-            42,
-            vec![
-                ArmySetup { name: "A".into(), faction: 0, start: (0, 0), team: 0 },
-                ArmySetup { name: "B".into(), faction: 1, start: (1000, 1000), team: 1 },
-            ],
-        )
-        .finish(600, 0x1234);
+        let entry = sample_vault_entry("test.farust-replay", "SCMP_001");
+        st.vault_index.entries.push(entry.clone());
         st.replays.push(ReplayItem {
             path: PathBuf::from("/tmp/test.farust-replay"),
-            name: "test".into(),
-            replay: rep,
+            thumb_key: "rthumb:1234".into(),
+            entry,
         });
         st.lobby = Some(LobbyState::with_maps(
             Path::new("/nonexistent"),
@@ -2415,12 +3404,27 @@ mod tests {
         ));
         st.start_host_lobby("127.0.0.1:0").unwrap();
 
+        st.mods_items.push(ModListItem {
+            spec: "heavy-tanks-001".into(),
+            loaded: Some(crate::mods::Mod::from_memory(
+                "name = 'Heavy Tanks'\nuid = 'heavy-tanks-001'\nversion = 1\nauthor = 'Test'\ndescription = 'Boosts tanks'\n",
+                vec![("units/UEL0201/UEL0201_unit.bp".into(), "UnitBlueprint { Merge = true, Defense = { MaxHealth = 500 } }".into())],
+                "heavy",
+            )),
+            error: None,
+            dir: Some(PathBuf::from("/tmp/heavy")),
+            blueprint_ids: vec!["UEL0201".into()],
+            enabled: true,
+        });
+        st.recompute_mod_conflicts();
+
         for screen in [
             ScreenId::Main,
             ScreenId::Skirmish,
             ScreenId::Multiplayer,
             ScreenId::MpLobby,
             ScreenId::Replays,
+            ScreenId::Mods,
             ScreenId::Options,
             ScreenId::Keys,
         ] {
@@ -2548,6 +3552,7 @@ mod tests {
                 ScreenId::Multiplayer,
                 ScreenId::MpLobby,
                 ScreenId::Replays,
+                ScreenId::Mods,
                 ScreenId::Options,
                 ScreenId::Keys,
             ] {
@@ -2600,5 +3605,93 @@ mod tests {
             .0
             .center();
         assert!(matches!(st.click(1280.0, 800.0, tx, ty), MenuEvent::StartTutorial));
+    }
+
+    #[test]
+    fn replays_screen_filters_and_exposes_bookmarks_and_share_controls() {
+        let mut st = MenuState::new(Path::new("/nonexistent"), &MenuOptions::default()).unwrap();
+        st.vault_index.entries = vec![
+            sample_vault_entry("a.farust-replay", "SCMP_001"),
+            sample_vault_entry("b.farust-replay", "SCMP_009"),
+        ];
+        st.navigate(ScreenId::Replays);
+        assert_eq!(st.replays.len(), 2);
+
+        // Search filter narrows list live.
+        st.replay_search = "map:scmp_009".into();
+        st.apply_replay_filter();
+        assert_eq!(st.replays.len(), 1);
+        assert_eq!(st.replays[0].entry.map_id, "SCMP_009");
+
+        let ws = st.replay_widgets(1280.0, 800.0);
+        assert!(ws.iter().any(|(_, a)| matches!(a, Action::ClearReplaySearch)));
+        assert!(ws.iter().any(|(_, a)| matches!(a, Action::ShareReplay)));
+        assert!(ws.iter().any(|(_, a)| matches!(a, Action::DownloadReplay)));
+        assert!(ws.iter().any(|(_, a)| matches!(a, Action::WatchReplayBookmark(0))));
+
+        // Clicking Clear restores both replays.
+        let clr = ws.iter().find(|(_, a)| matches!(a, Action::ClearReplaySearch)).unwrap().0.center();
+        st.click(1280.0, 800.0, clr.0, clr.1);
+        assert!(st.replay_search.is_empty());
+        assert_eq!(st.replays.len(), 2);
+    }
+
+    #[test]
+    fn mods_screen_toggles_and_detects_conflicts() {
+        let mut st = MenuState::new(Path::new("/nonexistent"), &MenuOptions::default()).unwrap();
+        let mod_a = crate::mods::Mod::from_memory(
+            "name = 'Mod Alpha'\nuid = 'mod-alpha'\nversion = 1\nauthor = 'Alice'\ndescription = 'Overrides Striker'\n",
+            vec![("units/UEL0201/UEL0201_unit.bp".into(), "UnitBlueprint { Merge = true, Defense = { MaxHealth = 500 } }".into())],
+            "alpha",
+        );
+        let mod_b = crate::mods::Mod::from_memory(
+            "name = 'Mod Beta'\nuid = 'mod-beta'\nversion = 2\nauthor = 'Bob'\ndescription = 'Also overrides Striker'\n",
+            vec![("units/UEL0201/UEL0201_unit.bp".into(), "UnitBlueprint { Merge = true, Defense = { MaxHealth = 700 } }".into())],
+            "beta",
+        );
+        st.mods_items = vec![
+            ModListItem {
+                spec: "mod-alpha".into(),
+                loaded: Some(mod_a),
+                error: None,
+                dir: None,
+                blueprint_ids: vec!["UEL0201".into()],
+                enabled: false,
+            },
+            ModListItem {
+                spec: "mod-beta".into(),
+                loaded: Some(mod_b),
+                error: None,
+                dir: None,
+                blueprint_ids: vec!["UEL0201".into()],
+                enabled: false,
+            },
+        ];
+        st.navigate(ScreenId::Mods);
+        assert!(st.mods_conflicts.is_empty());
+
+        // Enable both mods via clicking their toggle buttons -> conflict detected!
+        let ws = st.mods_widgets(1280.0, 800.0);
+        let (ax, ay) = ws.iter().find(|(_, a)| *a == Action::ToggleMod(0)).unwrap().0.center();
+        let (bx, by) = ws.iter().find(|(_, a)| *a == Action::ToggleMod(1)).unwrap().0.center();
+        st.click(1280.0, 800.0, ax, ay);
+        assert_eq!(st.settings.mods, vec!["mod-alpha"]);
+        assert!(st.mods_conflicts.is_empty());
+        st.click(1280.0, 800.0, bx, by);
+        assert_eq!(st.settings.mods, vec!["mod-alpha", "mod-beta"]);
+        assert_eq!(st.mods_conflicts.len(), 1);
+        assert!(st.status_err);
+
+        // Draw with conflict highlighted.
+        let mut c = Canvas::new(1280.0, 800.0, &st.fonts, &st.images, None);
+        st.draw(&mut c);
+        assert!(c.batches.iter().map(|b| b.idx.len()).sum::<usize>() > 100);
+
+        // Disable all clears enabled set and conflicts.
+        let ws2 = st.mods_widgets(1280.0, 800.0);
+        let (dx, dy) = ws2.iter().find(|(_, a)| *a == Action::DisableAllMods).unwrap().0.center();
+        st.click(1280.0, 800.0, dx, dy);
+        assert!(st.settings.mods.is_empty());
+        assert!(st.mods_conflicts.is_empty());
     }
 }

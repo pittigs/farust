@@ -469,6 +469,7 @@ struct Lod1Mesh {
     vertices: Vec<crate::scene::GpuVertex>,
     indices: Vec<u32>,
     albedo: Option<crate::dds_decode::RgbaImage>,
+    spec_glow: Option<crate::dds_decode::SpecGlowMap>,
 }
 
 /// Projectile mesh template (`<Name>_lod0.scm` scaled by `Display.UniformScale`, nose along +Z).
@@ -1037,17 +1038,17 @@ impl LivingBattlefield {
                                     color: [1.0, 1.0, 1.0, bone],
                                 })
                                 .collect();
+                            let spec = file(id, "_lod1_specteam.dds")
+                                .and_then(|b| crate::dds_decode::decode_dds_rgba8(b).ok());
+                            let spec_glow = spec.as_ref().map(crate::dds_decode::SpecGlowMap::from_spec_team);
                             let albedo = file(id, "_lod1_albedo.dds")
                                 .and_then(|b| crate::dds_decode::decode_dds_rgba8(b).ok())
-                                .map(|a| {
-                                    let spec = file(id, "_lod1_specteam.dds")
-                                        .and_then(|b| crate::dds_decode::decode_dds_rgba8(b).ok());
-                                    crate::scene::pack_albedo_team_mask(a, spec.as_ref())
-                                });
+                                .map(|a| crate::scene::pack_albedo_team_mask(a, spec.as_ref()));
                             Lod1Mesh {
                                 vertices,
                                 indices: m.indices.iter().map(|&i| u32::from(i)).collect(),
                                 albedo,
+                                spec_glow,
                             }
                         })
                         .filter(|l| l.albedo.is_some())
@@ -1156,13 +1157,14 @@ impl LivingBattlefield {
                     &l.vertices,
                     &l.indices,
                     l.albedo.as_ref(),
+                    l.spec_glow.as_ref(),
                     key,
                 );
                 templates.insert(key.clone(), tpl);
             }
         }
         for (key, m) in self.proj_meshes.iter() {
-            let tpl = resources.create_mesh_template(device, queue, &m.vertices, &m.indices, m.albedo.as_ref(), key);
+            let tpl = resources.create_mesh_template(device, queue, &m.vertices, &m.indices, m.albedo.as_ref(), None, key);
             templates.insert(key.clone(), tpl);
         }
     }
@@ -1233,12 +1235,15 @@ impl LivingBattlefield {
             dx * dx + dy * dy
         };
         let lim = 4 * crate::sim::SCALE as i128;
-        let Some(shooter) = world
-            .units()
-            .filter(|u| u.alive && u.army == p.army)
-            .min_by_key(|u| (d2(u), u.id))
-            .filter(|u| d2(u) <= lim * lim)
-        else {
+        // Phase 55: shells know their shooter; only legacy projectiles need the scan.
+        let known = (p.shooter != 0).then(|| world.unit(p.shooter)).flatten();
+        let Some(shooter) = known.or_else(|| {
+            world
+                .units()
+                .filter(|u| u.alive && u.army == p.army)
+                .min_by_key(|u| (d2(u), u.id))
+                .filter(|u| d2(u) <= lim * lim)
+        }) else {
             return (None, None);
         };
         let shooter_type = Some(shooter.type_id.clone());

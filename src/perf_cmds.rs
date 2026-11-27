@@ -9,7 +9,7 @@ use crate::play::{self, PlaySession, UnitMeshCache};
 use crate::profiler;
 use crate::sim::{self, SCALE};
 use crate::skirmish::{self, Catalog, MapContext, Skirmish};
-use crate::viewer::{self, DEPTH_FORMAT, GpuSceneResources, MSAA_SAMPLES};
+use crate::viewer::{self, GpuSceneResources};
 use crate::{jobs, scd};
 
 /// Spawns `unit_count` tanks split over two armies facing each other with attack-move orders
@@ -171,9 +171,7 @@ pub fn cmd_bench_render(args: &[String]) -> Result<(), String> {
     ))
     .map_err(|e| format!("failed to create GPU device: {e}"))?;
     let format = wgpu::TextureFormat::Rgba8UnormSrgb;
-    let (_msaa_tex, msaa_view) = viewer::create_attachment(
-        &device, width, height, format, MSAA_SAMPLES, wgpu::TextureUsages::RENDER_ATTACHMENT, "bench_msaa",
-    );
+    let msaa4_ok = viewer::hdr_msaa4_supported(&adapter);
     let (resolve_tex, resolve_view) = viewer::create_attachment(
         &device,
         width,
@@ -182,9 +180,6 @@ pub fn cmd_bench_render(args: &[String]) -> Result<(), String> {
         1,
         wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
         "bench_resolve",
-    );
-    let (_depth_tex, depth_view) = viewer::create_attachment(
-        &device, width, height, DEPTH_FORMAT, MSAA_SAMPLES, wgpu::TextureUsages::RENDER_ATTACHMENT, "bench_depth",
     );
 
     let was_enabled = profiler::enabled();
@@ -200,7 +195,8 @@ pub fn cmd_bench_render(args: &[String]) -> Result<(), String> {
         camera.set_aspect(width, height);
 
         let (scene, minimap) = play::build_terrain_loaded_scene(Some(&game_dir), &map, camera.clone());
-        let mut resources = GpuSceneResources::new(&device, &queue, &scene, format, MSAA_SAMPLES, &camera);
+        let mut resources =
+            GpuSceneResources::new(&device, &queue, &scene, format, width, height, msaa4_ok, &camera);
         let gpu_timed = resources.enable_gpu_timer(&device, &queue);
         if let Some(ref mm) = minimap {
             resources.set_minimap_texture(&device, &queue, mm);
@@ -229,7 +225,7 @@ pub fn cmd_bench_render(args: &[String]) -> Result<(), String> {
             let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("bench_enc") });
             {
                 let _p = profiler::scope("render.encode_submit");
-                resources.encode_draw(&mut encoder, &msaa_view, Some(&resolve_view), &depth_view, scene.clear_color);
+                resources.encode_draw(&mut encoder, &resolve_view, scene.clear_color);
                 queue.submit(Some(encoder.finish()));
                 resources.gpu_timer_after_submit();
             }
@@ -260,7 +256,7 @@ pub fn cmd_bench_render(args: &[String]) -> Result<(), String> {
         }
         if let Some(path) = snapshot.as_ref().filter(|_| ci == counts.len() - 1) {
             let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("bench_snap") });
-            resources.encode_draw(&mut encoder, &msaa_view, Some(&resolve_view), &depth_view, scene.clear_color);
+            resources.encode_draw(&mut encoder, &resolve_view, scene.clear_color);
             queue.submit(Some(encoder.finish()));
             resources.gpu_timer_after_submit();
             save_texture_png(&device, &queue, &resolve_tex, width, height, path)?;
