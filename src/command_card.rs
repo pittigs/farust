@@ -900,7 +900,7 @@ impl PlaySession {
         self.selected
             .iter()
             .filter_map(|id| self.world.unit(*id))
-            .filter(|u| u.army == self.human_army && (u.role.is_builder() || u.role.is_factory()))
+            .filter(|u| u.army == self.human_army && (self.world.is_constructor(u) || self.world.is_producer(u)))
             .filter_map(|u| {
                 let base = self.world.catalog().get(&u.type_id).map(|t| t.build_rate).unwrap_or(0);
                 Some(if u.enh.build_rate > 0 { u.enh.build_rate } else { base })

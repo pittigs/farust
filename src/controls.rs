@@ -654,7 +654,7 @@ impl PlaySession {
             .selected
             .iter()
             .copied()
-            .filter(|id| self.world.unit(*id).is_some_and(|u| u.army == self.human_army && u.role.is_builder()))
+            .filter(|id| self.world.unit(*id).is_some_and(|u| u.army == self.human_army && self.world.is_constructor(u)))
             .collect();
         if builders.is_empty() {
             self.status_banner = "Area reclaim/repair needs engineers".to_string();
@@ -735,7 +735,7 @@ impl PlaySession {
             .selected
             .iter()
             .copied()
-            .filter(|id| self.world.unit(*id).is_some_and(|u| u.army == self.human_army && u.role.is_builder()))
+            .filter(|id| self.world.unit(*id).is_some_and(|u| u.army == self.human_army && self.world.is_constructor(u)))
             .collect();
         if builders.is_empty()
             && let Some(acu) = self.world.commander_of(self.human_army)
@@ -900,7 +900,7 @@ impl PlaySession {
             .filter(|id| {
                 self.world
                     .unit(*id)
-                    .is_some_and(|u| u.army == self.human_army && u.role.is_factory())
+                    .is_some_and(|u| u.army == self.human_army && self.world.is_producer(u))
             })
             .collect()
     }
@@ -1031,7 +1031,7 @@ impl PlaySession {
             factories = self
                 .world
                 .units()
-                .filter(|u| u.army == self.human_army && u.role.is_factory())
+                .filter(|u| u.army == self.human_army && self.world.is_producer(u))
                 .map(|u| u.id)
                 .collect();
         }

@@ -323,11 +323,21 @@ bumps `SIM_VERSION`, re-baselines golden hashes deliberately, and keeps
 - Not modelled: ACU/SCU shoulder-pod enhancements (no `PodUnitID` in their blueprint data),
   station reclaim/capture, AI building stations.
 
-### Phase 32 — Mobile factories, carriers & eggs (planned)
-- Production from mobile units: Fatboy, Atlantis, Czar, Tempest, Megalith
-  crab eggs (`XRL0002–0005`) with hatching, internal storage and launch.
-- Exit: all four crab eggs are buildable; the exclusion list is down to the
-  orbital satellite.
+### Phase 32 — Mobile factories, carriers & eggs (done)
+- Roster: mobile `FACTORY` units (Fatboy, Atlantis, CZAR, Tempest, T3 carriers) get
+  `Produce` options for any domain; mobile `CONSTRUCTION` non-engineers (Megalith) get
+  `Build` options. The sim derives `mobile_factory` / `mobile_builder` from those options
+  (`Skirmish::is_producer` / `is_constructor`), so `Produce`/`Rally`/`SetRepeat`/
+  `CancelProduce`/`Build` and the HUD accept them; units roll off behind the moving factory.
+- Crab eggs: structures with `Economy.BuildUnit` hatch into it the moment they finish
+  (hatchlings loaded into the catalog). Roster excluded 5 → 1 (only the Novax satellite);
+  `roster --verify SCMP_009` 369/369 (hatchlings count as completions).
+- `AIRSTAGINGPLATFORM` mobiles (Fatboy, Atlantis, CZAR) are air staging platforms; docked
+  aircraft ride along. Rules v5.
+- Exit: produce-while-moving + mobile docking and egg-laying → hatch tests pass (310/310);
+  `bench-scale --units 2048` 176 / 315 ticks/s, exact `1t == 20t`. Done.
+- Not modelled: carrier aircraft storage (`StorageSlots`) and launch, AI use of mobile
+  factories / Megalith eggs.
 
 ### Phase 33 — Experimental & special-ability completeness (planned)
 - Novax orbital satellite (`XEB2402`), resource generators (Paragon),

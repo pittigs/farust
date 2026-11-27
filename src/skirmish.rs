@@ -264,6 +264,13 @@ pub struct UnitTypeExt {
     /// Phase 31: pod drones an engineering station keeps alive (`Economy.EngineeringPods`
     /// `PodUnitID`, upper-case); empty = the station works itself (Cybran Hive).
     pub pods: Vec<String>,
+    /// Phase 32: unit this structure turns into the moment it is finished
+    /// (`Economy.BuildUnit`, e.g. Megalith crab eggs).
+    pub hatch: Option<String>,
+    /// Phase 32: non-structure that produces units (Fatboy, carriers, CZAR, Tempest).
+    pub mobile_factory: bool,
+    /// Phase 32: non-engineer that places structures (Megalith laying eggs).
+    pub mobile_builder: bool,
 }
 
 /// Phase 30: air staging platform data (`Transport.DockingSlots`, `AI.Refueling*`,
@@ -448,8 +455,9 @@ pub const LOF_CLEARANCE: i64 = SCALE / 4;
 /// Phase 29: sim rules generation. Replays / saves record it and refuse to re-simulate
 /// under different rules (1 = Phases ≤ 28; 2 = Phase 29 ballistics, turrets and structure
 /// footprints blocking pathing).
-/// 3 = Phase 30 air fuel & staging; 4 = Phase 31 engineering stations & pod drones.
-pub const RULES_VERSION: u32 = 4;
+/// 3 = Phase 30 air fuel & staging; 4 = Phase 31 engineering stations & pod drones;
+/// 5 = Phase 32 mobile factories, mobile staging & hatching eggs.
+pub const RULES_VERSION: u32 = 5;
 
 /// Phase 29: milliradians per degree, scaled by 1000 (17.453 mrad / deg).
 const MRAD_PER_DEG_MILLI: i64 = 17_453;
@@ -939,6 +947,12 @@ impl UnitTypeExt {
                     .round() as i64;
             }
         }
+        if role.is_structure() {
+            out.hatch = root
+                .get("Economy")
+                .and_then(|e| e.get_str("BuildUnit"))
+                .map(|id| id.to_ascii_uppercase());
+        }
         if role == Role::EngStation {
             out.pods = root
                 .get("Economy")
@@ -950,7 +964,7 @@ impl UnitTypeExt {
                 .map(|id| id.to_ascii_uppercase())
                 .collect();
         }
-        if role == Role::AirStaging {
+        if role == Role::AirStaging || has_cat("AIRSTAGINGPLATFORM") {
             let ai = root.get("AI");
             let ai_f = |k: &str, d: f64| ai.and_then(|a| a.get_f64(k)).unwrap_or(d);
             out.staging = Some(StagingSpec {
@@ -1502,6 +1516,25 @@ impl Catalog {
                 t.energy_per_tick -= (upkeep * SCALE as f64).round() as i64 / TICK_HZ as i64;
             }
             self.types.insert(id.clone(), t);
+        }
+        // Phase 32: mobile units with produce / build options become mobile factories /
+        // mobile builders; eggs' hatchlings must be loadable.
+        for t in self.types.values_mut() {
+            if t.role.is_structure() || t.role.is_builder() {
+                continue;
+            }
+            let opts = r.options_of(&t.id.to_ascii_uppercase());
+            t.ext.mobile_factory = opts.iter().any(|o| o.kind == roster::BuildKind::Produce);
+            t.ext.mobile_builder = opts.iter().any(|o| o.kind == roster::BuildKind::Build);
+        }
+        let hatchlings: Vec<String> = self.types.values().filter_map(|t| t.ext.hatch.clone()).collect();
+        for id in hatchlings {
+            if !self.types.contains_key(&id)
+                && let Some(root) = roots.get(&id)
+                && let Some(Ok(role)) = Some(roster::infer_role(&infos[&id]))
+            {
+                self.types.insert(id.clone(), UnitType::from_blueprint(&id, role, root));
+            }
         }
         // Phase 31: pod drones are spawned by their stations, never built: load them too.
         let pods: Vec<String> = self.types.values().flat_map(|t| t.ext.pods.iter().cloned()).collect();
@@ -3271,7 +3304,7 @@ impl Skirmish {
                 let Some(b) = self.unit(builder) else {
                     return false;
                 };
-                if b.army != army || !b.role.is_builder() || b.carried_by.is_some() {
+                if b.army != army || !self.is_constructor(b) || b.carried_by.is_some() {
                     return false;
                 }
                 let Some(fi) = self.army(army).map(|a| a.faction) else {
@@ -3315,7 +3348,7 @@ impl Skirmish {
                 let fi = self.army(army).map(|a| a.faction).unwrap_or(usize::MAX);
                 let ok = self.unit(factory).is_some_and(|u| {
                     u.army == army
-                        && u.role.is_factory()
+                        && self.is_producer(u)
                         && (self.catalog.faction_can_produce(fi, &unit_type)
                             || self.catalog.builder_can_produce(&u.type_id, &unit_type))
                 });
@@ -3331,8 +3364,9 @@ impl Skirmish {
             }
             Command::Rally { factory, x, y } => {
                 let p = self.clamp_to_map(x, y);
+                let producer = self.unit(factory).is_some_and(|u| self.is_producer(u));
                 match self.units.get_mut(&factory) {
-                    Some(u) if u.alive && u.army == army && u.role.is_factory() => {
+                    Some(u) if u.alive && u.army == army && producer => {
                         u.rally = Some(p);
                         true
                     }
@@ -3562,10 +3596,11 @@ impl Skirmish {
                 ids.sort_unstable();
                 ids.dedup();
                 for id in ids {
+                    let producer = self.unit(id).is_some_and(|u| self.is_producer(u));
                     if let Some(u) = self.units.get_mut(&id)
                         && u.alive
                         && u.army == army
-                        && u.role.is_factory()
+                        && producer
                     {
                         u.repeat_queue = enabled;
                         any = true;
@@ -3574,10 +3609,11 @@ impl Skirmish {
                 any
             }
             Command::CancelProduce { factory, unit_type, count } => {
+                let producer = self.unit(factory).is_some_and(|u| self.is_producer(u));
                 let Some(u) = self.units.get_mut(&factory) else {
                     return false;
                 };
-                if !u.alive || u.army != army || !u.role.is_factory() || count == 0 {
+                if !u.alive || u.army != army || !producer || count == 0 {
                     return false;
                 }
                 let mut left = count.min(500);
@@ -3613,6 +3649,13 @@ impl Skirmish {
 
     pub fn spawn_unit(&mut self, army: ArmyId, type_id: &str, pos: (i64, i64)) -> Option<UnitId> {
         let t = self.catalog.get(type_id)?.clone();
+        // Phase 32: a finished egg hatches straight into its unit.
+        if let Some(h) = t.ext.hatch.as_deref()
+            && h != t.id
+            && self.catalog.get(h).is_some()
+        {
+            return self.spawn_unit(army, h, pos);
+        }
         let id = self.next_id;
         self.next_id += 1;
         let weapons: Vec<WeaponState> = t
@@ -4479,7 +4522,9 @@ impl Skirmish {
             };
             let assisted_rate = build_rate * (100 + adj) / 100 + assist_bonus.get(&id).copied().unwrap_or(0);
 
-            if role.is_factory() {
+            let (mobile_factory, mobile_builder) =
+                self.catalog.get(&type_id).map_or((false, false), |t| (t.ext.mobile_factory, t.ext.mobile_builder));
+            if role.is_factory() || mobile_factory {
                 if self.units[&id].build.is_none() && !capped(&cap_counts, army) {
                     let next = self.units.get_mut(&id).unwrap().production.pop_front();
                     if let Some(tid) = next {
@@ -4528,7 +4573,7 @@ impl Skirmish {
                     }
                     self.units.get_mut(&id).unwrap().build = Some(job);
                 }
-            } else if role.is_builder() || role == Role::EngStation {
+            } else if role.is_builder() || role == Role::EngStation || mobile_builder {
                 match head {
                     Some(UnitOrder::Build { unit_type, x, y }) => {
                         let target_r = self.catalog.get(&unit_type).map(|t| t.radius).unwrap_or(0);
@@ -5044,10 +5089,22 @@ impl Skirmish {
         None
     }
 
-    /// Phase 30: whether `sid` is a live air staging platform owned by `army`.
+    /// Phase 30/32: whether `sid` is a live air staging platform (structure, or a mobile
+    /// one such as the Fatboy, Atlantis or CZAR) owned by `army`.
     fn is_staging_of(&self, sid: UnitId, army: ArmyId) -> bool {
-        self.unit(sid)
-            .is_some_and(|s| s.alive && s.army == army && s.role == Role::AirStaging && s.carried_by.is_none())
+        self.unit(sid).is_some_and(|s| {
+            s.alive && s.army == army && s.carried_by.is_none() && self.catalog.get(&s.type_id).is_some_and(|t| t.ext.staging.is_some())
+        })
+    }
+
+    /// Phase 32: unit `u` can queue unit production (factory structures and mobile factories).
+    pub fn is_producer(&self, u: &Unit) -> bool {
+        u.role.is_factory() || self.catalog.get(&u.type_id).is_some_and(|t| t.ext.mobile_factory)
+    }
+
+    /// Phase 32: unit `u` can place structures (engineers, commanders, mobile builders).
+    pub fn is_constructor(&self, u: &Unit) -> bool {
+        u.role.is_builder() || self.catalog.get(&u.type_id).is_some_and(|t| t.ext.mobile_builder)
     }
 
     /// Phase 30: docking slots of staging platform `sid` taken by docked aircraft.
@@ -5103,7 +5160,7 @@ impl Skirmish {
             let platforms: Vec<(UnitId, ArmyId, (i64, i64), StagingSpec)> = self
                 .units
                 .values()
-                .filter(|s| s.alive && s.role == Role::AirStaging && s.carried_by.is_none())
+                .filter(|s| s.alive && s.carried_by.is_none())
                 .filter_map(|s| self.catalog.get(&s.type_id).and_then(|t| t.ext.staging).map(|sp| (s.id, s.army, (s.pos.x, s.pos.y), sp)))
                 .collect();
             if !platforms.is_empty() {
@@ -5170,6 +5227,7 @@ impl Skirmish {
                 u.moving = false;
                 continue;
             }
+            self.units.get_mut(&id).unwrap().pos = Vec2 { x: spos.0, y: spos.1 };
             let (fuel_ticks, recharge, base_speed) = self
                 .catalog
                 .get(&self.units[&id].type_id)
@@ -7261,6 +7319,73 @@ pub(crate) mod tests {
         w.units.get_mut(&ken).unwrap().hp = 0;
         w.run(3);
         assert!(all.iter().all(|p| w.unit(*p).is_none()), "pods die with their station");
+    }
+
+    /// Phase 32 fixture: a Fatboy-like mobile factory + air staging `RFAT`, a Megalith-like
+    /// mobile builder `RMEGA` and an egg `REGG` that hatches into an engineer.
+    fn mobile_factory_world() -> Skirmish {
+        let mut w = staging_world();
+        let mut fat = ty("RFAT", Role::Experimental, 5_000, 2, 0, 0);
+        fat.build_rate = 40;
+        fat.radius = 3 * SCALE;
+        fat.ext.mobile_factory = true;
+        fat.ext.staging = Some(StagingSpec { slots: 2, refuel_multiplier: 1, repair_permille: 0, repair_energy: 0, repair_mass: 0, scan_radius: 300 * SCALE });
+        let mut mega = ty("RMEGA", Role::Experimental, 5_000, 2, 0, 0);
+        mega.build_rate = 40;
+        mega.build_range = SCALE;
+        mega.ext.mobile_builder = true;
+        let mut egg = ty("REGG", Role::Factory, 10, 0, 0, 0);
+        egg.radius = SCALE / 2;
+        egg.ext.hatch = Some("RENG".into());
+        for t in [fat, mega, egg] {
+            w.catalog.types.insert(t.id.clone(), t);
+        }
+        w.catalog.extra_buildable.resize(2, Vec::new());
+        w.catalog.extra_buildable[0].push("REGG".into());
+        w
+    }
+
+    #[test]
+    fn mobile_factories_produce_on_the_move_and_dock_aircraft() {
+        let mut w = mobile_factory_world();
+        let fat = w.spawn_unit(0, "RFAT", (60 * SCALE, 60 * SCALE)).unwrap();
+        assert!(w.is_producer(w.unit(fat).unwrap()));
+        w.issue(0, Command::Move { units: vec![fat], x: 160 * SCALE, y: 60 * SCALE, queue: false });
+        w.issue(0, Command::Produce { factory: fat, unit_type: "RT".into(), count: 1 });
+        let before: Vec<UnitId> = w.units().map(|u| u.id).collect();
+        let mut made = None;
+        for _ in 0..100 {
+            w.step();
+            if let Some(u) = w.units().find(|u| !before.contains(&u.id) && u.type_id == "RT") {
+                made = Some((u.pos, w.unit(fat).unwrap().pos));
+                break;
+            }
+        }
+        let (tank, fat_pos) = made.expect("the moving factory produced a tank");
+        assert!(fat_pos.x > 60 * SCALE, "it was moving");
+        assert!(dist_sq((tank.x, tank.y), (fat_pos.x, fat_pos.y)) <= (8 * SCALE as i128).pow(2), "tank rolls off next to it");
+
+        // Mobile air staging: a docked fighter rides along.
+        let f = w.spawn_unit(0, "RAIR", (fat_pos.x, fat_pos.y + 5 * SCALE)).unwrap();
+        w.units.get_mut(&f).unwrap().hp = SCALE;
+        w.issue(0, Command::Dock { units: vec![f], staging: fat, queue: false });
+        w.run(5);
+        assert_eq!(w.unit(f).unwrap().carried_by, Some(fat));
+        w.run(10);
+        assert_eq!(w.unit(f).unwrap().pos, w.unit(fat).unwrap().pos, "docked fighter follows the platform");
+    }
+
+    #[test]
+    fn mobile_builders_lay_eggs_that_hatch_into_units() {
+        let mut w = mobile_factory_world();
+        let mega = w.spawn_unit(0, "RMEGA", (80 * SCALE, 80 * SCALE)).unwrap();
+        assert!(w.is_constructor(w.unit(mega).unwrap()));
+        assert!(w.apply_command_direct(0, Command::Build { builder: mega, unit_type: "REGG".into(), x: 84 * SCALE, y: 80 * SCALE, queue: false }));
+        w.run(40);
+        assert!(w.units().all(|u| u.type_id != "REGG"), "the egg never lingers as a structure");
+        let hatched: Vec<&Unit> = w.units().filter(|u| u.type_id == "RENG" && u.army == 0).collect();
+        assert_eq!(hatched.len(), 1, "egg hatched into an engineer");
+        assert!(dist_sq((hatched[0].pos.x, hatched[0].pos.y), (84 * SCALE, 80 * SCALE)) <= (2 * SCALE as i128).pow(2));
     }
 
     #[test]

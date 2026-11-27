@@ -346,7 +346,12 @@ fn sim_options(
     let faction = builder.faction();
     let exprs: Vec<&String> = builder.buildable.iter().chain(builder.enh_adds.iter()).collect();
     let lists = |c: &BpInfo| exprs.iter().any(|e| expr_matches(e, &c.cats));
-    if role.is_builder() {
+    // Phase 32: mobile non-engineers build (`CONSTRUCTION`, e.g. the Megalith laying eggs)
+    // or produce (`FACTORY`: Fatboy, carriers, CZAR, Tempest) like their structure cousins.
+    let mobile = builder.is_mobile_kind();
+    let mobile_builder = mobile && !role.is_builder() && builder.has("CONSTRUCTION") && !builder.has("FACTORY");
+    let mobile_factory = mobile && !role.is_builder() && builder.has("FACTORY");
+    if role.is_builder() || mobile_builder {
         for (id, c) in bps {
             if *id == builder.id || c.faction() != faction || !lists(c) {
                 continue;
@@ -358,7 +363,7 @@ fn sim_options(
                 out.push(BuildOption { id: id.clone(), tier: c.tier(), kind: BuildKind::Build, group: BuildGroup::of(*r, c) });
             }
         }
-    } else if role.is_factory() {
+    } else if role.is_factory() || mobile_factory {
         let want = match role {
             Role::AirFactory => 1,
             Role::NavalFactory => 2,
@@ -371,7 +376,7 @@ fn sim_options(
             let Some(Ok(r)) = roles.get(id) else {
                 continue;
             };
-            if matches!(r, Role::Mobile | Role::Engineer) && mobile_domain_group(c) == want {
+            if matches!(r, Role::Mobile | Role::Engineer) && (mobile_factory || mobile_domain_group(c) == want) {
                 out.push(BuildOption { id: id.clone(), tier: c.tier(), kind: BuildKind::Produce, group: BuildGroup::of(*r, c) });
             }
         }
@@ -904,7 +909,15 @@ pub fn cmd_roster_verify(args: &[String]) -> Result<(), String> {
         let done_of = |w: &Skirmish, j: &Job| -> bool {
             match j.kind {
                 BuildKind::Upgrade => w.unit(j.builder).is_some_and(|u| u.type_id.eq_ignore_ascii_case(&j.target)),
-                _ => w.units().any(|u| u.army == 0 && u.type_id == j.target && !initial.contains(&u.id)),
+                _ => {
+                    // Phase 32: eggs hatch into their `BuildUnit` the moment they finish.
+                    let hatch = w.catalog().get(&j.target).and_then(|t| t.ext.hatch.clone());
+                    w.units().any(|u| {
+                        u.army == 0
+                            && (u.type_id == j.target || hatch.as_deref() == Some(u.type_id.as_str()))
+                            && !initial.contains(&u.id)
+                    })
+                }
             }
         };
         let mut done = vec![false; jobs.len()];
@@ -1007,7 +1020,8 @@ mod tests {
         // Air unit is listed by the land factory in FA but needs an air factory here.
         assert!(matches!(st("TSA0101"), Status::Excluded(_)));
         assert_eq!(st("TSB5101"), Status::Playable, "Phase 28: walls are playable");
-        assert!(matches!(st("TSL0999"), Status::Excluded(m) if m.contains("mobile factory")));
+        assert_eq!(st("TSL0999"), Status::Playable, "Phase 32: produced by the mobile factory TSL0401");
+        assert!(r.can("TSL0401", "TSL0999", BuildKind::Produce));
         assert_eq!(st("TSC0001"), Status::NotInTree);
 
         let fac = r.options_of("TSB0101");
@@ -1019,9 +1033,9 @@ mod tests {
         assert!(acu.iter().any(|o| o.id == "TSB2301" && o.tier == 2 && o.group == BuildGroup::Defense));
         assert!(acu.iter().any(|o| o.id == "TSL0401" && o.group == BuildGroup::Experimental));
         assert!(!r.can("TSL0105", "TSB2301", BuildKind::Build));
-        assert_eq!(r.playable[0].len(), 10);
+        assert_eq!(r.playable[0].len(), 11);
         let cov = coverage(&r);
-        assert_eq!(cov[0][0], (6, 8));
+        assert_eq!(cov[0][0], (7, 8));
         assert_eq!(cov[0][3], (1, 1));
     }
 
