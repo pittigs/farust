@@ -954,6 +954,33 @@ impl PlaySession {
         true
     }
 
+    /// Phase 30: right-clicking an own air staging platform with aircraft selected docks them.
+    pub fn handle_right_click_dock(&mut self, world_xz: (i64, i64), queue: bool, pick_radius: i64) -> bool {
+        let Some(staging) = self.world.unit_at(world_xz, pick_radius, Some(self.human_army), None) else {
+            return false;
+        };
+        if !self.world.unit(staging).is_some_and(|u| u.role == Role::AirStaging) {
+            return false;
+        }
+        let aircraft: Vec<UnitId> = self
+            .selected
+            .iter()
+            .copied()
+            .filter(|&id| {
+                self.world.unit(id).is_some_and(|u| {
+                    u.army == self.human_army && u.domain == crate::flowfield::NavDomain::Air && u.speed > 0 && u.carried_by.is_none()
+                })
+            })
+            .collect();
+        if aircraft.is_empty() {
+            return false;
+        }
+        let n = aircraft.len();
+        self.world.issue(self.human_army, Command::Dock { units: aircraft, staging, queue });
+        self.status_banner = format!("Docking {n} aircraft at #{staging}");
+        true
+    }
+
     /// Right-clicking a friendly air transport with carryable mobiles selected loads them.
     pub fn handle_right_click_board(&mut self, world_xz: (i64, i64), queue: bool, pick_radius: i64) -> bool {
         let Some(transport) = self.world.unit_at(world_xz, pick_radius, Some(self.human_army), None) else {

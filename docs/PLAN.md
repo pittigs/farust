@@ -284,11 +284,27 @@ bumps `SIM_VERSION`, re-baselines golden hashes deliberately, and keeps
 - Deferred: turret yaw *range* limits and hull-facing fixed weapons (needs hull facing,
   Phase 35); render still draws direct shells at ground + 1.2 m, not their sim height.
 
-### Phase 30 — Air fuel, staging & repair (planned)
-- `Fuel` / `FuelUseTime` / `FuelRechargeRate`, out-of-fuel speed penalty,
-  air staging docking slots, refuel + repair, auto-return-to-staging toggle.
-- Exit: the 4 air staging blueprints are playable; fighters on patrol return
-  to staging when fuel runs low.
+### Phase 30 — Air fuel, staging & repair (done)
+- Aircraft burn `Physics.FuelUseTime` while airborne and fly at half speed when empty.
+- `Role::AirStaging` (all four platforms playable; roster excluded 14 → 10; `roster
+  --verify SCMP_009` 360/360): `Transport.DockingSlots`, refuel at `FuelRechargeRate ×
+  AI.RefuelingMultiplier`, repair at `Transport.RepairRate` paid per second
+  (`AI.RepairConsume*`), slot limits, aircraft released when the platform dies, undock
+  and resume queued orders when full (`step_staging`, docked aircraft reuse `carried_by`).
+- Orders: `Command::Dock` (RMB an own platform with aircraft selected), `UnitOrder::Dock`,
+  `Command::SetAutoRefuel`; auto-refuel (default on) queues a dock at the nearest platform
+  with a free slot within `AI.StagingPlatformScanRadius` below 20% fuel. Replay tags 21/22,
+  fuel hashed, rules v3.
+- AI: wants a staging platform once it fields ≥ 4 aircraft; AI build jobs now respect the
+  builder's tech tier for roster-derived structures (previously T1 engineers retried
+  rejected T2 builds forever). Fixed the AI role-count array (`ROLES` 18 → 20), which
+  would have panicked on an AI-owned wall (Phase 28) or platform.
+- Exit: fuel burn/half speed, auto-dock → refuel → repair (energy cost) → resume, slot
+  limit, enemy-dock refusal and platform-death release tests pass (283/283);
+  `bench-scale --units 2048` 180 / 330 ticks/s, exact `1t == 20t`. Done.
+- Limitation: today's AI rarely has a T2 engineer before ~40 min, so it seldom builds
+  staging in practice (tech pacing is Phase 52); staging HUD (fuel bar, auto-refuel
+  toggle button) is not on the command card yet.
 
 ### Phase 31 — Engineering stations & drones (planned)
 - Kennel / Hive builder stations, UEF pod drones and Cybran build drones as

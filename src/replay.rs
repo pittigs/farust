@@ -327,6 +327,17 @@ pub(crate) fn encode_command(out: &mut Vec<u8>, cmd: &Command) {
             out.extend_from_slice(&y.to_le_bytes());
             out.push(u8::from(*queue));
         }
+        Command::Dock { units, staging, queue } => {
+            out.push(21);
+            write_ids(out, units);
+            out.extend_from_slice(&staging.to_le_bytes());
+            out.push(u8::from(*queue));
+        }
+        Command::SetAutoRefuel { units, enabled } => {
+            out.push(22);
+            write_ids(out, units);
+            out.push(u8::from(*enabled));
+        }
         Command::Enhance { unit, name } => {
             out.push(18);
             out.extend_from_slice(&unit.to_le_bytes());
@@ -442,6 +453,15 @@ pub(crate) fn decode_command(data: &[u8], pos: &mut usize) -> Result<Command, St
             x: read_i64(data, pos)?,
             y: read_i64(data, pos)?,
             queue: read_u8(data, pos)? != 0,
+        }),
+        21 => Ok(Command::Dock {
+            units: read_ids(data, pos)?,
+            staging: read_u32(data, pos)?,
+            queue: read_u8(data, pos)? != 0,
+        }),
+        22 => Ok(Command::SetAutoRefuel {
+            units: read_ids(data, pos)?,
+            enabled: read_u8(data, pos)? != 0,
         }),
         18 => Ok(Command::Enhance {
             unit: read_u32(data, pos)?,
@@ -742,6 +762,12 @@ mod tests {
             Command::Patrol { units: vec![3, 4], x: 6000, y: 7000, queue: true },
             Command::ToggleShield { units: vec![10], enabled: true },
             Command::CancelProduce { factory: 7, unit_type: "UEL0201".into(), count: 2 },
+            Command::Load { units: vec![1, 2], transport: 3, queue: false },
+            Command::Unload { transports: vec![3], x: 100, y: 200, queue: true },
+            Command::Enhance { unit: 1, name: "Shield".into() },
+            Command::SetRepeat { factories: vec![7], enabled: true },
+            Command::Dock { units: vec![11, 12], staging: 40, queue: true },
+            Command::SetAutoRefuel { units: vec![11], enabled: false },
         ];
         let mut buf = Vec::new();
         for c in &all {

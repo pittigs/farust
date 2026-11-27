@@ -172,7 +172,7 @@ fn select_category(role: Role, domain: NavDomain, tier: u8) -> &'static str {
         Role::Extractor | Role::Generator | Role::Hydro | Role::MassStorage | Role::EnergyStorage => "Resource",
         Role::PointDefense => "Gun",
         Role::Radar => "Radar",
-        Role::Shield | Role::MissileSilo | Role::MissileDefense | Role::AntiAir | Role::Wall => "Structure",
+        Role::Shield | Role::MissileSilo | Role::MissileDefense | Role::AntiAir | Role::Wall | Role::AirStaging => "Structure",
         Role::Engineer => "Vehicle",
         Role::Experimental => "Bot",
         Role::Mobile => match domain {
@@ -209,7 +209,8 @@ fn order_cue(cmd: &Command) -> &'static str {
         | Command::Upgrade { .. } => UI_ORDER_BUILD,
         Command::Produce { .. } => UI_ORDER_PRODUCE,
         Command::Stop { .. } | Command::ToggleShield { .. } => UI_ORDER_STOP,
-        Command::Load { .. } | Command::Unload { .. } => UI_ORDER_MOVE,
+        Command::Load { .. } | Command::Unload { .. } | Command::Dock { .. } => UI_ORDER_MOVE,
+        Command::SetAutoRefuel { .. } => UI_ORDER_STOP,
         Command::Enhance { .. } => UI_ORDER_BUILD,
         Command::SetRepeat { .. } | Command::CancelProduce { .. } => UI_ORDER_PRODUCE,
     }

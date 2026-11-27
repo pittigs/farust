@@ -39,7 +39,8 @@ const DEFEND_RADIUS: i64 = 70 * U;
 const GATHER_DIST: i64 = 28 * U;
 const ACU_LEASH: i64 = 60 * U;
 const ACU_MEX_RANGE: i64 = 60 * U;
-const ROLES: usize = 18;
+/// Number of [`Role`] codes (`Role::code` is 0..ROLES).
+const ROLES: usize = 20;
 /// Raids start after 4 minutes of game time.
 const RAID_START: u64 = 2_400;
 /// Air units at least this fast (milli per tick) are used for strikes, otherwise kept home.
@@ -382,6 +383,28 @@ fn has(w: &Skirmish, id: &str) -> bool {
     !id.is_empty() && w.catalog().get(id).is_some()
 }
 
+/// One structure want: role, blueprint, wanted count, site anchor, search ring.
+type WantRow<'a> = (Role, &'a String, u32, Option<(i64, i64)>, i64);
+
+/// Phase 30: the air staging platform faction `f` can build (data-driven roster).
+fn staging_type(w: &Skirmish, f: &Faction) -> Option<String> {
+    let cat = w.catalog();
+    let fi = cat.factions.iter().position(|x| x.key == f.key)?;
+    cat.types
+        .values()
+        .filter(|t| t.role == Role::AirStaging && cat.roster.playable.get(fi).is_some_and(|p| p.contains(&t.id)))
+        .map(|t| t.id.clone())
+        .min()
+}
+
+/// Whether builder `b` may place `ty` (fixed faction structures, or a roster option of its
+/// own blueprint — the same test `Command::Build` applies).
+fn builder_may_build(w: &Skirmish, f: &Faction, b: &Unit, ty: &str) -> bool {
+    let cat = w.catalog();
+    cat.factions.iter().position(|x| x.key == f.key).is_some_and(|fi| cat.faction_can_build(fi, ty))
+        || cat.builder_can_build(&b.type_id, ty)
+}
+
 fn role_of(w: &Skirmish, id: &str) -> Option<Role> {
     w.catalog().get(id).map(|t| t.role)
 }
@@ -582,6 +605,8 @@ struct Wants {
     shield: u32,
     tml: u32,
     exp: u32,
+    /// Phase 30: air staging platforms.
+    staging: u32,
     eng: usize,
 }
 
@@ -1196,6 +1221,14 @@ impl Smart {
         if p.micro && p.tech && inc >= 35 && has(w, &f.tac_missile) {
             want.tml = 1;
         }
+        // Phase 30: one staging platform (two with a big air force) once aircraft fly.
+        let aircraft = w
+            .units()
+            .filter(|u| u.army == self.army && u.alive && u.domain == NavDomain::Air && u.speed > 0)
+            .count() as u32;
+        if aircraft >= 4 && inc >= 8 && staging_type(w, v.f).is_some() {
+            want.staging = 1 + u32::from(aircraft >= 20);
+        }
         if p.tech && has(w, &f.experimental) && inc >= if p.micro { 70 } else { 90 } && v.mass_float() {
             want.exp = v.have[Role::Experimental.code() as usize] + 1;
         }
@@ -1472,7 +1505,8 @@ impl Smart {
         // 3. Structures by priority.
         let pd_anchor = self.forward(v, 22 * U);
         let pg_anchor = self.pgen_anchor(v);
-        let wants: [(Role, &String, u32, Option<(i64, i64)>, i64); 10] = [
+        let staging_ty = staging_type(w, f).unwrap_or_default();
+        let wants: [WantRow; 11] = [
             (Role::Factory, &f.factory, v.want.land, Some(v.start), 14),
             (Role::AntiAir, &f.anti_air, v.want.aa, Some(v.start), 10),
             (Role::PointDefense, &f.point_defense, v.want.pd, Some(pd_anchor), 8),
@@ -1483,6 +1517,7 @@ impl Smart {
             (Role::Shield, &f.shield, v.want.shield, Some(v.start), 10),
             (Role::MissileSilo, &f.tac_missile, v.want.tml, Some(v.start), 12),
             (Role::Experimental, &f.experimental, v.want.exp, Some(v.start), 14),
+            (Role::AirStaging, &staging_ty, v.want.staging, Some(v.start), 14),
         ];
         for (role, ty, want, anchor, ring) in wants {
             let Some(anchor) = anchor else { continue };
@@ -1497,6 +1532,10 @@ impl Smart {
                 continue;
             }
             if is_acu && matches!(role, Role::Experimental | Role::NavalFactory) {
+                continue;
+            }
+            // Roster-derived types (e.g. air staging) need a builder of the right tech tier.
+            if !builder_may_build(w, f, b, ty) {
                 continue;
             }
             if let Some(s) = self.find_site(v, ty, anchor, ring) {

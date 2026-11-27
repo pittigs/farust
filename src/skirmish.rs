@@ -255,6 +255,28 @@ pub struct UnitTypeExt {
     pub ammo_cap: u32,
     /// Phase 24: structure can only be placed on water (`Physics.BuildOnLayerCaps`).
     pub water_only: bool,
+    /// Phase 30: flight time on a full tank (`Physics.FuelUseTime`, ticks); 0 = unlimited.
+    pub fuel_ticks: u32,
+    /// Phase 30: `Physics.FuelRechargeRate` (fuel seconds regained per second, milli).
+    pub fuel_recharge_milli: i64,
+    /// Phase 30: present on air staging platforms.
+    pub staging: Option<StagingSpec>,
+}
+
+/// Phase 30: air staging platform data (`Transport.DockingSlots`, `AI.Refueling*`,
+/// `Transport.RepairRate`, `AI.RepairConsume*`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StagingSpec {
+    pub slots: u8,
+    /// Docked refuel speed = `FuelRechargeRate × multiplier`.
+    pub refuel_multiplier: i64,
+    /// Repair per second in ‰ of max health.
+    pub repair_permille: i64,
+    /// Resource cost per second of repairing (milli).
+    pub repair_energy: i64,
+    pub repair_mass: i64,
+    /// Auto-refuel search radius (`AI.StagingPlatformScanRadius`, milli).
+    pub scan_radius: i64,
 }
 
 /// Runtime enhancement state of one unit (effects already folded in).
@@ -321,6 +343,8 @@ pub enum Role {
     Experimental,
     /// Phase 28: wall section — an inert structure that blocks land/amphibious pathing.
     Wall,
+    /// Phase 30: air staging platform — docks, refuels and repairs aircraft.
+    AirStaging,
 }
 
 impl Role {
@@ -342,6 +366,7 @@ impl Role {
                 | Role::MissileSilo
                 | Role::MissileDefense
                 | Role::Wall
+                | Role::AirStaging
         )
     }
     pub fn is_factory(self) -> bool {
@@ -371,6 +396,7 @@ impl Role {
             Role::MissileDefense => 16,
             Role::Experimental => 17,
             Role::Wall => 18,
+            Role::AirStaging => 19,
         }
     }
 }
@@ -414,7 +440,8 @@ pub const LOF_CLEARANCE: i64 = SCALE / 4;
 /// Phase 29: sim rules generation. Replays / saves record it and refuse to re-simulate
 /// under different rules (1 = Phases ≤ 28; 2 = Phase 29 ballistics, turrets and structure
 /// footprints blocking pathing).
-pub const RULES_VERSION: u32 = 2;
+/// 3 = Phase 30 air fuel & staging.
+pub const RULES_VERSION: u32 = 3;
 
 /// Phase 29: milliradians per degree, scaled by 1000 (17.453 mrad / deg).
 const MRAD_PER_DEG_MILLI: i64 = 17_453;
@@ -504,6 +531,7 @@ fn default_strategic_icon(role: Role, tier: u8) -> &'static str {
         Role::Experimental => "icon_experimental_generic",
         Role::Mobile => "icon_land1_directfire",
         Role::Wall => "icon_structure_wall",
+        Role::AirStaging => "icon_structure2_air",
     }
 }
 
@@ -885,6 +913,31 @@ impl UnitTypeExt {
                 class2_size: t_f("Class2AttachSize").unwrap_or(2.0).clamp(1.0, 8.0) as u8,
                 class3_size: t_f("Class3AttachSize").unwrap_or(4.0).clamp(1.0, 16.0) as u8,
                 carries_commander: has_cat("CANTRANSPORTCOMMANDER"),
+            });
+        }
+        if domain == NavDomain::Air && !role.is_structure() {
+            let fuel = root.get("Physics").and_then(|p| p.get_f64("FuelUseTime")).unwrap_or(0.0);
+            if fuel > 0.0 {
+                out.fuel_ticks = (fuel * TICK_HZ as f64).round().clamp(1.0, u32::MAX as f64 / 2.0) as u32;
+                out.fuel_recharge_milli = (root
+                    .get("Physics")
+                    .and_then(|p| p.get_f64("FuelRechargeRate"))
+                    .unwrap_or(5.0)
+                    .max(0.1)
+                    * 1000.0)
+                    .round() as i64;
+            }
+        }
+        if role == Role::AirStaging {
+            let ai = root.get("AI");
+            let ai_f = |k: &str, d: f64| ai.and_then(|a| a.get_f64(k)).unwrap_or(d);
+            out.staging = Some(StagingSpec {
+                slots: t_f("DockingSlots").unwrap_or(4.0).clamp(1.0, 32.0) as u8,
+                refuel_multiplier: ai_f("RefuelingMultiplier", 50.0).clamp(1.0, 1000.0).round() as i64,
+                repair_permille: (t_f("RepairRate").unwrap_or(0.1).clamp(0.0, 1.0) * 1000.0).round() as i64,
+                repair_energy: (ai_f("RepairConsumeEnergy", 5.0).max(0.0) * SCALE as f64).round() as i64,
+                repair_mass: (ai_f("RepairConsumeMass", 0.5).max(0.0) * SCALE as f64).round() as i64,
+                scan_radius: (ai_f("StagingPlatformScanRadius", 300.0).clamp(10.0, 2_000.0) * SCALE as f64).round() as i64,
             });
         }
         if matches!(domain, NavDomain::Land | NavDomain::Amphibious)
@@ -1638,6 +1691,8 @@ pub enum UnitOrder {
     Unload { x: i64, y: i64 },
     /// Phase 18: (ACU/SCU) install the named blueprint enhancement in place.
     Enhance(String),
+    /// Phase 30: (aircraft) fly to this air staging platform, dock, refuel and repair.
+    Dock(UnitId),
 }
 
 /// Player / AI input. Applied at the start of the next tick in issue order.
@@ -1668,6 +1723,10 @@ pub enum Command {
     ToggleShield { units: Vec<UnitId>, enabled: bool },
     /// Phase 18: `units` board air transport `transport`.
     Load { units: Vec<UnitId>, transport: UnitId, queue: bool },
+    /// Phase 30: aircraft dock at an own air staging platform.
+    Dock { units: Vec<UnitId>, staging: UnitId, queue: bool },
+    /// Phase 30: toggle automatic return to air staging on low fuel.
+    SetAutoRefuel { units: Vec<UnitId>, enabled: bool },
     /// Phase 18: `transports` fly to `(x, y)` and drop their cargo.
     Unload { transports: Vec<UnitId>, x: i64, y: i64, queue: bool },
     /// Phase 18: install ACU/SCU enhancement `name` (blueprint `Enhancements` key).
@@ -1804,6 +1863,10 @@ pub struct Unit {
     pub height: i64,
     /// Phase 29: ground displacement during the last tick (milli), used to lead targets.
     pub vel: (i64, i64),
+    /// Phase 30: remaining flight time (ticks; only meaningful when the type has fuel).
+    pub fuel: u32,
+    /// Phase 30: return to the nearest free air staging platform when fuel runs low.
+    pub auto_refuel: bool,
 }
 
 impl Unit {
@@ -3392,6 +3455,35 @@ impl Skirmish {
                 }
                 true
             }
+            Command::Dock { units, staging, queue } => {
+                if !self.is_staging_of(staging, army) {
+                    return false;
+                }
+                let mut ids: Vec<UnitId> = units
+                    .iter()
+                    .copied()
+                    .filter(|&id| self.unit(id).is_some_and(|u| u.army == army && u.domain == NavDomain::Air && u.speed > 0 && u.carried_by.is_none()))
+                    .collect();
+                ids.sort_unstable();
+                ids.dedup();
+                if ids.is_empty() {
+                    return false;
+                }
+                for id in ids {
+                    self.push_order(id, UnitOrder::Dock(staging), queue);
+                }
+                true
+            }
+            Command::SetAutoRefuel { units, enabled } => {
+                let mut any = false;
+                for id in units {
+                    if let Some(u) = self.units.get_mut(&id).filter(|u| u.army == army && u.alive) {
+                        u.auto_refuel = enabled;
+                        any = true;
+                    }
+                }
+                any
+            }
             Command::Unload { transports, x, y, queue } => {
                 let p = self.clamp_to_map(x, y);
                 let mut ids = transports;
@@ -3559,6 +3651,8 @@ impl Skirmish {
                 omni_mask: 0,
                 height: t.size[1].max(SCALE / 4),
                 vel: (0, 0),
+                fuel: t.ext.fuel_ticks,
+                auto_refuel: t.ext.fuel_ticks > 0,
             },
         );
         Some(id)
@@ -3668,7 +3762,7 @@ impl Skirmish {
         }
         { let _p = scope("sim.movement"); self.step_movement(); }
         { let _p = scope("sim.separation"); self.step_separation(); }
-        { let _p = scope("sim.transport"); self.step_transport(); }
+        { let _p = scope("sim.transport"); self.step_transport(); self.step_staging(); }
         for u in self.units.values_mut() {
             u.vel = (u.pos.x - u.vel.0, u.pos.y - u.vel.1);
         }
@@ -4785,9 +4879,177 @@ impl Skirmish {
                     }
                     return Some(((x, y), SCALE));
                 }
+                UnitOrder::Dock(sid) => {
+                    if !self.is_staging_of(sid, army) {
+                        self.units.get_mut(&id).unwrap().orders.pop_front();
+                        continue;
+                    }
+                    let s = &self.units[&sid];
+                    let sp = (s.pos.x, s.pos.y);
+                    if pos == sp {
+                        return None;
+                    }
+                    return Some((sp, SCALE));
+                }
             }
         }
         None
+    }
+
+    /// Phase 30: whether `sid` is a live air staging platform owned by `army`.
+    fn is_staging_of(&self, sid: UnitId, army: ArmyId) -> bool {
+        self.unit(sid)
+            .is_some_and(|s| s.alive && s.army == army && s.role == Role::AirStaging && s.carried_by.is_none())
+    }
+
+    /// Phase 30: docking slots of staging platform `sid` taken by docked aircraft.
+    fn docked_at(&self, sid: UnitId) -> Vec<UnitId> {
+        self.units
+            .values()
+            .filter(|u| u.alive && u.carried_by == Some(sid) && matches!(u.orders.front(), Some(UnitOrder::Dock(s)) if *s == sid))
+            .map(|u| u.id)
+            .collect()
+    }
+
+    /// Phase 30 air fuel & staging (ascending unit id throughout):
+    /// 1. aircraft whose staging platform died are released;
+    /// 2. airborne aircraft burn one tick of fuel and fly at half speed when empty;
+    /// 3. every second, low-fuel aircraft with auto-refuel queue a `Dock` at the nearest own
+    ///    platform with a free slot within its scan radius;
+    /// 4. aircraft that reached their platform dock (if a slot is free);
+    /// 5. docked aircraft refuel (`FuelRechargeRate × RefuelingMultiplier`) and are repaired
+    ///    (`RepairRate`, paid per second in energy/mass), then undock and resume orders.
+    fn step_staging(&mut self) {
+        if !self.units.values().any(|u| u.domain == NavDomain::Air) {
+            return;
+        }
+        let ids: Vec<UnitId> = self.units.keys().copied().collect();
+        // 1. Release aircraft from dead platforms.
+        for &id in &ids {
+            let Some(sid) = self.units[&id].carried_by else { continue };
+            let staged = matches!(self.units[&id].orders.front(), Some(UnitOrder::Dock(s)) if *s == sid);
+            if staged && !self.units.get(&sid).is_some_and(|s| s.alive) {
+                let u = self.units.get_mut(&id).unwrap();
+                u.carried_by = None;
+                u.orders.pop_front();
+            }
+        }
+        // 2. Fuel burn.
+        for &id in &ids {
+            if self.units[&id].domain != NavDomain::Air {
+                continue;
+            }
+            let (fuel_ticks, base_speed) = match self.units.get(&id).and_then(|u| self.catalog.get(&u.type_id)) {
+                Some(t) => (t.ext.fuel_ticks, t.speed_per_tick),
+                None => continue,
+            };
+            let u = self.units.get_mut(&id).unwrap();
+            if fuel_ticks == 0 || !u.alive || u.carried_by.is_some() || u.domain != NavDomain::Air {
+                continue;
+            }
+            u.fuel = u.fuel.saturating_sub(1);
+            u.speed = if u.fuel == 0 { base_speed / 2 } else { base_speed };
+        }
+        // 3. Auto-refuel.
+        if self.tick.is_multiple_of(TICK_HZ) {
+            let platforms: Vec<(UnitId, ArmyId, (i64, i64), StagingSpec)> = self
+                .units
+                .values()
+                .filter(|s| s.alive && s.role == Role::AirStaging && s.carried_by.is_none())
+                .filter_map(|s| self.catalog.get(&s.type_id).and_then(|t| t.ext.staging).map(|sp| (s.id, s.army, (s.pos.x, s.pos.y), sp)))
+                .collect();
+            if !platforms.is_empty() {
+                let mut load: BTreeMap<UnitId, u32> = BTreeMap::new();
+                for u in self.units.values().filter(|u| u.alive) {
+                    if let Some(UnitOrder::Dock(s)) = u.orders.front() {
+                        *load.entry(*s).or_insert(0) += 1;
+                    }
+                }
+                for &id in &ids {
+                    let Some(u) = self.units.get(&id).filter(|u| u.domain == NavDomain::Air) else { continue };
+                    let fuel_ticks = self.catalog.get(&u.type_id).map_or(0, |t| t.ext.fuel_ticks);
+                    if !u.alive || !u.auto_refuel || fuel_ticks == 0 || u.carried_by.is_some()
+                        || matches!(u.orders.front(), Some(UnitOrder::Dock(_)))
+                        || u.fuel as u64 * 5 > fuel_ticks as u64
+                    {
+                        continue;
+                    }
+                    let p = (u.pos.x, u.pos.y);
+                    let best = platforms
+                        .iter()
+                        .filter(|(sid, a, sp_pos, sp)| {
+                            *a == u.army
+                                && load.get(sid).copied().unwrap_or(0) < sp.slots as u32
+                                && dist_sq(p, *sp_pos) <= (sp.scan_radius as i128) * (sp.scan_radius as i128)
+                        })
+                        .min_by_key(|(sid, _, sp_pos, _)| (dist_sq(p, *sp_pos), *sid))
+                        .map(|(sid, ..)| *sid);
+                    if let Some(sid) = best {
+                        *load.entry(sid).or_insert(0) += 1;
+                        let u = self.units.get_mut(&id).unwrap();
+                        u.orders.push_front(UnitOrder::Dock(sid));
+                        u.path.clear();
+                        u.path_goal = None;
+                    }
+                }
+            }
+        }
+        // 4. Docking on arrival; 5. servicing.
+        for &id in &ids {
+            let Some(u) = self.units.get(&id) else { continue };
+            let Some(&UnitOrder::Dock(sid)) = u.orders.front() else { continue };
+            if !u.alive {
+                continue;
+            }
+            let Some((spos, sradius, spec)) = self
+                .units
+                .get(&sid)
+                .and_then(|s| self.catalog.get(&s.type_id).and_then(|t| t.ext.staging).map(|sp| ((s.pos.x, s.pos.y), s.radius, sp)))
+            else {
+                continue;
+            };
+            let (army, docked) = (u.army, u.carried_by == Some(sid));
+            if !docked {
+                let reach = (sradius + 3 * SCALE) as i128;
+                if dist_sq((u.pos.x, u.pos.y), spos) > reach * reach || self.docked_at(sid).len() >= spec.slots as usize {
+                    continue;
+                }
+                let u = self.units.get_mut(&id).unwrap();
+                u.carried_by = Some(sid);
+                u.pos = Vec2 { x: spos.0, y: spos.1 };
+                u.path.clear();
+                u.path_goal = None;
+                u.moving = false;
+                continue;
+            }
+            let (fuel_ticks, recharge, base_speed) = self
+                .catalog
+                .get(&self.units[&id].type_id)
+                .map_or((0, 0, 0), |t| (t.ext.fuel_ticks, t.ext.fuel_recharge_milli, t.speed_per_tick));
+            // `FuelRechargeRate` fuel-seconds per second = fuel ticks per tick.
+            let refuel = ((recharge * spec.refuel_multiplier) / 1000).clamp(1, u32::MAX as i64 / 4) as u32;
+            let (hp, max_hp) = (self.units[&id].hp, self.units[&id].max_hp);
+            let mut heal = 0;
+            if hp < max_hp {
+                let e = spec.repair_energy / TICK_HZ as i64;
+                let m = spec.repair_mass / TICK_HZ as i64;
+                let a = &mut self.armies[army as usize];
+                if a.energy >= e && a.mass >= m {
+                    a.energy -= e;
+                    a.mass -= m;
+                    heal = (max_hp * spec.repair_permille / 1000 / TICK_HZ as i64).max(1);
+                }
+            }
+            let u = self.units.get_mut(&id).unwrap();
+            u.fuel = u.fuel.saturating_add(refuel).min(fuel_ticks);
+            u.hp = (u.hp + heal).min(u.max_hp);
+            u.speed = base_speed;
+            if u.fuel >= fuel_ticks && u.hp >= u.max_hp {
+                u.carried_by = None;
+                u.orders.pop_front();
+                u.pos = Vec2 { x: spos.0, y: (spos.1 + sradius + 2 * SCALE).min(self.size.1) };
+            }
+        }
     }
 
     fn step_movement(&mut self) {
@@ -6117,6 +6379,8 @@ impl Skirmish {
                 m(&mut h, &v.to_le_bytes());
             }
             m(&mut h, &u.silo_missiles.to_le_bytes());
+            m(&mut h, &u.fuel.to_le_bytes());
+            m(&mut h, &[u8::from(u.auto_refuel)]);
             m(&mut h, &(u.orders.len() as u32).to_le_bytes());
             m(&mut h, &(u.production.len() as u32).to_le_bytes());
             m(&mut h, &(u.path.len() as u32).to_le_bytes());
@@ -6645,6 +6909,96 @@ pub(crate) mod tests {
         let fresh: Vec<&Unit> = w.units().filter(|u| !before.contains(&u.id) && u.role == Role::Mobile).collect();
         assert_eq!(fresh.len(), 1, "one tank produced");
         assert!(!w.is_wall_cell((fresh[0].pos.x, fresh[0].pos.y)), "rolled off onto an open cell");
+    }
+
+    /// Phase 30 fixture: `wall_world` with a 10 s-fuel fighter (`RAIR`, 12 m/s) and an air
+    /// staging platform `RSTAGE` (2 slots).
+    fn staging_world() -> Skirmish {
+        let mut w = wall_world();
+        let air = w.catalog.types.get_mut("RAIR").unwrap();
+        air.ext.fuel_ticks = 100;
+        air.ext.fuel_recharge_milli = 5_000;
+        let mut st = ty("RSTAGE", Role::AirStaging, 500, 0, 0, 0);
+        st.ext.staging = Some(StagingSpec {
+            slots: 2,
+            refuel_multiplier: 2,
+            repair_permille: 100,
+            repair_energy: 5 * SCALE,
+            repair_mass: SCALE / 2,
+            scan_radius: 300 * SCALE,
+        });
+        w.catalog.types.insert("RSTAGE".into(), st);
+        w.armies[0].mass = 1_000 * SCALE;
+        w.armies[0].energy = 10_000 * SCALE;
+        w
+    }
+
+    #[test]
+    fn aircraft_burn_fuel_and_fly_at_half_speed_when_empty() {
+        let mut w = staging_world();
+        let f = w.spawn_unit(0, "RAIR", (40 * SCALE, 120 * SCALE)).unwrap();
+        w.issue(0, Command::SetAutoRefuel { units: vec![f], enabled: false });
+        w.issue(0, Command::Patrol { units: vec![f], x: 220 * SCALE, y: 120 * SCALE, queue: false });
+        let full = w.unit(f).unwrap().speed;
+        w.run(50);
+        assert_eq!(w.unit(f).unwrap().fuel, 50);
+        assert_eq!(w.unit(f).unwrap().speed, full);
+        w.run(60);
+        let u = w.unit(f).unwrap();
+        assert_eq!(u.fuel, 0);
+        assert_eq!(u.speed, full / 2, "out of fuel: half speed");
+    }
+
+    #[test]
+    fn low_fuel_aircraft_dock_refuel_repair_and_resume() {
+        let mut w = staging_world();
+        let st = w.spawn_unit(0, "RSTAGE", (60 * SCALE, 60 * SCALE)).unwrap();
+        let f = w.spawn_unit(0, "RAIR", (60 * SCALE, 90 * SCALE)).unwrap();
+        w.issue(0, Command::Move { units: vec![f], x: 200 * SCALE, y: 200 * SCALE, queue: false });
+        w.issue(0, Command::Move { units: vec![f], x: 60 * SCALE, y: 200 * SCALE, queue: true });
+        w.step();
+        w.units.get_mut(&f).unwrap().hp /= 2;
+        let energy0 = w.armies[0].energy;
+        let (mut docked, mut ticks) = (false, 0);
+        while ticks < 400 {
+            w.step();
+            ticks += 1;
+            let u = w.unit(f).unwrap();
+            if u.carried_by == Some(st) {
+                docked = true;
+                assert_eq!(u.pos, w.unit(st).unwrap().pos);
+            } else if docked {
+                break;
+            }
+        }
+        assert!(docked, "low-fuel fighter docked at the platform");
+        let u = w.unit(f).unwrap();
+        assert_eq!((u.fuel, u.hp), (100, u.max_hp), "undocks refuelled and repaired");
+        assert!(w.armies[0].energy < energy0, "repair costs energy");
+        assert!(matches!(u.orders.front(), Some(UnitOrder::Move { .. })), "resumes its orders: {:?}", u.orders);
+    }
+
+    #[test]
+    fn staging_slots_are_limited_and_dead_platforms_release_aircraft() {
+        let mut w = staging_world();
+        let st = w.spawn_unit(0, "RSTAGE", (60 * SCALE, 60 * SCALE)).unwrap();
+        let fs: Vec<UnitId> = (0..3).map(|i| w.spawn_unit(0, "RAIR", (60 * SCALE + i * SCALE, 70 * SCALE)).unwrap()).collect();
+        for &f in &fs {
+            w.units.get_mut(&f).unwrap().hp = 10 * SCALE;
+        }
+        w.issue(0, Command::Dock { units: fs.clone(), staging: st, queue: false });
+        w.run(10);
+        let docked = fs.iter().filter(|f| w.unit(**f).unwrap().carried_by == Some(st)).count();
+        assert_eq!(docked, 2, "only two docking slots");
+        assert!(!w.apply_command_direct(1, Command::Dock { units: vec![], staging: st, queue: false }), "enemy cannot dock");
+
+        w.units.get_mut(&st).unwrap().hp = 0;
+        w.run(2);
+        for &f in &fs {
+            let u = w.unit(f).unwrap();
+            assert!(u.alive && u.carried_by.is_none(), "aircraft released when the platform dies");
+            assert!(!matches!(u.orders.front(), Some(UnitOrder::Dock(_))));
+        }
     }
 
     #[test]

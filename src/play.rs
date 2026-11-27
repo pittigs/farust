@@ -310,6 +310,7 @@ impl UnitMeshCache {
             let target = match role {
                 Role::AirFactory | Role::NavalFactory => Role::Factory,
                 Role::Hydro | Role::MassStorage | Role::EnergyStorage => Role::Generator,
+                Role::AirStaging => Role::Factory,
                 Role::Shield | Role::AntiAir | Role::MissileSilo | Role::MissileDefense => Role::PointDefense,
                 Role::Experimental => Role::Mobile,
                 r => r,
@@ -404,7 +405,7 @@ fn procedural_role_mesh(role: Role, span: f32) -> NormalizedMesh {
             append_local_box(&mut positions, &mut normals, &mut uvs, &mut indices, [0.0, 0.0, 0.0], [half * 0.75, span * 0.35, half]);
             append_local_box(&mut positions, &mut normals, &mut uvs, &mut indices, [0.0, span * 0.35, half * 0.1], [half * 0.4, span * 0.25, half * 0.65]);
         }
-        Role::AirFactory | Role::NavalFactory | Role::Hydro | Role::MassStorage | Role::EnergyStorage | Role::Shield | Role::AntiAir | Role::MissileSilo | Role::MissileDefense => {
+        Role::AirFactory | Role::NavalFactory | Role::Hydro | Role::MassStorage | Role::EnergyStorage | Role::Shield | Role::AntiAir | Role::MissileSilo | Role::MissileDefense | Role::AirStaging => {
             append_local_box(&mut positions, &mut normals, &mut uvs, &mut indices, [0.0, 0.0, 0.0], [half * 0.75, span * 0.55, half * 0.75]);
             append_local_box(&mut positions, &mut normals, &mut uvs, &mut indices, [0.0, span * 0.55, 0.0], [half * 0.45, span * 0.35, half * 0.45]);
         }
@@ -950,6 +951,9 @@ impl PlaySession {
         if self.handle_right_click_board(world_xz, queue, pick_radius) {
             return;
         }
+        if self.handle_right_click_dock(world_xz, queue, pick_radius) {
+            return;
+        }
 
         if !builders.is_empty() {
             if let Some((ally_id, ally_hp, ally_max_hp, ally_role)) = self
@@ -1281,6 +1285,10 @@ fn unit_yaw(world: &Skirmish, u: &crate::skirmish::Unit) -> f32 {
             .unwrap_or(0.0),
         Some(UnitOrder::Unload { x, y }) => ((x - u.pos.x) as f32).atan2((y - u.pos.y) as f32),
         Some(UnitOrder::Board(_) | UnitOrder::Enhance(_)) => 0.0,
+        Some(UnitOrder::Dock(tid)) => world
+            .unit(*tid)
+            .map(|t| ((t.pos.x - u.pos.x) as f32).atan2((t.pos.y - u.pos.y) as f32))
+            .unwrap_or(0.0),
         Some(UnitOrder::Upgrade(_)) | None => 0.0,
     }
 }
@@ -1612,6 +1620,10 @@ pub(crate) fn build_skirmish_render_frame(
                     UnitOrder::Upgrade(_) => continue,
                     UnitOrder::Unload { x, y } => ((*x, *y), [0.85, 0.80, 0.30, 0.2]),
                     UnitOrder::Board(_) | UnitOrder::Enhance(_) => continue,
+                    UnitOrder::Dock(tid) => match world.unit(*tid) {
+                        Some(t) => ((t.pos.x, t.pos.y), [0.40, 0.85, 1.0, 0.2]),
+                        None => continue,
+                    },
                     UnitOrder::Attack(tid) | UnitOrder::Overcharge(tid) => {
                         if let Some(t) = world.unit(*tid) {
                             ((t.pos.x, t.pos.y), [1.0, 0.22, 0.22, 0.2])
