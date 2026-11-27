@@ -11,6 +11,7 @@ mod controls;
 mod dds;
 mod dds_decode;
 mod economy;
+mod effects;
 mod flowfield;
 mod fuzz;
 mod hud;
@@ -72,6 +73,7 @@ fn print_usage() {
     eprintln!("  farust mesh <PATH> [FILE.scd]");
     eprintln!("  farust textures [FILE.scd] [--limit N] [--check]");
     eprintln!("  farust dds <PATH> [FILE.scd]");
+    eprintln!("  farust effects [GAME_DIR] [--check] [--coverage]  (FA emitter/beam/trail blueprints & weapon coverage)");
     eprintln!("  farust anim <list|UNIT_ID> [GAME_DIR] [--limit N] [--check]");
     eprintln!("  farust audio <list|info|export> [TARGET] [GAME_DIR] [--check] [--all] [--out DIR]");
     eprintln!("  farust audio <coverage|cues> [GAME_DIR] | audio play-cue <CUE> [GAME_DIR] [--mute] | audio render-mix <OUT.wav> [MAP] [GAME_DIR] [--from TICK] [--ticks N] [--seed S] [--factions a,b]");
@@ -294,6 +296,7 @@ fn run(args: &[String], connect_lobby: Option<&str>) -> Result<(), String> {
         "mesh" => cmd_mesh(args),
         "textures" => cmd_textures(args),
         "dds" => cmd_dds(args),
+        "effects" => effects::cmd_effects(args),
         "anim" => cmd_anim(args),
         "audio" => cmd_audio(args),
         "view-unit" => cmd_view_unit(args),

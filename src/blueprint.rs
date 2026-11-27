@@ -95,7 +95,10 @@ impl Value {
 struct Parser<'a> {
     bytes: &'a [u8],
     pos: usize,
+    depth: usize,
 }
+
+const MAX_PARSE_DEPTH: usize = 64;
 
 impl<'a> Parser<'a> {
     fn err(&self, msg: &str) -> String {
@@ -106,8 +109,16 @@ impl<'a> Parser<'a> {
             while self.pos < self.bytes.len() && self.bytes[self.pos].is_ascii_whitespace() {
                 self.pos += 1;
             }
-            // Moho blueprints use both `--` and `#` line comments.
-            if self.bytes[self.pos..].starts_with(b"--")
+            // Moho blueprints use `--[[ ... ]]` block comments as well as `--` and `#` line comments.
+            if self.bytes[self.pos..].starts_with(b"--[[") {
+                self.pos += 4;
+                while self.pos + 1 < self.bytes.len()
+                    && !(self.bytes[self.pos] == b']' && self.bytes[self.pos + 1] == b']')
+                {
+                    self.pos += 1;
+                }
+                self.pos = (self.pos + 2).min(self.bytes.len());
+            } else if self.bytes[self.pos..].starts_with(b"--")
                 || self.bytes.get(self.pos) == Some(&b'#')
             {
                 while self.pos < self.bytes.len() && self.bytes[self.pos] != b'\n' {
@@ -168,6 +179,47 @@ impl<'a> Parser<'a> {
         }
         Err(self.err("unterminated string"))
     }
+    fn parse_long_string(&mut self) -> Result<String, String> {
+        self.skip_ws();
+        if self.bytes.get(self.pos) != Some(&b'[') {
+            return Err(self.err("expected '[' for long string"));
+        }
+        self.pos += 1;
+        let mut eq_count = 0usize;
+        while self.bytes.get(self.pos) == Some(&b'=') {
+            eq_count += 1;
+            self.pos += 1;
+        }
+        if self.bytes.get(self.pos) != Some(&b'[') {
+            return Err(self.err("expected '[' to open long string"));
+        }
+        self.pos += 1;
+        // Lua strips an immediate leading newline in long-bracket strings.
+        if self.bytes.get(self.pos) == Some(&b'\r') {
+            self.pos += 1;
+        }
+        if self.bytes.get(self.pos) == Some(&b'\n') {
+            self.pos += 1;
+        }
+        let start = self.pos;
+        while self.pos < self.bytes.len() {
+            if self.bytes[self.pos] == b']' {
+                let end = self.pos;
+                let mut j = self.pos + 1;
+                let mut eq = 0usize;
+                while eq < eq_count && self.bytes.get(j) == Some(&b'=') {
+                    eq += 1;
+                    j += 1;
+                }
+                if eq == eq_count && self.bytes.get(j) == Some(&b']') {
+                    self.pos = j + 1;
+                    return Ok(String::from_utf8_lossy(&self.bytes[start..end]).into_owned());
+                }
+            }
+            self.pos += 1;
+        }
+        Err(self.err("unterminated long string"))
+    }
     fn parse_number(&mut self) -> Result<f64, String> {
         self.skip_ws();
         let start = self.pos;
@@ -189,6 +241,15 @@ impl<'a> Parser<'a> {
             .map_err(|_| self.err(&format!("bad number '{text}'")))
     }
     fn parse_table(&mut self, constructor: Option<String>) -> Result<Value, String> {
+        if self.depth >= MAX_PARSE_DEPTH {
+            return Err(self.err("maximum table nesting depth exceeded"));
+        }
+        self.depth += 1;
+        let res = self.parse_table_inner(constructor);
+        self.depth -= 1;
+        res
+    }
+    fn parse_table_inner(&mut self, constructor: Option<String>) -> Result<Value, String> {
         self.expect(b'{')?;
         let mut entries = Vec::new();
         loop {
@@ -240,6 +301,7 @@ impl<'a> Parser<'a> {
     fn parse_value(&mut self) -> Result<Value, String> {
         match self.peek() {
             Some(b'{') => self.parse_table(None),
+            Some(b'[') => Ok(Value::Str(self.parse_long_string()?)),
             Some(b'\'') | Some(b'"') => Ok(Value::Str(self.parse_string()?)),
             Some(b'-') | Some(b'+') => Ok(Value::Number(self.parse_number()?)),
             Some(c) if c.is_ascii_digit() || c == b'.' => Ok(Value::Number(self.parse_number()?)),
@@ -277,10 +339,28 @@ pub fn parse_prop_blueprint(text: &str) -> Result<Value, String> {
     parse_blueprint_kind(text, "PropBlueprint")
 }
 
+/// Parse any blueprint file regardless of root constructor (`EmitterBlueprint`, `BeamBlueprint`,
+/// `TrailEmitterBlueprint`, `ProjectileBlueprint`, `UnitBlueprint`, etc.), returning
+/// `(constructor_name, root_value)`.
+pub fn parse_any_blueprint(text: &str) -> Result<(Option<String>, Value), String> {
+    let mut p = Parser {
+        bytes: text.as_bytes(),
+        pos: 0,
+        depth: 0,
+    };
+    let value = p.parse_value()?;
+    let ctor = match &value {
+        Value::Table { constructor, .. } => constructor.clone(),
+        _ => return Err("blueprint root must be a table".to_string()),
+    };
+    Ok((ctor, value))
+}
+
 fn parse_blueprint_kind(text: &str, expected: &str) -> Result<Value, String> {
     let mut p = Parser {
         bytes: text.as_bytes(),
         pos: 0,
+        depth: 0,
     };
     let value = p.parse_value()?;
     if let Value::Table {
@@ -556,5 +636,27 @@ UnitBlueprint {
     #[test]
     fn extracts_id() {
         assert_eq!(unit_id_from_path("units/UAL0001/UAL0001_unit.bp"), "UAL0001");
+    }
+
+    #[test]
+    fn parses_long_bracket_strings_and_any_blueprint() {
+        let txt = r#"
+--[[ block comment ]]
+EmitterBlueprint {
+    BlueprintId = 'flash_01',
+    Texture = [[/textures/particles/glow_02.dds]],
+    RampTexture = [=[/textures/particles/ramp_white_01.dds]=],
+}
+"#;
+        let (ctor, val) = parse_any_blueprint(txt).unwrap();
+        assert_eq!(ctor.as_deref(), Some("EmitterBlueprint"));
+        assert_eq!(val.get_str("Texture"), Some("/textures/particles/glow_02.dds"));
+        assert_eq!(val.get_str("RampTexture"), Some("/textures/particles/ramp_white_01.dds"));
+    }
+
+    #[test]
+    fn guards_against_deep_nesting() {
+        let deep = format!("{}{}", "{".repeat(128), "}".repeat(128));
+        assert!(parse_any_blueprint(&deep).is_err());
     }
 }

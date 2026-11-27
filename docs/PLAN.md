@@ -331,12 +331,22 @@ bumps `SIM_VERSION`, re-baselines golden hashes deliberately, and keeps
 
 ### Arc C — Visual & audio fidelity III (40–43)
 
-### Phase 40 — FA effect blueprints (planned)
-- Parse emitter/beam/trail blueprints from `effects.scd` and drive the
-  `vfx.rs` GPU particle pool with them (muzzle flashes, impacts, explosions,
-  shield hits, build beams). Render-only.
-- Exit: weapon effects use FA emitters for ≥ 90% of weapons; sim hash
-  unchanged.
+### Phase 40 — FA effect blueprints (done)
+- `src/effects.rs` + `src/blueprint.rs`: Lua long-bracket string (`[[...]]`) and nesting-depth
+  parser support; parses all 2,827 `.bp` files in `effects.scd` (2,437 `EmitterBlueprint`,
+  103 `BeamBlueprint`, 184 `TrailEmitterBlueprint`, 103 other) with 0 failures (`farust effects --check`)
+  and `Kind::EffectBp` mutation fuzzing (`src/fuzz.rs`).
+- Data-driven `EffectTemplates.lua` + weapon/projectile/collision-beam Lua mapping (`farust effects --coverage`):
+  404/404 (100.0%) weapons mapped to FA emitters (368 exact Lua chain, 2 name match, 34 faction/category
+  FA fallback; 789 templates, 2,724 valid effect blueprints).
+- `src/vfx.rs` + `src/viewer.rs` + `src/render_prep.rs`: evaluates FA emitter curves (emit rate,
+  lifetime, size, velocity, acceleration, rotation, sprite-sheet strips/frames, 4-stop DDS color ramps,
+  additive/alpha premultiplied blending) into a `128x128` GPU `texture_2d_array` (up to 256 layers)
+  with a hard 4,096-particle cap driving muzzle flashes, impacts, explosions, ACU nukes, shield hits,
+  projectile poly-trails, and faction build beams. Render-only.
+- Exit: 404/404 (100.0%) weapons use FA emitters (≥ 90% target); `cargo test --release` 271/271 passed;
+  sim hashes unchanged (`sim-run` `35db8f2bd7a6faf2`, `skirmish SCMP_001` `192e89b083b978cb`);
+  `bench-render` at 8,192 units stays at ~5.7 ms p50 frame / 252 draws. Done.
 
 ### Phase 41 — Dynamic decals & terrain marks (planned)
 - Runtime scorch, crater and tread decals with a bounded decal atlas and

@@ -19,10 +19,11 @@ pub enum Kind {
     Sca,
     ScMap,
     Dds,
+    EffectBp,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 4] = [Kind::Scm, Kind::Sca, Kind::ScMap, Kind::Dds];
+    pub const ALL: [Kind; 5] = [Kind::Scm, Kind::Sca, Kind::ScMap, Kind::Dds, Kind::EffectBp];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -30,6 +31,7 @@ impl Kind {
             Kind::Sca => "sca",
             Kind::ScMap => "scmap",
             Kind::Dds => "dds",
+            Kind::EffectBp => "effectbp",
         }
     }
 }
@@ -244,6 +246,22 @@ pub fn exercise(kind: Kind, data: &[u8]) -> bool {
             }
             let _ = crate::dds_decode::decode_dds_cubemap_rgba8(data);
             header_ok
+        }
+        Kind::EffectBp => {
+            let text = String::from_utf8_lossy(data);
+            match crate::effects::parse_effect_blueprint(&text) {
+                Ok(crate::effects::EffectBp::Emitter(e)) => {
+                    for x in [0.0f32, 0.5, e.repeat_time, -1.0, f32::NAN] {
+                        let _ = e.emit_rate.sample(x, 0.25);
+                        let _ = e.lifetime_curve.sample(x, -0.5);
+                        let _ = e.start_size.sample(x, 0.0);
+                    }
+                    let _ = crate::effects::emitter_burst_count(&e);
+                    true
+                }
+                Ok(_) => true,
+                Err(_) => false,
+            }
         }
     }
 }
@@ -520,6 +538,52 @@ pub fn synthetic_scmap() -> Vec<u8> {
     v
 }
 
+/// Minimal valid effect blueprints (emitter, beam, trail).
+pub fn synthetic_effect_bps() -> Vec<(String, Vec<u8>)> {
+    vec![
+        (
+            "synthetic_emit.bp".into(),
+            br#"EmitterBlueprint {
+    BlueprintId = 'syn_emit',
+    Lifetime = 1.0,
+    Repeattime = 1.0,
+    Blendmode = 3.0,
+    Texture = [[/textures/particles/glow_02.dds]],
+    RampTexture = [[/textures/particles/ramp_white_01.dds]],
+    EmitRateCurve = { XRange = 1.0, Keys = { { x=0.5, y=2.0, z=1.0 } } },
+    LifetimeCurve = { XRange = 1.0, Keys = { { x=0.5, y=4.0, z=0.5 } } },
+    StartSizeCurve = { XRange = 1.0, Keys = { { x=0.5, y=1.0, z=0.2 } } },
+}"#
+            .to_vec(),
+        ),
+        (
+            "synthetic_beam.bp".into(),
+            br#"BeamBlueprint {
+    Lifetime = 2,
+    TextureName = '/textures/particles/build_beam_01.dds',
+    Thickness = 0.05,
+    StartColor = {x=0.2, y=0.5, z=0.8, w=0.5},
+    EndColor = {x=0.1, y=0.2, z=0.9, w=0.2},
+    Blendmode = 3,
+}"#
+            .to_vec(),
+        ),
+        (
+            "synthetic_trail.bp".into(),
+            br#"TrailEmitterBlueprint {
+    BlueprintId = 'syn_trail',
+    Lifetime = -1.0,
+    TrailLength = 8,
+    Size = 0.2,
+    BlendMode = 0,
+    RepeatTexture = [[/textures/particles/trail_white_01.dds]],
+    RampTexture = [[/textures/particles/ramp_trail_01.dds]],
+}"#
+            .to_vec(),
+        ),
+    ]
+}
+
 /// Synthetic seeds for every parser family.
 pub fn synthetic_seeds() -> Vec<Seed> {
     let mut v = vec![
@@ -529,6 +593,9 @@ pub fn synthetic_seeds() -> Vec<Seed> {
     ];
     for (label, bytes) in synthetic_dds() {
         v.push(Seed { kind: Kind::Dds, label, bytes });
+    }
+    for (label, bytes) in synthetic_effect_bps() {
+        v.push(Seed { kind: Kind::EffectBp, label, bytes });
     }
     v
 }
@@ -585,6 +652,22 @@ pub fn real_seeds(game_dir: &Path, max_per_kind: usize, include_maps: bool) -> V
             && let Ok(bytes) = std::fs::read(&p)
         {
             out.push(Seed { kind: Kind::ScMap, label: p.display().to_string(), bytes });
+        }
+    }
+    let effects_scd = crate::scd::gamedata_dir(game_dir).join("effects.scd");
+    if effects_scd.is_file() {
+        let wanted = [
+            "effects/emitters/flash_01_emit.bp",
+            "effects/emitters/build_beam_01_emit.bp",
+            "effects/emitters/aeon_cannon_trail_emit.bp",
+        ];
+        if let Ok(files) = crate::scd::read_scd_matching(&effects_scd, |n| {
+            let l = n.replace('\\', "/").to_ascii_lowercase();
+            wanted.iter().any(|w| l == *w)
+        }) {
+            for (name, bytes) in files.into_iter().take(max_per_kind.max(1)) {
+                out.push(Seed { kind: Kind::EffectBp, label: name, bytes });
+            }
         }
     }
     out
