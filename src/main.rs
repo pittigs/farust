@@ -750,18 +750,17 @@ fn cmd_anim(args: &[String]) -> Result<(), String> {
 }
 
 fn collect_sound_files(sounds_dir: &Path, ext: &str) -> Result<Vec<PathBuf>, String> {
-    let rd = std::fs::read_dir(sounds_dir)
-        .map_err(|e| format!("cannot read {}: {e}", sounds_dir.display()))?;
-    let mut out: Vec<PathBuf> = rd
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
+    if !sounds_dir.is_dir() {
+        return Err(format!("cannot read {}: not a directory", sounds_dir.display()));
+    }
+    let out: Vec<PathBuf> = xact::collect_sound_paths(sounds_dir)
+        .into_iter()
         .filter(|p| {
             p.extension()
                 .and_then(|s| s.to_str())
                 .is_some_and(|s| s.eq_ignore_ascii_case(ext))
         })
         .collect();
-    out.sort();
     Ok(out)
 }
 
@@ -798,9 +797,13 @@ fn cmd_audio(args: &[String]) -> Result<(), String> {
                                 }
                             }
                         } else {
+                            let rel = p
+                                .strip_prefix(&sounds_dir)
+                                .unwrap_or(p)
+                                .to_string_lossy();
                             println!(
-                                "  XWB {:<24} waves={:<4} v{}",
-                                p.file_name().unwrap_or_default().to_string_lossy(),
+                                "  XWB {:<28} waves={:<4} v{}",
+                                rel,
                                 wb.entries.len(),
                                 wb.version
                             );
@@ -817,9 +820,13 @@ fn cmd_audio(args: &[String]) -> Result<(), String> {
                     Ok(sb) => {
                         total_cues += sb.cues.len();
                         if !check {
+                            let rel = p
+                                .strip_prefix(&sounds_dir)
+                                .unwrap_or(p)
+                                .to_string_lossy();
                             println!(
-                                "  XSB {:<24} cues={:<4} wbs={}",
-                                p.file_name().unwrap_or_default().to_string_lossy(),
+                                "  XSB {:<28} cues={:<4} wbs={}",
+                                rel,
                                 sb.cues.len(),
                                 sb.wavebank_names.join(",")
                             );
@@ -930,7 +937,7 @@ fn cmd_audio_ext(args: &[String]) -> Result<(), String> {
         "cues" => {
             let game_dir = positional_after(args, 3).unwrap_or_else(scd::default_game_dir);
             let catalog = skirmish::Catalog::load(&game_dir).ok();
-            audio_play::print_cue_mapping(&game_dir, catalog.as_ref());
+            audio_play::print_cue_mapping(&game_dir, catalog.as_ref(), has_flag(args, "--all"));
             Ok(())
         }
         _ => {
