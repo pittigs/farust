@@ -601,10 +601,33 @@ bumps `SIM_VERSION`, re-baselines golden hashes deliberately, and keeps
   `steam` cargo feature so the default build stays dependency-light.
 - Exit: a friend invite from the Steam overlay lands in the FARust lobby.
 
-### Phase 47 — Replay vault & sharing (planned)
-- Replay index with metadata, thumbnails and search, optional upload to and
-  download from the rendezvous server, event bookmarks (kills, experimentals).
-- Exit: a replay uploaded by one client plays back verified on another.
+### Phase 47 — Replay vault & sharing (done)
+- Replay vault index (`src/vault.rs`, `index.farust-idx` `FARVX1` v1 alongside recorded
+  replays, override with `--vault` / `FARUST_VAULT_DIR`): caches map id/name, date,
+  duration, armies (names/factions/teams), winner, sim `RULES_VERSION` (flags older
+  replays as "needs older build"), mods, mission title, size, share code, and
+  `160×160` PNG thumbnails (`thumbs/*.png`, `.scmap` preview + start spots + winner
+  ring) with incremental `(mtime, size)` rebuilds and free-text / qualifier search
+  (`map:`, `player:`, `faction:`, `winner:`, `from:`, `to:`).
+- Event bookmarks (`BookmarkKind`: `ACU` deaths, `EXP` completions, `NUKE` launches,
+  top `CLASH` kill bursts with tick + world position) collected via headless re-sim
+  during indexing without changing the `FARPL1` replay format; shown on the replay
+  timeline with clickable pips, hover labels, `<BM`/`BM>` buttons, and camera jump
+  (`src/controls.rs`, `src/hud.rs`, `src/play.rs`).
+- Sharing (`src/rendezvous.rs`, backward-compatible v1 messages `19..=22`): server-side
+  replay upload/download capped at 8 MiB per replay and configurable total quota (default
+  256 MiB), validated with `FARPL1` magic + `Replay::from_bytes`, content-hash
+  deduplicated into unambiguous `XXXX-XXXX` codes stored strictly inside the configured
+  storage dir; CLI `farust replay <index|upload|download>` (`src/main.rs`) and upgraded
+  Replays vault screen with search, thumbnails, clickable bookmarks, and Share /
+  Download-by-code (`src/menu.rs`).
+- Exit: 344/344 release tests pass (index round-trip, incremental sync, search filters,
+  headless ACU-death/winner extraction, bookmark seek, menu vault UI, and loopback
+  upload/download + invalid/oversized/quota rejection); `SCMP_009` replay recorded →
+  uploaded (`5K4B-DK6D`) → downloaded into a second vault (`FARUST_VAULT_DIR`) →
+  `replay verify` verified (`74eb2ae300b25619`); `menu --screen replays --snapshot`
+  renders real map thumbnails and bookmarks; determinism unchanged (`sim-run`
+  `35db8f2bd7a6faf2`, `skirmish SCMP_001` `0fe934990406d829`). Done.
 
 ### Arc E — Content & authoring (48–51)
 

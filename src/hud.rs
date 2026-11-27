@@ -306,9 +306,12 @@ pub enum TimelineHit {
     Slower,
     Faster,
     Perspective,
+    PrevBookmark,
+    NextBookmark,
+    Bookmark(usize),
 }
 
-/// Phase 15 replay timeline bar layout (screen pixels, `[x, y, w, h]`).
+/// Phase 15/47 replay timeline bar layout (screen pixels, `[x, y, w, h]`).
 #[derive(Debug, Clone)]
 pub struct TimelineLayout {
     pub panel: [f32; 4],
@@ -317,6 +320,9 @@ pub struct TimelineLayout {
     pub slower: [f32; 4],
     pub faster: [f32; 4],
     pub view: [f32; 4],
+    pub prev_bm: Option<[f32; 4]>,
+    pub next_bm: Option<[f32; 4]>,
+    pub bookmark_pins: Vec<([f32; 4], usize)>,
 }
 
 fn rect_hit(r: [f32; 4], px: f32, py: f32) -> bool {
@@ -324,19 +330,52 @@ fn rect_hit(r: [f32; 4], px: f32, py: f32) -> bool {
 }
 
 impl TimelineLayout {
-    fn from_bounds(x0: f32, y: f32, pw: f32) -> Self {
+    fn from_bounds(
+        x0: f32,
+        y: f32,
+        pw: f32,
+        bookmarks: &[crate::vault::Bookmark],
+        final_tick: u64,
+    ) -> Self {
         let by = y + 6.0;
+        let view = [x0 + pw - 8.0 - 104.0, by, 104.0, 24.0];
+        let (prev_bm, next_bm) = if !bookmarks.is_empty() && pw >= 380.0 {
+            let next = [view[0] - 42.0, by, 38.0, 24.0];
+            let prev = [next[0] - 42.0, by, 38.0, 24.0];
+            (Some(prev), Some(next))
+        } else {
+            (None, None)
+        };
+        let bar = [x0 + 8.0, y + 38.0, pw - 16.0, 18.0];
+        let mut bookmark_pins = Vec::with_capacity(bookmarks.len());
+        let fin = final_tick.max(1) as f32;
+        for (idx, bm) in bookmarks.iter().enumerate() {
+            let frac = (bm.tick as f32 / fin).clamp(0.0, 1.0);
+            let cx = bar[0] + bar[2] * frac;
+            bookmark_pins.push(([cx - 5.0, bar[1] - 5.0, 10.0, bar[3] + 8.0], idx));
+        }
         Self {
             panel: [x0, y, pw, 64.0],
-            bar: [x0 + 8.0, y + 38.0, pw - 16.0, 18.0],
+            bar,
             pause: [x0 + 8.0, by, 64.0, 24.0],
             slower: [x0 + 78.0, by, 26.0, 24.0],
             faster: [x0 + 108.0, by, 26.0, 24.0],
-            view: [x0 + pw - 8.0 - 104.0, by, 104.0, 24.0],
+            view,
+            prev_bm,
+            next_bm,
+            bookmark_pins,
         }
     }
 
-    fn compute(w: f32, h: f32, minimap: [f32; 4], palette_right: f32, palette_top: f32) -> Self {
+    fn compute(
+        w: f32,
+        h: f32,
+        minimap: [f32; 4],
+        palette_right: f32,
+        palette_top: f32,
+        bookmarks: &[crate::vault::Bookmark],
+        final_tick: u64,
+    ) -> Self {
         let mut x0 = palette_right + 10.0;
         let mut x1 = minimap[0] - 14.0;
         let mut y = h - 74.0;
@@ -345,10 +384,18 @@ impl TimelineLayout {
             x1 = (w - 12.0).min(minimap[0] - 14.0).max(x0 + 200.0);
             y = palette_top - 4.0 - 70.0;
         }
-        Self::from_bounds(x0, y, x1 - x0)
+        Self::from_bounds(x0, y, x1 - x0, bookmarks, final_tick)
     }
 
-    fn compute_classic(w: f32, h: f32, dock_right: f32, dock_x: f32, dock_top: f32) -> Self {
+    fn compute_classic(
+        w: f32,
+        h: f32,
+        dock_right: f32,
+        dock_x: f32,
+        dock_top: f32,
+        bookmarks: &[crate::vault::Bookmark],
+        final_tick: u64,
+    ) -> Self {
         let mut x0 = dock_right + 10.0;
         let mut x1 = w - 12.0;
         let mut y = h - 70.0;
@@ -357,7 +404,7 @@ impl TimelineLayout {
             x1 = (w - 12.0).max(x0 + 240.0);
             y = (dock_top - 70.0).max(60.0);
         }
-        Self::from_bounds(x0, y, (x1 - x0).max(200.0))
+        Self::from_bounds(x0, y, (x1 - x0).max(200.0), bookmarks, final_tick)
     }
 
     /// Fraction along the seek bar for screen x (clamped to `[0, 1]`).
@@ -374,6 +421,12 @@ impl TimelineLayout {
             Some(TimelineHit::Faster)
         } else if rect_hit(self.view, px, py) {
             Some(TimelineHit::Perspective)
+        } else if self.prev_bm.is_some_and(|r| rect_hit(r, px, py)) {
+            Some(TimelineHit::PrevBookmark)
+        } else if self.next_bm.is_some_and(|r| rect_hit(r, px, py)) {
+            Some(TimelineHit::NextBookmark)
+        } else if let Some(&(_, idx)) = self.bookmark_pins.iter().rev().find(|(r, _)| rect_hit(*r, px, py)) {
+            Some(TimelineHit::Bookmark(idx))
         } else if rect_hit([self.bar[0] - 4.0, self.bar[1] - 6.0, self.bar[2] + 8.0, self.bar[3] + 12.0], px, py) {
             Some(TimelineHit::Seek(self.frac_at(px)))
         } else {
@@ -630,11 +683,12 @@ impl HudLayout {
             top = e.panel[1];
         }
         let cluster = [dock_x, top, full_w, h - MARGIN - top];
-        let timeline = session.is_replay().then(|| {
+        let timeline = session.replay_progress().map(|(_, fin)| {
+            let bms = session.replay_bookmarks();
             if classic {
-                TimelineLayout::compute_classic(w, h, dock_x + full_w, dock_x, top)
+                TimelineLayout::compute_classic(w, h, dock_x + full_w, dock_x, top, bms, fin)
             } else {
-                TimelineLayout::compute(w, h, minimap, dock_x + full_w, card_y)
+                TimelineLayout::compute(w, h, minimap, dock_x + full_w, card_y, bms, fin)
             }
         });
 
@@ -1054,6 +1108,12 @@ pub fn build_hud_geometry_ex(
             None => "VIEW:OBS".to_string(),
         };
         btn(&mut v, &mut i, &mut fg_v, &mut fg_i, tl.view, &view_label, persp.is_some());
+        if let Some(r) = tl.prev_bm {
+            btn(&mut v, &mut i, &mut fg_v, &mut fg_i, r, "<BM", false);
+        }
+        if let Some(r) = tl.next_bm {
+            btn(&mut v, &mut i, &mut fg_v, &mut fg_i, r, "BM>", false);
+        }
         let info = format!(
             "{}X  {} / {}{}",
             session.speed,
@@ -1074,6 +1134,31 @@ pub fn build_hud_geometry_ex(
             let x = bx + bw * (t as f32 / fin as f32);
             push_rect(&mut fg_v, &mut fg_i, x, by + bh - 5.0, 1.0, 5.0, [0.70, 0.78, 0.90, 0.7], w, h);
             t += minute;
+        }
+        // Phase 47: event bookmark markers on the timeline bar.
+        let bms = session.replay_bookmarks();
+        let active_bm = session.ui.replay.as_ref().and_then(|r| r.active_bookmark);
+        for (idx, bm) in bms.iter().enumerate() {
+            let mx = bx + bw * (bm.tick as f32 / fin.max(1) as f32).clamp(0.0, 1.0);
+            let col = bm.kind.color();
+            let is_active = active_bm == Some(idx);
+            let pip_h = if is_active { bh + 8.0 } else { bh + 4.0 };
+            let pip_w = if is_active { 5.0 } else { 3.5 };
+            push_rect(&mut fg_v, &mut fg_i, mx - pip_w * 0.5, by - 4.0, pip_w, pip_h, col, w, h);
+            push_rect(&mut fg_v, &mut fg_i, mx - 3.5, by - 6.0, 7.0, 4.0, col, w, h);
+        }
+        // Hover tooltip for bookmark pins.
+        if let Some((cx, cy)) = session.ui.cursor_px
+            && let Some(&(_, idx)) = tl.bookmark_pins.iter().rev().find(|(r, _)| rect_hit(*r, cx, cy))
+            && let Some(bm) = bms.get(idx)
+        {
+            let tip = format!("[{}] {}  {}", bm.kind.tag(), crate::controls::fmt_ticks(bm.tick), bm.label);
+            let tw = (tip.len() as f32 * 8.0 + 14.0).min(pw);
+            let tx = (cx - tw * 0.5).clamp(px, (px + pw - tw).max(px));
+            let ty = py - 24.0;
+            push_rect(&mut v, &mut i, tx, ty, tw, 20.0, [0.05, 0.08, 0.13, 0.95], w, h);
+            push_rect_outline(&mut fg_v, &mut fg_i, tx, ty, tw, 20.0, 1.0, bm.kind.color(), w, h);
+            draw_text(&mut fg_v, &mut fg_i, tx + 6.0, ty + 6.0, 1.35, &tip, [0.96, 0.98, 1.0, 1.0], w, h);
         }
         let marker = session
             .ui

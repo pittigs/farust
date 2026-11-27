@@ -292,3 +292,26 @@ FARUST_BLOOM=off cargo run --release -- play SCMP_001 --snapshot fa-unpack/rende
 FARUST_AA=fxaa cargo run --release -- bench-render SCMP_001 --units 4096,8192 --frames 30 --no-sim
 cargo run --release -- view-unit UAL0001 --snapshot fa-unpack/renders/ual0001_glow.png
 ```
+
+## Step 47 — done: replay vault, bookmarks & sharing
+
+- **Replay Vault Index & Thumbnails** (`src/vault.rs`, `src/menu.rs`, `src/main.rs`):
+  incremental `index.farust-idx` cache (metadata, winner, mods/mission, rules-version
+  compatibility badge, `160×160` map+start-spot PNG thumbnails) with free-text and
+  qualifier search (`map:`, `player:`, `faction:`, `winner:`, `from:`, `to:`).
+- **Event Bookmarks** (`src/vault.rs`, `src/controls.rs`, `src/hud.rs`, `src/play.rs`):
+  headless re-sim detects ACU deaths, experimental completions, nuke launches, and major
+  kill bursts; replay timeline displays colored bookmark markers, `<BM`/`BM>` navigation,
+  and jumps both time and camera to the event.
+- **Rendezvous Replay Sharing** (`src/rendezvous.rs`):
+  backward-compatible v1 upload/download endpoints (8 MiB per-replay cap, total storage
+  quota, `FARPL1` parse validation, content-hash `XXXX-XXXX` share codes) integrated into
+  both the CLI and the Replays menu screen.
+
+```sh
+cargo run --release -- replay index --search "map:SCMP_009 winner:uef"
+cargo run --release -- rendezvous 0.0.0.0:15050 --replay-dir /path/to/replays
+cargo run --release -- replay upload match.farust-replay --rendezvous 127.0.0.1:15050
+cargo run --release -- replay download XXXX-XXXX --rendezvous 127.0.0.1:15050
+cargo run --release -- menu --screen replays
+```

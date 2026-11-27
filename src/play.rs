@@ -2854,6 +2854,20 @@ impl ApplicationHandler for PlayApp {
 
         if self.session.seeking() {
             self.session.pump_replay_seek(Duration::from_millis(24));
+            if !self.session.seeking()
+                && let Some((mx, mz)) = self
+                    .session
+                    .ui
+                    .replay
+                    .as_mut()
+                    .and_then(|r| r.camera_jump.take())
+            {
+                let wx = mx as f32 / SCALE as f32;
+                let wz = mz as f32 / SCALE as f32;
+                let wy = sample_terrain_y(&self.map.scmap, wx, wz);
+                st.camera.target = [wx, wy, wz];
+                st.resources.update_camera(&st.queue, &st.camera);
+            }
             st.accum_secs = 0.0;
             st.dirty_dynamic = true;
             st.window
@@ -2861,6 +2875,20 @@ impl ApplicationHandler for PlayApp {
             st.window.request_redraw();
             event_loop.set_control_flow(ControlFlow::Poll);
             return;
+        }
+        if let Some((mx, mz)) = self
+            .session
+            .ui
+            .replay
+            .as_mut()
+            .and_then(|r| r.camera_jump.take())
+        {
+            let wx = mx as f32 / SCALE as f32;
+            let wz = mz as f32 / SCALE as f32;
+            let wy = sample_terrain_y(&self.map.scmap, wx, wz);
+            st.camera.target = [wx, wy, wz];
+            st.resources.update_camera(&st.queue, &st.camera);
+            st.dirty_dynamic = true;
         }
 
         if self.session.sim_active() {
@@ -3233,6 +3261,15 @@ impl ApplicationHandler for PlayApp {
                                     self.session.speed = (self.session.speed * 2).clamp(1, max_speed)
                                 }
                                 hud::TimelineHit::Perspective => self.session.cycle_replay_perspective(),
+                                hud::TimelineHit::PrevBookmark => {
+                                    self.session.jump_adjacent_bookmark(false);
+                                }
+                                hud::TimelineHit::NextBookmark => {
+                                    self.session.jump_adjacent_bookmark(true);
+                                }
+                                hud::TimelineHit::Bookmark(idx) => {
+                                    self.session.jump_to_bookmark(idx);
+                                }
                             }
                             st.dirty_dynamic = true;
                             st.window.request_redraw();
