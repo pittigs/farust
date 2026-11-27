@@ -196,3 +196,23 @@ cargo run --release -- host --code SCMP_001 --rendezvous 127.0.0.1:15050 --play
 cargo run --release -- join --code XXXX-XXXX --rendezvous 127.0.0.1:15050 --play
 FARUST_UI_THEME=classic cargo run --release -- play SCMP_001
 ```
+
+## Step 50 — done: map authoring tools
+
+- **`.scmap` v2.60 writer & round-trip** (`src/scmap.rs`, `src/map_author.rs`): byte-exact
+  `parse → write → parse` identity verified on all 61 stock maps (`825.55 MiB`), plus
+  world-space raise/lower/smooth heightmap brushes and prop placement/deletion.
+- **`_save.lua` & `_scenario.lua` writers** (`src/scenario.rs`): regenerate start spots
+  (`ARMY_n`), `Mass`, and `Hydrocarbon` markers while preserving other markers and Lua
+  verbatim; writes full map bundles to `$XDG_DATA_HOME/farust/maps/<NEW_ID>/` (never
+  modifying the read-only game install).
+- **Interactive GPU map editor** (`src/map_author.rs`, `src/viewer.rs`, `src/ui_kit.rs`):
+  heightmap brush (`1`), smooth brush (`2`), mass (`3`), hydrocarbon (`4`), start spot (`5`),
+  and prop (`6`) tools with a `ui_kit` toolbar (`Ctrl+S` saves to user maps).
+
+```sh
+cargo run --release -- map-roundtrip --all
+cargo run --release -- map-edit SCMP_001 MY_MAP --raise 512,512,60,12 --add-mass 512,512 --move-start 1,180,180
+cargo run --release -- map-editor SCMP_001 --out MY_MAP
+cargo run --release -- skirmish MY_MAP
+```

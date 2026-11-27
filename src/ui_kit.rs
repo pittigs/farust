@@ -1080,6 +1080,28 @@ impl UiRenderer {
     }
 
     pub fn draw(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, target: &wgpu::TextureView, canvas: &Canvas, clear: [f64; 3]) {
+        self.draw_with_load(
+            device,
+            queue,
+            target,
+            canvas,
+            wgpu::LoadOp::Clear(wgpu::Color { r: clear[0], g: clear[1], b: clear[2], a: 1.0 }),
+        );
+    }
+
+    /// Draws `canvas` composited on top of an already-rendered target (preserving its contents).
+    pub fn draw_overlay(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, target: &wgpu::TextureView, canvas: &Canvas) {
+        self.draw_with_load(device, queue, target, canvas, wgpu::LoadOp::Load);
+    }
+
+    fn draw_with_load(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        target: &wgpu::TextureView,
+        canvas: &Canvas,
+        load: wgpu::LoadOp<wgpu::Color>,
+    ) {
         for b in &canvas.batches {
             if let Tex::Image(name) = &b.tex
                 && !self.images.contains_key(name)
@@ -1121,7 +1143,7 @@ impl UiRenderer {
                     view: target,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color { r: clear[0], g: clear[1], b: clear[2], a: 1.0 }),
+                        load,
                         store: wgpu::StoreOp::Store,
                     },
                 })],

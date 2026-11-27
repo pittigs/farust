@@ -395,10 +395,29 @@ bumps `SIM_VERSION`, re-baselines golden hashes deliberately, and keeps
   engine using the user's map data, voice cues and objectives.
 - Exit: the operation is beatable start to finish with all primary objectives.
 
-### Phase 50 — Map authoring tools (planned)
-- `.scmap` v2.60 writer, in-game marker/prop editor, heightmap brush,
-  round-trip `parse → write → parse` identity on all 61 stock maps.
-- Exit: a map edited in FARust loads and plays as a skirmish map.
+### Phase 50 — Map authoring tools (done)
+- Byte-exact `.scmap` v2.60 writer (`src/scmap.rs`): retains header unknowns, raw
+  C-strings, and post-water tail verbatim (`write(parse(b)) == b`), with world-space
+  raise/lower/smooth heightmap brush (`apply_brush`), bilinear `sample_height`, and
+  prop-slice re-serialization (`add_prop` / `remove_prop_near`) when props change.
+  Embedded DXT5 normal-map DDS in the tail is preserved as-is; geometric terrain
+  normals recompute from the edited heightmap.
+- Scenario & save writers (`src/scenario.rs`): case-insensitive `rewrite_map_id`,
+  `rewrite_scenario_for_clone` (`map`/`save`/`script` VFS paths + title), and
+  comment/string-aware `rewrite_save_markers` regenerating start spots (`ARMY_n`),
+  `Mass`, and `Hydrocarbon` markers while keeping all other markers and Lua outside
+  `Markers` verbatim.
+- CLI & interactive GPU map editor (`src/map_author.rs`, `src/viewer.rs`,
+  `src/ui_kit.rs`, `src/scene.rs`): `farust map-roundtrip [--all | MAP]`,
+  `farust map-edit <SRC> <NEW_ID> [--raise|--lower|--smooth|--add-mass|--del-mass|--add-hydro|--del-hydro|--move-start|--add-prop|--del-prop]`,
+  and `farust map-editor <MAP> [--out NEW_ID] [--snapshot OUT.png]` with a `ui_kit`
+  toolbar, heightmap/smooth brushes, mass/hydro/start/prop editing, and safe saves
+  to `$XDG_DATA_HOME/farust/maps/<NEW_ID>/` (never writing to the game install).
+- Exit: `map-roundtrip --all` passes 61/61 stock maps byte-identically (825.55 MiB,
+  61/61 reparse ok); `map-edit SCMP_001 FARUST_TEST01` produces a map that plays to
+  completion via `skirmish FARUST_TEST01` and renders via `view-map` and `map-editor`;
+  272/272 tests pass; golden hashes unchanged (`sim-run` `35db8f2bd7a6faf2`,
+  `skirmish SCMP_001` `192e89b083b978cb`). Done.
 
 ### Phase 51 — Mod manager & lobby mod sync (planned)
 - In-game mod manager (enable/disable, conflicts), automatic mod transfer

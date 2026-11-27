@@ -17,6 +17,7 @@ mod hud;
 mod jobs;
 mod keymap;
 mod lobby;
+mod map_author;
 mod menu;
 mod mods;
 mod net;
@@ -68,6 +69,9 @@ fn print_usage() {
     eprintln!("  farust mods                                       (installed blueprint mods)");
     eprintln!("  global: --mod <DIR|NAME> (repeatable) enables a blueprint mod for any subcommand");
     eprintln!("  farust map <NAME> [GAME_DIR]");
+    eprintln!("  farust map-roundtrip [--all | <MAP>] [GAME_DIR]   (.scmap v2.60 byte-exact round-trip check)");
+    eprintln!("  farust map-edit <SRC_MAP> <NEW_ID> [GAME_DIR] [--name TITLE] [--raise X,Z,R,H] [--lower X,Z,R,H] [--smooth X,Z,R,S] [--add-mass X,Z] [--del-mass X,Z,R] [--add-hydro X,Z] [--move-start N,X,Z] [--add-prop BP,X,Z[,S]] [--del-prop X,Z,R]");
+    eprintln!("  farust map-editor <MAP> [GAME_DIR] [--out NEW_ID] [--size WxH] [--snapshot OUT.png]");
     eprintln!("  farust meshes [FILE.scd] [--limit N] [--check]");
     eprintln!("  farust mesh <PATH> [FILE.scd]");
     eprintln!("  farust textures [FILE.scd] [--limit N] [--check]");
@@ -290,6 +294,9 @@ fn run(args: &[String], connect_lobby: Option<&str>) -> Result<(), String> {
         "roster" => roster::cmd_roster(args),
         "mods" => mods::cmd_mods(args),
         "map" => cmd_map(args),
+        "map-roundtrip" => map_author::cmd_map_roundtrip(args),
+        "map-edit" => map_author::cmd_map_edit(args),
+        "map-editor" => map_author::cmd_map_editor(args),
         "meshes" => cmd_meshes(args),
         "mesh" => cmd_mesh(args),
         "textures" => cmd_textures(args),

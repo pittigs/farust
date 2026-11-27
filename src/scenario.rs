@@ -483,13 +483,84 @@ pub fn farust_maps_dir() -> PathBuf {
     xdg_data_home().join("farust").join("maps")
 }
 
-/// Replaces every occurrence of a map id (VFS paths, file names, LOC tags)
-/// in a scenario/save/script text when cloning a map under a new id.
+/// Replaces every ASCII-case-insensitive occurrence of `old_id` with `new_id`
+/// in scenario/save/script text when cloning a map under a new id.
 pub fn rewrite_map_id(text: &str, old_id: &str, new_id: &str) -> String {
-    if old_id.is_empty() || old_id == new_id {
+    if old_id.is_empty() || old_id.eq_ignore_ascii_case(new_id) && old_id == new_id {
         return text.to_string();
     }
-    text.replace(old_id, new_id)
+    let needle = old_id.as_bytes();
+    let hay = text.as_bytes();
+    if needle.len() > hay.len() {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0usize;
+    while i < hay.len() {
+        if i + needle.len() <= hay.len() && hay[i..i + needle.len()].eq_ignore_ascii_case(needle) {
+            out.push_str(new_id);
+            i += needle.len();
+        } else {
+            let ch = text[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    out
+}
+
+/// Rewrites a `_scenario.lua` file for a cloned/edited map under `new_id`,
+/// updating VFS paths (`map`, `save`, `script`) and optionally the display `name`.
+pub fn rewrite_scenario_for_clone(
+    text: &str,
+    old_id: &str,
+    new_id: &str,
+    new_name: Option<&str>,
+) -> String {
+    let mut out = rewrite_map_id(text, old_id, new_id);
+    // Normalize `map = '...'`, `save = '...'`, `script = '...'` lines in case the
+    // source scenario referenced differently named files.
+    let targets = [
+        ("map", format!("/maps/{new_id}/{new_id}.scmap")),
+        ("save", format!("/maps/{new_id}/{new_id}_save.lua")),
+        ("script", format!("/maps/{new_id}/{new_id}_script.lua")),
+    ];
+    let mut lines: Vec<String> = Vec::new();
+    for line in out.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        let indent_len = line.len() - trimmed.len();
+        let indent = &line[..indent_len];
+        let eol = if line.ends_with("\r\n") {
+            "\r\n"
+        } else if line.ends_with('\n') {
+            "\n"
+        } else {
+            ""
+        };
+        let mut replaced = None;
+        for (key, val) in &targets {
+            if let Some(rest) = trimmed.strip_prefix(key) {
+                let after = rest.trim_start();
+                if after.starts_with('=') {
+                    let comma = if trimmed.trim_end().ends_with(',') { "," } else { "" };
+                    replaced = Some(format!("{indent}{key} = '{val}'{comma}{eol}"));
+                    break;
+                }
+            }
+        }
+        if replaced.is_none()
+            && let Some(title) = new_name
+            && let Some(rest) = trimmed.strip_prefix("name")
+            && rest.trim_start().starts_with('=')
+        {
+            let escaped = title.replace('\\', "\\\\").replace('\'', "\\'");
+            let comma = if trimmed.trim_end().ends_with(',') { "," } else { "" };
+            replaced = Some(format!("{indent}name = '{escaped}'{comma}{eol}"));
+        }
+        lines.push(replaced.unwrap_or_else(|| line.to_string()));
+    }
+    out = lines.concat();
+    out
 }
 
 fn scan_matching_brace(bytes: &[u8], open: usize) -> Option<usize> {
@@ -508,7 +579,10 @@ fn scan_matching_brace(bytes: &[u8], open: usize) -> Option<usize> {
                         j += 1;
                     }
                     if bytes.get(j) == Some(&b'[') {
-                        let close: Vec<u8> = std::iter::once(b']').chain(std::iter::repeat_n(b'=', eq)).chain([b']']).collect();
+                        let close: Vec<u8> = std::iter::once(b']')
+                            .chain(std::iter::repeat_n(b'=', eq))
+                            .chain(*b"]")
+                            .collect();
                         let mut k = j + 1;
                         let mut found = None;
                         while k + close.len() <= bytes.len() {
@@ -554,21 +628,51 @@ fn scan_matching_brace(bytes: &[u8], open: usize) -> Option<usize> {
     None
 }
 
-fn marker_entry_type(entry: &str) -> String {
-    let Some(tpos) = entry.find("'type'").or_else(|| entry.find("\"type\"")) else {
-        return String::new();
-    };
-    let rest = &entry[tpos..];
-    let Some(spos) = rest.find("STRING") else { return String::new() };
-    let rest = &rest[spos..];
-    let Some(q1) = rest.find(['\'', '"']) else { return String::new() };
-    let q = rest.as_bytes()[q1];
-    let rest2 = &rest[q1 + 1..];
-    let Some(q2) = rest2.find(q as char) else { return String::new() };
-    rest2[..q2].to_string()
+fn skip_ws_and_lua_comments(bytes: &[u8], mut i: usize, end: usize) -> usize {
+    while i < end {
+        if bytes[i].is_ascii_whitespace() || bytes[i] == b',' || bytes[i] == b';' {
+            i += 1;
+            continue;
+        }
+        if bytes[i] == b'-' && bytes.get(i + 1) == Some(&b'-') {
+            let mut j = i + 2;
+            if bytes.get(j) == Some(&b'[') {
+                let mut eq = 0usize;
+                j += 1;
+                while j < end && bytes[j] == b'=' {
+                    eq += 1;
+                    j += 1;
+                }
+                if j < end && bytes[j] == b'[' {
+                    let close: Vec<u8> = std::iter::once(b']')
+                        .chain(std::iter::repeat_n(b'=', eq))
+                        .chain(*b"]")
+                        .collect();
+                    let mut k = j + 1;
+                    let mut found = end;
+                    while k + close.len() <= end {
+                        if &bytes[k..k + close.len()] == close.as_slice() {
+                            found = k + close.len();
+                            break;
+                        }
+                        k += 1;
+                    }
+                    i = found;
+                    continue;
+                }
+            }
+            while i < end && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        break;
+    }
+    i
 }
 
 fn marker_entry(name: &str, marker_type: &str, pos: [f32; 3]) -> String {
+    let escaped = name.replace('\\', "\\\\").replace('\'', "\\'");
     let (color, prop, extra) = match marker_type {
         "Mass" => (
             "ff808080",
@@ -583,7 +687,7 @@ fn marker_entry(name: &str, marker_type: &str, pos: [f32; 3]) -> String {
         _ => ("ff800080", "/env/common/props/markers/M_Blank_prop.bp", ""),
     };
     format!(
-        "                ['{name}'] = {{\n{extra}                    ['color'] = STRING( '{color}' ),\n                    ['type'] = STRING( '{marker_type}' ),\n                    ['prop'] = STRING( '{prop}' ),\n                    ['orientation'] = VECTOR3( 0, 0, 0 ),\n                    ['position'] = VECTOR3( {:.4}, {:.4}, {:.4} ),\n                }},\n",
+        "                ['{escaped}'] = {{\n{extra}                    ['color'] = STRING( '{color}' ),\n                    ['type'] = STRING( '{marker_type}' ),\n                    ['prop'] = STRING( '{prop}' ),\n                    ['orientation'] = VECTOR3( 0, 0, 0 ),\n                    ['position'] = VECTOR3( {:.4}, {:.4}, {:.4} ),\n                }},\n",
         pos[0], pos[1], pos[2]
     )
 }
@@ -598,64 +702,105 @@ pub fn rewrite_save_markers(
     mass: &[Marker],
     hydro: &[Marker],
 ) -> Result<String, String> {
-    let bytes = text.as_bytes();
-    let master = text.find("MasterChain").ok_or("missing MasterChain in save text")?;
-    let markers_kw = text[master..]
-        .find("Markers")
-        .map(|p| master + p)
-        .ok_or("missing Markers in save text")?;
-    let open = text[markers_kw..]
-        .find('{')
-        .map(|p| markers_kw + p)
-        .ok_or("missing '{' after Markers")?;
-    let close = scan_matching_brace(bytes, open).ok_or("unterminated Markers table")?;
+    let src = text.strip_prefix('\u{FEFF}').unwrap_or(text);
+    let prefix_len = text.len() - src.len();
+    let bytes = src.as_bytes();
 
-    // Split the interior into top-level `['name'] = { ... },` entries.
+    // Locate `MasterChain = { ... ['_MASTERCHAIN_'] = { ... Markers = { ... } } }`
+    // using the comment/string-aware Lua lexer.
+    let mc_open = Lexer::new(src)
+        .find_table_value_start("MasterChain")?
+        .ok_or_else(|| "missing MasterChain in save text".to_string())?;
+    let mc_close = scan_matching_brace(bytes, mc_open)
+        .ok_or_else(|| "unterminated MasterChain table".to_string())?;
+    let inner_open = Lexer::new(&src[mc_open + 1..mc_close])
+        .find_table_value_start("_MASTERCHAIN_")?
+        .map(|p| mc_open + 1 + p)
+        .ok_or_else(|| "missing '_MASTERCHAIN_' in MasterChain".to_string())?;
+    let inner_close = scan_matching_brace(bytes, inner_open)
+        .ok_or_else(|| "unterminated '_MASTERCHAIN_' table".to_string())?;
+    let open = Lexer::new(&src[inner_open + 1..inner_close])
+        .find_table_value_start("Markers")?
+        .map(|p| inner_open + 1 + p)
+        .ok_or_else(|| "missing Markers in '_MASTERCHAIN_'".to_string())?;
+    let close = scan_matching_brace(bytes, open)
+        .ok_or_else(|| "unterminated Markers table".to_string())?;
+
+    // Split the interior into top-level `['name'] = { ... },` or `name = { ... },` entries.
     let mut kept: Vec<String> = Vec::new();
     let mut i = open + 1;
     while i < close {
-        // Skip separators between entries.
-        while i < close && (bytes[i].is_ascii_whitespace() || bytes[i] == b',') {
-            i += 1;
-        }
+        i = skip_ws_and_lua_comments(bytes, i, close);
         if i >= close {
             break;
         }
         let entry_start = i;
-        // Entry name: `['name']` or bare identifier.
-        let mut name = String::new();
-        if bytes[i] == b'[' {
-            if let Some(end) = text[i..close].find(']') {
-                let inner = &text[i + 1..i + end];
-                name = inner.trim().trim_matches(['\'', '"']).to_string();
-                i += end + 1;
+        // Parse key name (`['name']`, `["name"]`, or bare identifier).
+        let name = if bytes[i] == b'[' {
+            let mut lex = Lexer::new(&src[i + 1..close]);
+            let _ = lex.skip_whitespace_and_comments();
+            let k = match lex.next_token().ok().flatten() {
+                Some(Token::Str(s)) => s,
+                Some(Token::Ident(s)) => s,
+                Some(Token::Num(n)) => n.to_string(),
+                _ => String::new(),
+            };
+            let _ = lex.skip_whitespace_and_comments();
+            if bytes.get(i + 1 + lex.pos) == Some(&b']') {
+                i = i + 1 + lex.pos + 1;
             }
+            k
+        } else if is_ident_start(bytes[i]) {
+            let ks = i;
+            i += 1;
+            while i < close && is_ident_continue(bytes[i]) {
+                i += 1;
+            }
+            src[ks..i].to_string()
+        } else {
+            String::new()
+        };
+
+        // Advance past `=` to the entry's opening `{`.
+        i = skip_ws_and_lua_comments(bytes, i, close);
+        if i < close && bytes[i] == b'=' {
+            i += 1;
+            i = skip_ws_and_lua_comments(bytes, i, close);
         }
-        // Find this entry's table (or scalar) end.
-        let entry_end = match text[i..close].find('{') {
-            Some(rel) => {
-                let eopen = i + rel;
-                match scan_matching_brace(bytes, eopen) {
-                    Some(eclose) => {
-                        let mut e = eclose + 1;
-                        if bytes.get(e) == Some(&b',') {
-                            e += 1;
-                        }
-                        e
+        let (val_open, entry_end) = if i < close && bytes[i] == b'{' {
+            let eopen = i;
+            match scan_matching_brace(bytes, eopen) {
+                Some(eclose) => {
+                    let mut e = eclose + 1;
+                    if bytes.get(e) == Some(&b',') {
+                        e += 1;
                     }
-                    None => close,
+                    (Some((eopen, eclose)), e)
                 }
+                None => (None, close),
             }
-            None => close,
+        } else {
+            // Non-table fallback: advance to next comma or end.
+            let mut e = i;
+            while e < close && bytes[e] != b',' {
+                e += 1;
+            }
+            if e < close && bytes[e] == b',' {
+                e += 1;
+            }
+            (None, e)
         };
         if entry_end <= entry_start {
             break;
         }
-        let entry = &text[entry_start..entry_end];
-        let ty = marker_entry_type(entry);
+        let entry = &src[entry_start..entry_end];
+        let ty = val_open
+            .and_then(|(vo, vc)| Parser::new(&src[vo..=vc]).ok()?.parse_table().ok())
+            .and_then(|tbl| tbl.get("type").and_then(|v| v.as_string()))
+            .unwrap_or_default();
         let is_start = name.starts_with("ARMY_") || armies.iter().any(|a| a == &name);
         if !is_start && ty != "Mass" && ty != "Hydrocarbon" {
-            kept.push(entry.to_string());
+            kept.push(format!("                {}", entry.trim_start()));
             if !entry.trim_end().ends_with(',') {
                 kept.last_mut().unwrap().push(',');
             }
@@ -679,7 +824,13 @@ pub fn rewrite_save_markers(
         interior.push_str(&k);
     }
     interior.push_str("            ");
-    Ok(format!("{}{}{}{}", &text[..=open], interior, &text[close..], ""))
+    Ok(format!(
+        "{}{}{}{}",
+        &text[..prefix_len],
+        &src[..=open],
+        interior,
+        &src[close..]
+    ))
 }
 
 fn list_dir_files_sorted(dir: &Path) -> Result<Vec<(String, PathBuf)>, String> {
@@ -1668,7 +1819,77 @@ description]],
         assert_eq!(parsed.mass_points.len(), 1);
         assert_eq!(parsed.mass_points[0].name, "MASS_900");
         assert_eq!(parsed.total_markers, 4);
-        assert_eq!(rewrite_map_id("map = '/maps/SCMP_001/SCMP_001.scmap'", "SCMP_001", "NEW1"), "map = '/maps/NEW1/NEW1.scmap'");
+        assert_eq!(
+            rewrite_map_id("map = '/maps/scmp_001/SCMP_001.scmap'", "SCMP_001", "NEW1"),
+            "map = '/maps/NEW1/NEW1.scmap'"
+        );
+    }
+
+    #[test]
+    fn rewrite_save_markers_handles_comments_bare_keys_and_plain_types() {
+        let lua = r#"
+--[[ Fake MasterChain = { ['_MASTERCHAIN_'] = { Markers = { } } } ]]--
+Scenario = {
+    note = "MasterChain = { fake }",
+    MasterChain = {
+        ['_MASTERCHAIN_'] = {
+            Markers = {
+                -- existing comment inside Markers
+                ARMY_1 = {
+                    ['type'] = 'Blank Marker',
+                    ['position'] = VECTOR3( 1, 2, 3 ),
+                },
+                ['Mass 01'] = {
+                    ['type'] = 'Mass',
+                    ['position'] = VECTOR3( 4, 5, 6 ),
+                },
+                ['Hydro 01'] = {
+                    ['type'] = STRING( 'Hydrocarbon' ),
+                    ['position'] = VECTOR3( 7, 8, 9 ),
+                },
+                ['Land Path Node 01'] = {
+                    ['type'] = STRING( 'Land Path Node' ),
+                    ['position'] = VECTOR3( 10, 11, 12 ),
+                },
+            },
+        },
+    },
+}
+"#;
+        let armies = vec!["ARMY_1".to_string()];
+        let starts = vec![Marker {
+            name: "ARMY_1".into(),
+            marker_type: "Blank Marker".into(),
+            position: [55.0, 12.0, 66.0],
+        }];
+        let mass = vec![Marker {
+            name: "Mass 02".into(),
+            marker_type: "Mass".into(),
+            position: [77.0, 12.0, 88.0],
+        }];
+        let hydro = vec![Marker {
+            name: "Hydro 02".into(),
+            marker_type: "Hydrocarbon".into(),
+            position: [99.0, 12.0, 111.0],
+        }];
+        let out = rewrite_save_markers(lua, &armies, &starts, &mass, &hydro).expect("rewrite");
+        let parsed = parse_save_markers(&out, &armies).expect("reparse");
+        assert_eq!(parsed.start_spots.len(), 1);
+        assert_eq!(parsed.start_spots[0].position, [55.0, 12.0, 66.0]);
+        assert_eq!(parsed.mass_points.len(), 1);
+        assert_eq!(parsed.mass_points[0].name, "Mass 02");
+        assert_eq!(parsed.hydro_points.len(), 1);
+        assert_eq!(parsed.hydro_points[0].name, "Hydro 02");
+        assert_eq!(parsed.total_markers, 4); // 1 start + 1 mass + 1 hydro + 1 kept path node
+        assert!(out.contains("Land Path Node 01"));
+
+        let scen = "ScenarioInfo = {\n    name = 'Old Name',\n    map = '/maps/old_id/old.scmap',\n    save = '/maps/old_id/old_save.lua',\n    script = '/maps/old_id/old_script.lua',\n}\n";
+        let cloned = rewrite_scenario_for_clone(scen, "OLD_ID", "NEW_ID", Some("New Name"));
+        let meta = parse_scenario(&cloned, "NEW_ID").expect("parse cloned scenario");
+        assert_eq!(meta.name, "New Name");
+        assert_eq!(meta.map_vfs_path, "/maps/NEW_ID/NEW_ID.scmap");
+        assert_eq!(meta.save_vfs_path, "/maps/NEW_ID/NEW_ID_save.lua");
+        assert!(cloned.contains("script = '/maps/NEW_ID/NEW_ID_script.lua',"));
     }
 
     #[test]

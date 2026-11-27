@@ -116,6 +116,13 @@ pub struct TerrainTextures {
     pub normal_map_dds: Vec<u8>,
     pub water_params: ScMapWaterParams,
     pub props: Vec<ScMapProp>,
+    /// Byte range `(start, end)` of the prop section (`prop_count` + prop records)
+    /// inside [`ScMap::tail_bytes`], enabling prop edits while keeping all other
+    /// tail bytes verbatim.
+    pub props_tail_range: Option<(usize, usize)>,
+    /// Set when `props` has been modified so [`ScMap::write`] re-serializes the
+    /// prop slice instead of emitting `tail_bytes` verbatim.
+    pub props_dirty: bool,
 }
 
 /// Parsed Supreme Commander `.scmap` map data (header, heightmap, environment paths, lighting, and water).
@@ -372,7 +379,10 @@ fn parse_terrain_textures(tail: &[u8], hm_w: u32, hm_h: u32) -> Option<TerrainTe
         Vec::new()
     };
 
-    let props = parse_props_tail(&mut r, hm_w, hm_h).unwrap_or_default();
+    let (props, props_tail_range) = match parse_props_tail(&mut r, hm_w, hm_h) {
+        Some((p, range)) => (p, Some(range)),
+        None => (Vec::new(), None),
+    };
 
     let water_params = ScMapWaterParams {
         surface_color: [wf[0], wf[1], wf[2]],
@@ -393,10 +403,16 @@ fn parse_terrain_textures(tail: &[u8], hm_w: u32, hm_h: u32) -> Option<TerrainTe
         normal_map_dds,
         water_params,
         props,
+        props_tail_range,
+        props_dirty: false,
     })
 }
 
-fn parse_props_tail(r: &mut Reader<'_>, hm_w: u32, hm_h: u32) -> Option<Vec<ScMapProp>> {
+fn parse_props_tail(
+    r: &mut Reader<'_>,
+    hm_w: u32,
+    hm_h: u32,
+) -> Option<(Vec<ScMapProp>, (usize, usize))> {
     // Unknown v60 u32 (usually 1) + watermap DDS length/payload
     r.skip(4).ok()?;
     let wmap_len = usize::try_from(r.read_u32().ok()?).ok()?;
@@ -423,6 +439,7 @@ fn parse_props_tail(r: &mut Reader<'_>, hm_w: u32, hm_h: u32) -> Option<Vec<ScMa
     r.skip(cirrus_bytes).ok()?;
     r.skip(4).ok()?;
 
+    let props_start = r.pos;
     let prop_count = usize::try_from(r.read_u32().ok()?).ok()?;
     if prop_count > r.remaining() / 61 {
         return None;
@@ -443,7 +460,8 @@ fn parse_props_tail(r: &mut Reader<'_>, hm_w: u32, hm_h: u32) -> Option<Vec<ScMa
             scale: [vals[12], vals[13], vals[14]],
         });
     }
-    Some(props)
+    let props_end = r.pos;
+    Some((props, (props_start, props_end)))
 }
 
 impl ScMap {
@@ -588,13 +606,15 @@ impl ScMap {
 
     /// Serializes back to `.scmap` bytes. The structured header is rewritten
     /// from the parsed fields; the post-water tail is emitted verbatim from
-    /// `tail_bytes`, so `write(parse(bytes)) == bytes` for stock maps.
+    /// `tail_bytes` unless props were edited (in which case only the prop
+    /// section inside `tail_bytes` is regenerated), so `write(parse(bytes)) == bytes`
+    /// for stock maps.
     pub fn write(&self) -> Vec<u8> {
         fn cstr(out: &mut Vec<u8>, raw: &[u8], text: &str) {
-            if raw.is_empty() {
-                out.extend_from_slice(text.as_bytes());
-            } else {
+            if !raw.is_empty() && decode_cstr_bytes(raw) == text {
                 out.extend_from_slice(raw);
+            } else {
+                out.extend_from_slice(text.as_bytes());
             }
             out.push(0);
         }
@@ -653,7 +673,32 @@ impl ScMap {
         out.extend_from_slice(&self.water.elevation.to_le_bytes());
         out.extend_from_slice(&self.water.elevation_deep.to_le_bytes());
         out.extend_from_slice(&self.water.elevation_abyss.to_le_bytes());
-        out.extend_from_slice(&self.tail_bytes);
+        if let Some(tt) = &self.terrain_textures
+            && tt.props_dirty
+            && let Some((start, end)) = tt.props_tail_range
+            && start <= end
+            && end <= self.tail_bytes.len()
+        {
+            out.extend_from_slice(&self.tail_bytes[..start]);
+            out.extend_from_slice(&(tt.props.len() as u32).to_le_bytes());
+            for p in &tt.props {
+                out.extend_from_slice(p.blueprint_path.as_bytes());
+                out.push(0);
+                let vals = [
+                    p.position[0], p.position[1], p.position[2],
+                    p.rot_x[0], p.rot_x[1], p.rot_x[2],
+                    p.rot_y[0], p.rot_y[1], p.rot_y[2],
+                    p.rot_z[0], p.rot_z[1], p.rot_z[2],
+                    p.scale[0], p.scale[1], p.scale[2],
+                ];
+                for v in vals {
+                    out.extend_from_slice(&v.to_le_bytes());
+                }
+            }
+            out.extend_from_slice(&self.tail_bytes[end..]);
+        } else {
+            out.extend_from_slice(&self.tail_bytes);
+        }
         out
     }
 
@@ -662,27 +707,95 @@ impl ScMap {
         fs::write(path, self.write()).map_err(|e| format!("failed to write '{}': {e}", path.display()))
     }
 
+    /// Bilinearly samples world-space terrain height at `(wx, wz)`.
+    pub fn sample_height(&self, wx: f32, wz: f32) -> f32 {
+        let hm_w = self.heightmap_width;
+        let hm_h = self.heightmap_height;
+        if hm_w == 0 || hm_h == 0 {
+            return 0.0;
+        }
+        let mw = if self.map_width > 0.0 { self.map_width } else { hm_w as f32 };
+        let mh = if self.map_height > 0.0 { self.map_height } else { hm_h as f32 };
+        let gx = ((wx / mw) * hm_w as f32).clamp(0.0, hm_w as f32);
+        let gz = ((wz / mh) * hm_h as f32).clamp(0.0, hm_h as f32);
+        let x0 = (gx.floor() as u32).min(hm_w);
+        let z0 = (gz.floor() as u32).min(hm_h);
+        let x1 = (x0 + 1).min(hm_w);
+        let z1 = (z0 + 1).min(hm_h);
+        let tx = (gx - x0 as f32).clamp(0.0, 1.0);
+        let tz = (gz - z0 as f32).clamp(0.0, 1.0);
+
+        let h00 = self.height_at(x0, z0).unwrap_or(0.0);
+        let h10 = self.height_at(x1, z0).unwrap_or(h00);
+        let h01 = self.height_at(x0, z1).unwrap_or(h00);
+        let h11 = self.height_at(x1, z1).unwrap_or(h00);
+        let h0 = h00 + (h10 - h00) * tx;
+        let h1 = h01 + (h11 - h01) * tx;
+        h0 + (h1 - h0) * tz
+    }
+
+    /// Appends a prop instance to `terrain_textures.props` and marks props dirty
+    /// for serialization. Returns `false` if this map has no parsed prop section.
+    pub fn add_prop(&mut self, prop: ScMapProp) -> bool {
+        let Some(tt) = self.terrain_textures.as_mut() else {
+            return false;
+        };
+        if tt.props_tail_range.is_none() {
+            return false;
+        }
+        tt.props.push(prop);
+        tt.props_dirty = true;
+        true
+    }
+
+    /// Removes the nearest prop within `max_dist` (XZ world units) of `(x, z)`.
+    pub fn remove_prop_near(&mut self, x: f32, z: f32, max_dist: f32) -> Option<ScMapProp> {
+        let tt = self.terrain_textures.as_mut()?;
+        tt.props_tail_range?;
+        let max_d2 = max_dist.max(0.0) * max_dist.max(0.0);
+        let (idx, _) = tt
+            .props
+            .iter()
+            .enumerate()
+            .filter_map(|(i, p)| {
+                let dx = p.position[0] - x;
+                let dz = p.position[2] - z;
+                let d2 = dx * dx + dz * dz;
+                (d2 <= max_d2).then_some((i, d2))
+            })
+            .min_by(|a, b| a.1.total_cmp(&b.1))?;
+        tt.props_dirty = true;
+        Some(tt.props.remove(idx))
+    }
+
     /// Applies a heightmap brush in world coordinates (`x`, `z` on the map,
     /// `radius` in world units, `strength` in world height units for
-    /// raise/lower). Returns the number of samples changed.
+    /// raise/lower or blend factor in `0.05..=1.0` for smooth). Returns the
+    /// number of samples changed.
     pub fn apply_brush(&mut self, x: f32, z: f32, radius: f32, strength: f32, mode: BrushMode) -> usize {
         if self.heightmap_width == 0 || self.heightmap_height == 0 || radius <= 0.0 || self.height_scale == 0.0 {
             return 0;
         }
         let stride = self.heightmap_width as usize + 1;
-        let gx = x / self.map_width.max(1.0) * self.heightmap_width as f32;
-        let gz = z / self.map_height.max(1.0) * self.heightmap_height as f32;
-        let gr = radius / self.map_width.max(1.0) * self.heightmap_width as f32;
-        let x0 = (gx - gr).floor().max(0.0) as usize;
-        let z0 = (gz - gr).floor().max(0.0) as usize;
-        let x1 = ((gx + gr).ceil() as usize).min(self.heightmap_width as usize);
-        let z1 = ((gz + gr).ceil() as usize).min(self.heightmap_height as usize);
+        let mw = self.map_width.max(1.0);
+        let mh = self.map_height.max(1.0);
+        let gx = x / mw * self.heightmap_width as f32;
+        let gz = z / mh * self.heightmap_height as f32;
+        let gr_x = radius / mw * self.heightmap_width as f32;
+        let gr_z = radius / mh * self.heightmap_height as f32;
+        let x0 = (gx - gr_x).floor().max(0.0) as usize;
+        let z0 = (gz - gr_z).floor().max(0.0) as usize;
+        let x1 = ((gx + gr_x).ceil() as usize).min(self.heightmap_width as usize);
+        let z1 = ((gz + gr_z).ceil() as usize).min(self.heightmap_height as usize);
         let mut changed = 0usize;
         // Snapshot for smooth mode so the pass is order-independent.
         let orig = (mode == BrushMode::Smooth).then(|| self.heightmap.clone());
+        let smooth_alpha = strength.clamp(0.05, 1.0);
         for gz_i in z0..=z1 {
+            let wz = gz_i as f32 / self.heightmap_height as f32 * mh;
             for gx_i in x0..=x1 {
-                let d = ((gx_i as f32 - gx).powi(2) + (gz_i as f32 - gz).powi(2)).sqrt() / gr.max(0.001);
+                let wx = gx_i as f32 / self.heightmap_width as f32 * mw;
+                let d = (wx - x).hypot(wz - z) / radius;
                 if d > 1.0 {
                     continue;
                 }
@@ -704,18 +817,22 @@ impl ScMap {
                             for dx in -1i32..=1 {
                                 let nx = gx_i as i32 + dx;
                                 let nz = gz_i as i32 + dz;
-                                if nx >= 0 && nz >= 0 && (nx as usize) <= self.heightmap_width as usize && (nz as usize) <= self.heightmap_height as usize {
-                                    if let Some(&v) = src.get(nz as usize * stride + nx as usize) {
-                                        sum += v as u32;
-                                        n += 1;
-                                    }
+                                if nx >= 0
+                                    && nz >= 0
+                                    && (nx as usize) <= self.heightmap_width as usize
+                                    && (nz as usize) <= self.heightmap_height as usize
+                                    && let Some(&v) = src.get(nz as usize * stride + nx as usize)
+                                {
+                                    sum += v as u32;
+                                    n += 1;
                                 }
                             }
                         }
-                        if n > 0 {
-                            let avg = (sum / n) as i32;
+                        if let Some(avg_u) = sum.checked_div(n) {
+                            let avg = avg_u as i32;
                             let cur = *slot as i32;
-                            *slot = (cur + ((avg - cur) as f32 * fall).round() as i32).clamp(0, u16::MAX as i32) as u16;
+                            let w = fall * smooth_alpha;
+                            *slot = (cur + ((avg - cur) as f32 * w).round() as i32).clamp(0, u16::MAX as i32) as u16;
                         }
                     }
                 }
@@ -1154,6 +1271,92 @@ mod tests {
         assert_eq!(map.heightmap[0], before[0]);
         let n = map.apply_brush(256.0, 512.0, 100.0, 10.0, BrushMode::Lower);
         assert!(n > 0);
+    }
+
+    #[test]
+    fn brush_smooth_and_sample_height_and_props_roundtrip() {
+        // Build a synthetic v2.60 map with a minimal parseable terrain_textures + props tail.
+        let mut bytes = valid_v2_60_bytes();
+        let mut tail = Vec::new();
+        // 20 f32 water shading params
+        for _ in 0..20 {
+            tail.extend_from_slice(&0.5_f32.to_le_bytes());
+        }
+        tail.push(0); // water_cubemap
+        tail.push(0); // water_ramp
+        tail.extend_from_slice(&[0u8; 16]); // 4 wave repeats
+        for _ in 0..4 {
+            tail.extend_from_slice(&[0u8; 8]);
+            tail.push(0);
+        }
+        tail.extend_from_slice(&0u32.to_le_bytes()); // wave_gen_count
+        tail.extend_from_slice(&[0u8; 28]); // contour
+        for _ in 0..10 {
+            tail.push(0);
+            tail.extend_from_slice(&4.0_f32.to_le_bytes());
+        }
+        for _ in 0..9 {
+            tail.push(0);
+            tail.extend_from_slice(&4.0_f32.to_le_bytes());
+        }
+        tail.extend_from_slice(&[0u8; 8]);
+        tail.extend_from_slice(&0u32.to_le_bytes()); // decal_count
+        tail.extend_from_slice(&0u32.to_le_bytes()); // group_count
+        tail.extend_from_slice(&[0u8; 8]);
+        tail.extend_from_slice(&0u32.to_le_bytes()); // norm_count
+        tail.extend_from_slice(&4u32.to_le_bytes()); // tm0_len
+        tail.extend_from_slice(b"DDS ");
+        tail.extend_from_slice(&4u32.to_le_bytes()); // tm1_len
+        tail.extend_from_slice(b"DDS ");
+        // props tail header: unknown u32 + wmap_len=0 + masks (half=1*1 => 3 + 2*2 = 7 bytes)
+        tail.extend_from_slice(&1u32.to_le_bytes());
+        tail.extend_from_slice(&0u32.to_le_bytes());
+        tail.extend_from_slice(&[0u8; 7]);
+        // skybox (64) + 2 cstrs + planet_count=0 + 19 + cirrus_tex + cirrus_count=0 + 4
+        tail.extend_from_slice(&[0u8; 64]);
+        tail.push(0);
+        tail.push(0);
+        tail.extend_from_slice(&0u32.to_le_bytes());
+        tail.extend_from_slice(&[0u8; 19]);
+        tail.push(0);
+        tail.extend_from_slice(&0u32.to_le_bytes());
+        tail.extend_from_slice(&0u32.to_le_bytes());
+        // 1 initial prop
+        tail.extend_from_slice(&1u32.to_le_bytes());
+        tail.extend_from_slice(b"/env/tree.bp\0");
+        for v in [10.0_f32, 5.0, 20.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0] {
+            tail.extend_from_slice(&v.to_le_bytes());
+        }
+        bytes.extend_from_slice(&tail);
+
+        let mut map = ScMap::parse(&bytes).expect("parse with props tail");
+        assert_eq!(map.write(), bytes, "unedited map with props must be byte-identical");
+        assert_eq!(map.terrain_textures.as_ref().unwrap().props.len(), 1);
+        assert!((map.sample_height(256.0, 512.0) - 25.0).abs() < 1e-4);
+
+        // Add a second prop and verify write -> reparse -> write identity.
+        assert!(map.add_prop(ScMapProp {
+            blueprint_path: "/env/rock.bp".to_string(),
+            position: [100.0, 12.0, 200.0],
+            rot_x: [1.0, 0.0, 0.0],
+            rot_y: [0.0, 1.0, 0.0],
+            rot_z: [0.0, 0.0, 1.0],
+            scale: [1.5, 1.5, 1.5],
+        }));
+        let edited = map.write();
+        let reparsed = ScMap::parse(&edited).expect("reparse edited props");
+        let props = &reparsed.terrain_textures.as_ref().unwrap().props;
+        assert_eq!(props.len(), 2);
+        assert_eq!(props[1].blueprint_path, "/env/rock.bp");
+        assert_eq!(props[1].position, [100.0, 12.0, 200.0]);
+        assert_eq!(reparsed.write(), edited);
+
+        // Smooth brush moves center spike toward neighbors
+        let mut spike = ScMap::parse(&valid_v2_60_bytes()).expect("parse");
+        spike.heightmap[4] = 500;
+        let ch = spike.apply_brush(256.0, 512.0, 200.0, 0.8, BrushMode::Smooth);
+        assert!(ch > 0);
+        assert!(spike.heightmap[4] < 500);
     }
 
     #[test]

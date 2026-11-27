@@ -2885,6 +2885,107 @@ impl GpuSceneResources {
         self.hud_text = make(text_v, text_i, "hud_text");
     }
 
+    /// Replaces the main terrain vertex/index buffers after live heightmap edits.
+    pub(crate) fn update_terrain_mesh(
+        &mut self,
+        device: &wgpu::Device,
+        vertices: &[GpuVertex],
+        indices: &[u32],
+    ) {
+        if vertices.is_empty() || indices.is_empty() {
+            self.index_count = 0;
+            return;
+        }
+        self.vertex_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("scene_vb_edited"),
+            contents: bytemuck::cast_slice(vertices),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        self.index_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("scene_ib_edited"),
+            contents: bytemuck::cast_slice(indices),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+        self.index_count = indices.len() as u32;
+    }
+
+    /// Replaces the static 3D overlay (marker beacons / legacy water quad).
+    pub(crate) fn update_static_overlay(
+        &mut self,
+        device: &wgpu::Device,
+        vertices: &[GpuVertex],
+        indices: &[u32],
+    ) {
+        if vertices.is_empty() || indices.is_empty() {
+            self.static_overlay = None;
+            return;
+        }
+        let ov_vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("static_overlay_vb_edited"),
+            contents: bytemuck::cast_slice(vertices),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let ov_ib = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("static_overlay_ib_edited"),
+            contents: bytemuck::cast_slice(indices),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+        self.static_overlay = Some((ov_vb, ov_ib, indices.len() as u32));
+    }
+
+    /// Replaces the static prop batches after placing or deleting props in the map editor.
+    pub(crate) fn update_prop_batches(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        prop_batches: &[crate::scene::PropMeshBatch],
+    ) {
+        let mut uploaded = Vec::with_capacity(prop_batches.len());
+        for pb in prop_batches {
+            if pb.instances.is_empty() || pb.indices.is_empty() {
+                continue;
+            }
+            let vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(&pb.label),
+                contents: bytemuck::cast_slice(&pb.vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+            let ib = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(&pb.label),
+                contents: bytemuck::cast_slice(&pb.indices),
+                usage: wgpu::BufferUsages::INDEX,
+            });
+            let bg = match pb.albedo {
+                Some(ref img) => create_rgba_bind_group(
+                    device,
+                    queue,
+                    &self.bind_group_layout,
+                    &self.uniform_buf,
+                    &self.sampler_repeat,
+                    img,
+                    &pb.label,
+                ),
+                None => self.overlay_bind_group.clone(),
+            };
+            let inst_b = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(&pb.label),
+                contents: bytemuck::cast_slice(&pb.instances),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+            uploaded.push((
+                vb,
+                ib,
+                pb.indices.len() as u32,
+                bg,
+                inst_b,
+                pb.instances.len() as u32,
+                pb.bounds_min,
+                pb.bounds_max,
+            ));
+        }
+        self.prop_batches = uploaded;
+    }
+
     /// Replace the per-frame dynamic geometry (empty input clears it).
     pub(crate) fn set_dynamic(&mut self, device: &wgpu::Device, vertices: &[GpuVertex], indices: &[u32]) {
         if vertices.is_empty() || indices.is_empty() {
