@@ -258,15 +258,31 @@ bumps `SIM_VERSION`, re-baselines golden hashes deliberately, and keeps
 - Deferred: reclaiming live walls (moves to Phase 34 with prop reclaim) and
   structures other than walls blocking pathing (moves to Phase 29).
 
-### Phase 29 — Ballistics & line of fire (planned)
-- Every structure footprint becomes a pathing blocker (reusing the Phase 28 wall
-  overlay), with factory roll-off points so produced units exit cleanly.
-- Replace direct-fire hitscan with simulated integer projectiles
-  (`MuzzleVelocity`, `FiringTolerance`, turret yaw/pitch limits from the
-  blueprint), terrain and wall occlusion, misses vs. moving targets, beam
-  weapons kept as instant but terrain-checked.
-- Exit: shots fired over a ridge hit the ridge; `bench-scale --units 2048`
-  stays ≥ 180 ticks/s.
+### Phase 29 — Ballistics & line of fire (done)
+- Integer terrain heightfield in the sim (`src/terrain.rs`, quantized once from the
+  `.scmap` heightmap; bilinear, `segment_hit` line-of-fire sampling) attached by the new
+  `Skirmish::attach_map` at every map-based world construction.
+- Surface direct fire is a 3-D shell (`MuzzleVelocity`) aimed at the target's centre and
+  led by its last-tick velocity (`LeadTarget`); per tick it hits the first thing on its
+  path — terrain, or any non-allied surface unit/wall it passes through — or misses at its
+  aim point. Instant/beam weapons (`BeamLifetime`, `ContinuousBeam`, no muzzle velocity)
+  are terrain-checked; anti-air stays hitscan, artillery keeps its ballistic AoE arc.
+- Turrets slew at `TurretYawSpeed` and fire only within `FiringTolerance`; yaw uses a new
+  integer CORDIC `combat::atan2_mrad` (no floats in sim state). Real data: 189 projectile
+  vs 27 beam/instant surface weapons, 156 turreted.
+- Every structure footprint blocks pathing (Phase 28 overlay; cells whose centre lies in
+  the footprint, walls keep full-cover), naval grid included; only paths near newly
+  blocked cells are re-routed; factory-built units roll off onto open ground.
+- `RULES_VERSION` 2 recorded in replay v5 headers; replays/saves from other rules are
+  refused with a clear error. Lockstep protocol v6.
+- Exit: ridge soaks shells and beams, turret slew delay, wall soaks shots aimed past it,
+  leading beats no-leading, structure detour + roll-off and replay-rules tests pass
+  (271/271). `bench-scale --units 2048`: 181 ticks/s 1t, 346 ticks/s 20t, exact `1t == 20t`
+  (`3325c3259e0e6e74`); 46% of shells miss (half overkill on dead targets, half dodged),
+  4% hit terrain. `skirmish SCMP_009 --record` → `replay verify` OK; 12-game `ai-arena`
+  all decisive. Done.
+- Deferred: turret yaw *range* limits and hull-facing fixed weapons (needs hull facing,
+  Phase 35); render still draws direct shells at ground + 1.2 m, not their sim height.
 
 ### Phase 30 — Air fuel, staging & repair (planned)
 - `Fuel` / `FuelUseTime` / `FuelRechargeRate`, out-of-fuel speed penalty,

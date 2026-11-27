@@ -29,6 +29,7 @@ use crate::scenario;
 use crate::scmap::ScMap;
 use crate::sim::{SCALE, TICK_HZ, Vec2};
 use crate::spatial::{SPATIAL_CELL_MILLI, SpatialGrid};
+use crate::terrain::HeightField;
 
 pub type ArmyId = u8;
 pub type UnitId = u32;
@@ -393,7 +394,30 @@ pub struct WeaponType {
     pub anti_surface: bool,
     pub turret_yaw_bone: Option<String>,
     pub turret_pitch_bone: Option<String>,
+    /// Phase 29: turret slew rate (milliradians per tick); 0 = fixed / instant aim.
+    pub turret_yaw_speed: i64,
+    /// Phase 29: fire only when the turret is within this angle of the target (mrad).
+    pub firing_tolerance: i64,
+    /// Phase 29: instant beam / hitscan weapon (no projectile; terrain-checked line of fire).
+    pub beam: bool,
+    /// Phase 29: aim ahead of moving targets (`LeadTarget`).
+    pub lead_target: bool,
 }
+
+/// Phase 29: spatial reach (beyond half a shell's per-tick segment) searched for units the
+/// shell passes through; hit boxes wider than this are only hit near their centre line.
+const DIRECT_HIT_REACH: i64 = 5 * SCALE;
+
+/// Phase 29: a line of fire may graze the terrain by this much (milli) before it is blocked.
+pub const LOF_CLEARANCE: i64 = SCALE / 4;
+
+/// Phase 29: sim rules generation. Replays / saves record it and refuse to re-simulate
+/// under different rules (1 = Phases ≤ 28; 2 = Phase 29 ballistics, turrets and structure
+/// footprints blocking pathing).
+pub const RULES_VERSION: u32 = 2;
+
+/// Phase 29: milliradians per degree, scaled by 1000 (17.453 mrad / deg).
+const MRAD_PER_DEG_MILLI: i64 = 17_453;
 
 /// Quantized unit type derived once from a blueprint.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -618,6 +642,18 @@ impl UnitType {
                 let muzzle_velocity = t.get_f64("MuzzleVelocity").map(per_tick).unwrap_or(0).max(0);
                 let turret_yaw_bone = t.get_str("TurretBoneYaw").map(ToOwned::to_owned);
                 let turret_pitch_bone = t.get_str("TurretBonePitch").map(ToOwned::to_owned);
+                let deg_to_mrad = |deg: f64| ((deg * MRAD_PER_DEG_MILLI as f64) / 1000.0).round() as i64;
+                let turreted = t.get_bool("Turreted").unwrap_or(turret_yaw_bone.is_some()) && turret_yaw_bone.is_some();
+                let turret_yaw_speed = if turreted {
+                    (deg_to_mrad(t.get_f64("TurretYawSpeed").unwrap_or(90.0).max(1.0)) / TICK_HZ as i64).max(1)
+                } else {
+                    0
+                };
+                let firing_tolerance = deg_to_mrad(t.get_f64("FiringTolerance").unwrap_or(2.0).clamp(0.0, 180.0)).max(5);
+                let beam = t.get("BeamLifetime").is_some()
+                    || t.get_bool("ContinuousBeam").unwrap_or(false)
+                    || muzzle_velocity <= 0;
+                let lead_target = t.get_bool("LeadTarget").unwrap_or(true);
                 Some(WeaponType {
                     label,
                     damage: q(d),
@@ -629,6 +665,10 @@ impl UnitType {
                     anti_surface,
                     turret_yaw_bone,
                     turret_pitch_bone,
+                    turret_yaw_speed,
+                    firing_tolerance,
+                    beam,
+                    lead_target,
                 })
             })
             .collect();
@@ -1665,6 +1705,33 @@ pub struct WeaponState {
     pub muzzle_velocity: i64,
     pub anti_air: bool,
     pub anti_surface: bool,
+    /// Phase 29: copied from [`WeaponType`].
+    pub turret_yaw_speed: i64,
+    pub firing_tolerance: i64,
+    pub beam: bool,
+    pub lead_target: bool,
+    /// Phase 29: current turret yaw (mrad, `atan2(dx, dz)` convention).
+    pub yaw: i64,
+}
+
+impl WeaponState {
+    pub fn from_type(w: &WeaponType) -> Self {
+        Self {
+            damage: w.damage,
+            range_sq: (w.range as i128) * (w.range as i128),
+            reset: w.reset,
+            cooldown: 0,
+            splash_radius: w.splash_radius,
+            muzzle_velocity: w.muzzle_velocity,
+            anti_air: w.anti_air,
+            anti_surface: w.anti_surface,
+            turret_yaw_speed: w.turret_yaw_speed,
+            firing_tolerance: w.firing_tolerance,
+            beam: w.beam,
+            lead_target: w.lead_target,
+            yaw: 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1733,6 +1800,10 @@ pub struct Unit {
     still_ticks: u32,
     /// Armies (bit = army id) whose omni sensors (or allies') reveal this cloaked unit.
     omni_mask: u8,
+    /// Phase 29: hit-box height (milli, blueprint `SizeY`) for line-of-fire tests.
+    pub height: i64,
+    /// Phase 29: ground displacement during the last tick (milli), used to lead targets.
+    pub vel: (i64, i64),
 }
 
 impl Unit {
@@ -1769,6 +1840,8 @@ struct UnitSpatialSnap {
     is_struct: bool,
     /// Phase 28: wall sections are only auto-targeted when nothing else is in range.
     is_wall: bool,
+    /// Phase 29: hit-box height (milli) for direct-fire collisions.
+    height: i64,
     can_fire_aa: bool,
     can_fire_surface: bool,
     max_range: i64,
@@ -1801,6 +1874,14 @@ pub struct Projectile {
     pub is_missile: bool,
     pub is_nuke: bool,
     pub target_air: bool,
+    /// Phase 29: straight-flying single-target direct-fire shell.
+    pub direct: bool,
+    /// Phase 29: firing unit (excluded from collisions; 0 = none).
+    pub shooter: UnitId,
+    /// Phase 29: current / start / aim height (milli) of a direct shell.
+    pub z: i64,
+    pub start_z: i64,
+    pub target_z: i64,
 }
 
 /// Visual/audio telemetry emitted during simulation ticks (excluded from `state_hash()`).
@@ -1975,9 +2056,13 @@ pub struct Skirmish {
     /// these into `grid` / `amphib_grid` by [`Skirmish::sync_walls`].
     base_grid: Arc<PathGrid>,
     base_amphib: Arc<PathGrid>,
-    /// Phase 28: live wall sections per land-grid cell (row-major, `base_grid` layout).
+    base_naval: Arc<PathGrid>,
+    /// Phase 28/29: live structures (walls and, since Phase 29, every structure) per
+    /// land-grid cell (row-major, `base_grid` layout).
     wall_cells: Vec<u16>,
     walls_dirty: bool,
+    /// Phase 29: integer terrain heights (flat on synthetic maps).
+    terrain: Arc<HeightField>,
     flow_cache: FlowFieldCache,
     spatial: Arc<SpatialGrid>,
     spatial_snap: Arc<Vec<UnitSpatialSnap>>,
@@ -2054,7 +2139,9 @@ impl Skirmish {
             naval_grid: Arc::clone(&grid_arc),
             amphib_grid: Arc::clone(&grid_arc),
             base_grid: Arc::clone(&grid_arc),
-            base_amphib: grid_arc,
+            base_amphib: Arc::clone(&grid_arc),
+            base_naval: grid_arc,
+            terrain: Arc::new(HeightField::flat()),
             flow_cache: FlowFieldCache::new(),
             spatial,
             spatial_snap: Arc::new(Vec::new()),
@@ -2145,11 +2232,7 @@ impl Skirmish {
             &setups,
             seed,
         )?;
-        w.set_domain_grids(
-            map.naval_grid.clone(),
-            map.amphib_grid.clone(),
-            map.hydro_points.clone(),
-        );
+        w.attach_map(map);
         Ok(w)
     }
 
@@ -2162,6 +2245,7 @@ impl Skirmish {
         self.naval_grid = Arc::new(naval_grid);
         self.amphib_grid = Arc::new(amphib_grid);
         self.base_amphib = Arc::clone(&self.amphib_grid);
+        self.base_naval = Arc::clone(&self.naval_grid);
         self.hydro_claims = vec![None; hydro_points.len()];
         self.hydro_points = hydro_points;
         self.flow_cache.clear();
@@ -2173,12 +2257,40 @@ impl Skirmish {
         }
     }
 
+    /// Phase 29: terrain heights used for line-of-fire and projectile collisions.
+    pub fn set_terrain(&mut self, terrain: HeightField) {
+        self.terrain = Arc::new(terrain);
+    }
+
+    pub fn terrain(&self) -> &HeightField {
+        &self.terrain
+    }
+
+    /// Attaches the naval / amphibious grids, hydro markers and terrain of `map` (the
+    /// common tail of every map-based world construction).
+    pub fn attach_map(&mut self, map: &MapContext) {
+        self.set_domain_grids(map.naval_grid.clone(), map.amphib_grid.clone(), map.hydro_points.clone());
+        self.set_terrain(HeightField::from_scmap(&map.scmap));
+    }
+
     /// Phase 28: grid cells covered by a square footprint of half-size `r` centred on `p`.
-    fn footprint_cells(grid: &PathGrid, p: (i64, i64), r: i64) -> impl Iterator<Item = (u32, u32)> {
+    /// Walls block every cell they touch (so 1 m sections form solid lines); other
+    /// structures (Phase 29) block the cells whose centre lies inside their footprint, so
+    /// small structures and the 1 m gaps between buildings do not seal off whole cells.
+    fn footprint_cells(grid: &PathGrid, p: (i64, i64), r: i64, wall: bool) -> Vec<(u32, u32)> {
         let r = r.max(1);
         let (x0, z0) = grid.world_to_cell(p.0 - r, p.1 - r);
         let (x1, z1) = grid.world_to_cell(p.0 + r - 1, p.1 + r - 1);
-        (z0..=z1).flat_map(move |z| (x0..=x1).map(move |x| (x, z)))
+        let half = grid.cell_size_milli / 2;
+        let cs = grid.cell_size_milli;
+        let inside = |c: u32, lo: i64, hi: i64| {
+            let m = c as i64 * cs + half;
+            m >= lo && m < hi
+        };
+        (z0..=z1)
+            .flat_map(|z| (x0..=x1).map(move |x| (x, z)))
+            .filter(|&(x, z)| wall || (inside(x, p.0 - r, p.0 + r) && inside(z, p.1 - r, p.1 + r)))
+            .collect()
     }
 
     /// Phase 28: whether a live wall section covers the grid cell containing `p`.
@@ -2219,8 +2331,8 @@ impl Skirmish {
         self.walls_dirty = false;
         let mut cells = vec![0u16; self.wall_cells.len()];
         let w = self.base_grid.width as usize;
-        for u in self.units.values().filter(|u| u.alive && u.role == Role::Wall) {
-            for (cx, cz) in Self::footprint_cells(&self.base_grid, (u.pos.x, u.pos.y), u.radius) {
+        for u in self.units.values().filter(|u| u.alive && u.role.is_structure() && u.carried_by.is_none()) {
+            for (cx, cz) in Self::footprint_cells(&self.base_grid, (u.pos.x, u.pos.y), u.radius, u.role == Role::Wall) {
                 let c = &mut cells[(cz as usize) * w + cx as usize];
                 *c = c.saturating_add(1);
             }
@@ -2229,22 +2341,49 @@ impl Skirmish {
             return;
         }
         let newly: Vec<bool> = cells.iter().zip(&self.wall_cells).map(|(&n, &o)| n > 0 && o == 0).collect();
+        // Bounding box (cells) of newly blocked cells: only paths near it can be invalid.
+        let mut bb: Option<(u32, u32, u32, u32)> = None;
+        for (i, _) in newly.iter().enumerate().filter(|(_, n)| **n) {
+            let (x, z) = ((i % w) as u32, (i / w) as u32);
+            bb = Some(bb.map_or((x, z, x, z), |(a, b, c, d)| (a.min(x), b.min(z), c.max(x), d.max(z))));
+        }
         self.wall_cells = cells;
         self.grid = Arc::new(Self::stamp_walls(&self.base_grid, &self.wall_cells));
-        let same_dims = self.base_amphib.width == self.base_grid.width && self.base_amphib.height == self.base_grid.height;
-        self.amphib_grid = if same_dims {
+        let same_dims = |g: &PathGrid| g.width == self.base_grid.width && g.height == self.base_grid.height;
+        self.amphib_grid = if same_dims(&self.base_amphib) {
             Arc::new(Self::stamp_walls(&self.base_amphib, &self.wall_cells))
         } else {
             Arc::clone(&self.base_amphib)
         };
+        self.naval_grid = if same_dims(&self.base_naval) {
+            Arc::new(Self::stamp_walls(&self.base_naval, &self.wall_cells))
+        } else {
+            Arc::clone(&self.base_naval)
+        };
         self.flow_cache.clear();
+        let Some((bx0, bz0, bx1, bz1)) = bb else {
+            return; // only unblocking: existing paths stay valid
+        };
+        let cs = self.base_grid.cell_size_milli;
+        let (lo_x, lo_z) = (bx0 as i64 * cs, bz0 as i64 * cs);
+        let (hi_x, hi_z) = ((bx1 as i64 + 1) * cs, (bz1 as i64 + 1) * cs);
         let mut evict = Vec::new();
         for u in self.units.values_mut() {
             if u.domain == NavDomain::Air {
                 continue;
             }
-            u.path.clear();
-            u.path_goal = None;
+            // Re-route units whose remaining path (incl. current position) overlaps the
+            // newly blocked area's bounding box.
+            let mut ax = (u.pos.x, u.pos.x);
+            let mut az = (u.pos.y, u.pos.y);
+            for &(x, z) in &u.path {
+                ax = (ax.0.min(x), ax.1.max(x));
+                az = (az.0.min(z), az.1.max(z));
+            }
+            if ax.1 >= lo_x - cs && ax.0 <= hi_x + cs && az.1 >= lo_z - cs && az.0 <= hi_z + cs {
+                u.path.clear();
+                u.path_goal = None;
+            }
             if u.alive && u.speed > 0 && u.carried_by.is_none() {
                 let (cx, cz) = self.base_grid.world_to_cell(u.pos.x, u.pos.y);
                 if newly[(cz as usize) * w + cx as usize] {
@@ -3352,21 +3491,12 @@ impl Skirmish {
         let weapons: Vec<WeaponState> = t
             .weapons
             .iter()
-            .map(|w| WeaponState {
-                damage: w.damage,
-                range_sq: (w.range as i128) * (w.range as i128),
-                reset: w.reset,
-                cooldown: 0,
-                splash_radius: w.splash_radius,
-                muzzle_velocity: w.muzzle_velocity,
-                anti_air: w.anti_air,
-                anti_surface: w.anti_surface,
-            })
+            .map(WeaponState::from_type)
             .collect();
         let can_aa = weapons.iter().any(|w| w.anti_air);
         let can_surf = weapons.iter().any(|w| w.anti_surface);
         let shield_init = t.shield_max_hp;
-        if t.role == Role::Wall {
+        if t.role.is_structure() {
             self.walls_dirty = true;
         }
         self.units.insert(
@@ -3427,6 +3557,8 @@ impl Skirmish {
                 intercept_cd: 0,
                 still_ticks: 0,
                 omni_mask: 0,
+                height: t.size[1].max(SCALE / 4),
+                vel: (0, 0),
             },
         );
         Some(id)
@@ -3447,6 +3579,7 @@ impl Skirmish {
                 speed: u.speed,
                 is_struct: u.role.is_structure(),
                 is_wall: u.role == Role::Wall,
+                height: u.height,
                 can_fire_aa: u.can_fire_aa,
                 can_fire_surface: u.can_fire_surface,
                 max_range: u.max_range,
@@ -3528,9 +3661,17 @@ impl Skirmish {
         { let _p = scope("sim.economy"); self.step_income(); self.step_shields(); self.step_enhancements(); self.step_silos(); }
         { let _p = scope("sim.construction"); self.step_construction(); self.sync_walls(); }
         { let _p = scope("sim.spatial"); self.rebuild_spatial(); }
+        // Phase 29: per-tick ground velocity (for target leading) = position delta over the
+        // movement, separation and transport passes.
+        for u in self.units.values_mut() {
+            u.vel = (u.pos.x, u.pos.y);
+        }
         { let _p = scope("sim.movement"); self.step_movement(); }
         { let _p = scope("sim.separation"); self.step_separation(); }
         { let _p = scope("sim.transport"); self.step_transport(); }
+        for u in self.units.values_mut() {
+            u.vel = (u.pos.x - u.vel.0, u.pos.y - u.vel.1);
+        }
         { let _p = scope("sim.intel"); self.step_intel(); }
         { let _p = scope("sim.spatial"); self.rebuild_spatial(); }
         { let _p = scope("sim.weapons"); self.step_weapons(); }
@@ -3785,21 +3926,16 @@ impl Skirmish {
             u.shield_hp = new_t.shield_max_hp;
         }
         u.max_range = new_t.max_range();
+        u.height = new_t.size[1].max(SCALE / 4);
+        if new_t.role.is_structure() {
+            self.walls_dirty = true;
+        }
         u.vision_radius = new_t.vision_radius;
         u.radar_radius = new_t.radar_radius;
         u.weapons = new_t
             .weapons
             .iter()
-            .map(|w| WeaponState {
-                damage: w.damage,
-                range_sq: (w.range as i128) * (w.range as i128),
-                reset: w.reset,
-                cooldown: 0,
-                splash_radius: w.splash_radius,
-                muzzle_velocity: w.muzzle_velocity,
-                anti_air: w.anti_air,
-                anti_surface: w.anti_surface,
-            })
+            .map(WeaponState::from_type)
             .collect();
         u.can_fire_aa = u.weapons.iter().any(|w| w.anti_air);
         u.can_fire_surface = u.weapons.iter().any(|w| w.anti_surface);
@@ -3922,6 +4058,7 @@ impl Skirmish {
         st.health_bonus = health_bonus;
 
         let old_cd: Vec<u32> = u.weapons.iter().map(|w| w.cooldown).collect();
+        let old_yaw: Vec<i64> = u.weapons.iter().map(|w| w.yaw).collect();
         u.weapons = t
             .weapons
             .iter()
@@ -3945,9 +4082,8 @@ impl Skirmish {
                     reset,
                     cooldown: old_cd.get(i).copied().unwrap_or(0).min(reset),
                     splash_radius: splash,
-                    muzzle_velocity: w.muzzle_velocity,
-                    anti_air: w.anti_air,
-                    anti_surface: w.anti_surface,
+                    yaw: old_yaw.get(i).copied().unwrap_or(0),
+                    ..WeaponState::from_type(w)
                 }
             })
             .collect();
@@ -4125,6 +4261,11 @@ impl Skirmish {
                         f.production.push_back(job.unit_type.clone());
                     }
                     if let Some(nid) = self.spawn_unit(army, &job.unit_type, exit) {
+                        // Phase 29: roll off onto open ground when the exit is built over.
+                        let free = self.walkable_near(nid, exit);
+                        if let Some(nu) = self.units.get_mut(&nid) {
+                            nu.pos = Vec2 { x: free.0, y: free.1 };
+                        }
                         self.armies[army as usize].units_built += 1;
                         let rally = self.units[&id].rally;
                         let u = self.units.get_mut(&nid).unwrap();
@@ -5165,6 +5306,11 @@ impl Skirmish {
                 is_missile,
                 is_nuke,
                 target_air,
+                direct: false,
+                shooter: 0,
+                z: 0,
+                start_z: 0,
+                target_z: 0,
             },
         );
     }
@@ -5397,20 +5543,39 @@ impl Skirmish {
                         .filter(|t| self.unit(*t).is_some())
                 });
             let tinfo = target.and_then(|t| {
-                self.unit(t)
-                    .map(|u| (t, (u.pos.x, u.pos.y), u.radius, u.altitude, u.domain == NavDomain::Air))
+                self.unit(t).map(|u| {
+                    (t, (u.pos.x, u.pos.y), u.radius, u.altitude, u.domain == NavDomain::Air, u.height, u.vel)
+                })
             });
+            let my_height = self.units[&id].height;
             let n = self.units[&id].weapons.len();
             for wi in 0..n {
+                // Phase 29: turrets slew toward the current target (also while reloading)
+                // and only fire once within `FiringTolerance`.
+                let mut aimed = true;
+                if let Some((_, tp, _, _, t_air, _, _)) = tinfo {
+                    let me = self.units.get_mut(&id).unwrap();
+                    let ws = &mut me.weapons[wi];
+                    if (t_air && ws.anti_air) || (!t_air && ws.anti_surface) {
+                        let desired = combat::atan2_mrad(tp.0 - pos.0, tp.1 - pos.1);
+                        if ws.turret_yaw_speed > 0 {
+                            let diff = combat::wrap_mrad(desired - ws.yaw);
+                            ws.yaw = combat::wrap_mrad(ws.yaw + diff.clamp(-ws.turret_yaw_speed, ws.turret_yaw_speed));
+                            aimed = combat::wrap_mrad(desired - ws.yaw).abs() <= ws.firing_tolerance;
+                        } else {
+                            ws.yaw = desired;
+                        }
+                    }
+                }
                 let w = self.units[&id].weapons[wi].clone();
                 if w.cooldown > 0 {
                     self.units.get_mut(&id).unwrap().weapons[wi].cooldown -= 1;
                     continue;
                 }
-                let Some((tid, tp, tr, t_alt, t_air)) = tinfo else {
+                let Some((tid, tp, tr, t_alt, t_air, t_height, t_vel)) = tinfo else {
                     continue;
                 };
-                if (t_air && !w.anti_air) || (!t_air && !w.anti_surface) {
+                if (t_air && !w.anti_air) || (!t_air && !w.anti_surface) || !aimed {
                     continue;
                 }
                 let alive = self.units.get(&tid).is_some_and(|t| t.alive);
@@ -5418,10 +5583,7 @@ impl Skirmish {
                 let reach_sq = (reach as i128) * (reach as i128);
                 if combat::can_fire(0, alive, Some(reach_sq), dist_sq(pos, tp), Some(w.damage)) {
                     let tick = self.tick;
-                    // Quantized turret yaw angle in milliradians for Phase 11 turret tracking
-                    let dx = (tp.0 - pos.0) as f64;
-                    let dz = (tp.1 - pos.1) as f64;
-                    let yaw_mrad = (dx.atan2(dz) * 1000.0).round() as i64;
+                    let yaw_mrad = w.yaw;
                     {
                         let me = self.units.get_mut(&id).unwrap();
                         me.weapons[wi].cooldown = w.reset;
@@ -5454,10 +5616,154 @@ impl Skirmish {
                             false,
                             t_air,
                         );
-                    } else {
+                    } else if t_air {
+                        // Anti-air stays hitscan (FA AA is homing / flak).
                         self.apply_shield_and_damage(tid, w.damage, army, Some(id), &shield_ids);
+                    } else {
+                        // Phase 29: surface direct fire from the muzzle to the target's centre.
+                        let muzzle = (pos.0, pos.1, self.terrain.height_at(pos.0, pos.1) + alt + (my_height * 3 / 4).max(SCALE / 2));
+                        let centre = |p: (i64, i64)| (p.0, p.1, self.terrain.height_at(p.0, p.1) + t_alt + t_height / 2);
+                        if w.beam {
+                            // Instant beam: the terrain between muzzle and target soaks the shot.
+                            let aim = centre(tp);
+                            match self.terrain.segment_hit(muzzle, aim, LOF_CLEARANCE, SCALE, tr + SCALE) {
+                                Some(_) => {}
+                                None => self.apply_shield_and_damage(tid, w.damage, army, Some(id), &shield_ids),
+                            }
+                        } else {
+                            // Projectile: lead the target by its last-tick velocity.
+                            let spd = w.muzzle_velocity.max(SCALE / 2);
+                            let mut aim2 = tp;
+                            if w.lead_target && t_vel != (0, 0) {
+                                for _ in 0..2 {
+                                    let t = isqrt(dist_sq(pos, aim2)) / spd;
+                                    aim2 = self.clamp_to_map(tp.0 + t_vel.0 * t, tp.1 + t_vel.1 * t);
+                                }
+                            }
+                            self.spawn_direct_projectile(army, id, muzzle, centre(aim2), spd, w.damage);
+                        }
                     }
                 }
+            }
+        }
+    }
+
+    /// Phase 29: a straight-flying direct-fire shell from `start` to `target` (3-D, milli).
+    fn spawn_direct_projectile(
+        &mut self,
+        army: ArmyId,
+        shooter: UnitId,
+        start: (i64, i64, i64),
+        target: (i64, i64, i64),
+        speed: i64,
+        damage: i64,
+    ) {
+        let id = self.next_projectile_id;
+        self.next_projectile_id += 1;
+        let (dx, dy, dz) = ((target.0 - start.0) as i128, (target.1 - start.1) as i128, (target.2 - start.2) as i128);
+        let d = isqrt(dx * dx + dy * dy + dz * dz).max(1);
+        let spd = speed.max(1);
+        let total_ticks = ((d + spd - 1) / spd).clamp(1, 120) as u32;
+        self.projectiles.insert(
+            id,
+            Projectile {
+                id,
+                army,
+                start: Vec2 { x: start.0, y: start.1 },
+                pos: Vec2 { x: start.0, y: start.1 },
+                target: Vec2 { x: target.0, y: target.1 },
+                speed,
+                damage,
+                splash_radius: 0,
+                arc_height: 0,
+                ticks_lived: 0,
+                total_ticks,
+                is_overcharge: false,
+                is_missile: false,
+                is_nuke: false,
+                target_air: false,
+                direct: true,
+                shooter,
+                z: start.2,
+                start_z: start.2,
+                target_z: target.2,
+            },
+        );
+    }
+
+    /// Phase 29: advances direct-fire shell `pid` one tick. The shell hits the first thing on
+    /// its path this tick — terrain (more than [`LOF_CLEARANCE`] below the ground) or a
+    /// non-allied surface unit whose hit box (footprint radius × height) it passes through,
+    /// walls included — and otherwise flies on; reaching its aim point without a hit is a miss.
+    fn step_direct_projectile(&mut self, pid: u32, shield_ids: &[UnitId]) {
+        let Some(p) = self.projectiles.get(&pid).cloned() else { return };
+        let tt = p.total_ticks.max(1);
+        let t1 = (p.ticks_lived + 1).min(tt);
+        let lerp = |a: i64, b: i64| a + ((b - a) as i128 * t1 as i128 / tt as i128) as i64;
+        let a = (p.pos.x, p.pos.y, p.z);
+        let b = (lerp(p.start.x, p.target.x), lerp(p.start.y, p.target.y), lerp(p.start_z, p.target_z));
+        let last = t1 >= tt;
+        let (sx, sy, sz) = ((b.0 - a.0) as i128, (b.1 - a.1) as i128, (b.2 - a.2) as i128);
+        let seg2 = sx * sx + sy * sy;
+        let seg = isqrt(seg2);
+
+        // Terrain: parameter along the segment in 1/1000ths.
+        let skip_start = if p.ticks_lived == 0 { SCALE } else { 0 };
+        let skip_end = if last { SCALE * 3 / 2 } else { 0 };
+        let ground = self.terrain.segment_hit(a, b, LOF_CLEARANCE, skip_start, skip_end).map(|h| {
+            let along = isqrt(dist_sq((a.0, a.1), (h.0, h.1)));
+            (along as i128 * 1000 / (seg as i128).max(1), h)
+        });
+
+        // Units: closest approach of the segment to each candidate's centre, from the
+        // spatial snapshot (positions as of this tick's weapons pass). Candidates are tried in
+        // (t, id) order and the first one still alive takes the hit.
+        let mid = ((a.0 + b.0) / 2, (a.1 + b.1) / 2);
+        let team = self.armies.get(p.army as usize).map(|a| a.team).unwrap_or(p.army);
+        let terrain = &self.terrain;
+        let snap = &self.spatial_snap;
+        let mut hits: Vec<(i128, UnitId)> = Vec::new();
+        self.spatial.for_each_enemy_in_radius(mid.0, mid.1, seg / 2 + DIRECT_HIT_REACH, team, |idx| {
+            let u = &snap[idx as usize];
+            if u.team == team || u.domain == NavDomain::Air || u.id == p.shooter {
+                return;
+            }
+            let (px, py) = ((u.x - a.0) as i128, (u.y - a.1) as i128);
+            let t = if seg2 == 0 { 1000 } else { ((px * sx + py * sy) * 1000 / seg2).clamp(0, 1000) };
+            let c = (a.0 + (sx * t / 1000) as i64, a.1 + (sy * t / 1000) as i64);
+            let r = u.radius as i128;
+            if dist_sq(c, (u.x, u.y)) > r * r {
+                return;
+            }
+            let z = a.2 + (sz * t / 1000) as i64;
+            let base = terrain.height_at(u.x, u.y);
+            if z > base + u.height + LOF_CLEARANCE || z + SCALE < base {
+                return;
+            }
+            hits.push((t, u.id));
+        });
+        hits.sort_unstable();
+        let best = hits
+            .into_iter()
+            .find(|&(_, id)| self.units.get(&id).is_some_and(|u| u.alive && u.carried_by.is_none()));
+
+        match (best, ground) {
+            (Some((tu, uid)), g) if g.is_none_or(|(tg, _)| tu <= tg) => {
+                self.projectiles.remove(&pid);
+                let shooter = self.units.contains_key(&p.shooter).then_some(p.shooter);
+                self.apply_shield_and_damage(uid, p.damage, p.army, shooter, shield_ids);
+            }
+            (_, Some(_)) => {
+                self.projectiles.remove(&pid);
+            }
+            _ if last => {
+                self.projectiles.remove(&pid);
+            }
+            _ => {
+                let q = self.projectiles.get_mut(&pid).unwrap();
+                q.ticks_lived = t1;
+                q.pos = Vec2 { x: b.0, y: b.1 };
+                q.z = b.2;
             }
         }
     }
@@ -5494,7 +5800,12 @@ impl Skirmish {
             .collect();
         let mut site_used = vec![false; def_sites.len()];
 
-        let pids: Vec<u32> = self.projectiles.keys().copied().collect();
+        // Phase 29: direct-fire shells fly and collide on their own.
+        let direct: Vec<u32> = self.projectiles.values().filter(|p| p.direct).map(|p| p.id).collect();
+        for pid in direct {
+            self.step_direct_projectile(pid, &shield_ids);
+        }
+        let pids: Vec<u32> = self.projectiles.values().filter(|p| !p.direct).map(|p| p.id).collect();
         let mut exploded = Vec::new();
         let mut intercepted = Vec::new();
         for pid in pids {
@@ -5732,7 +6043,7 @@ impl Skirmish {
                 self.hydro_claims[i] = None;
             }
         }
-        if self.units.values().any(|u| !u.alive && u.role == Role::Wall) {
+        if self.units.values().any(|u| !u.alive && u.role.is_structure()) {
             self.walls_dirty = true;
         }
         self.units.retain(|_, u| u.alive);
@@ -5903,6 +6214,10 @@ pub(crate) mod tests {
                     anti_surface: role != Role::AntiAir,
                     turret_yaw_bone: None,
                     turret_pitch_bone: None,
+                    turret_yaw_speed: 0,
+                    firing_tolerance: 35,
+                    beam: true,
+                    lead_target: true,
                 }]
             } else {
                 vec![]
@@ -6220,6 +6535,116 @@ pub(crate) mod tests {
         assert!(!w.site_is_free("RPD", 103 * SCALE, 100 * SCALE + SCALE / 2));
         w.spawn_unit(0, "RPD", (60 * SCALE, 60 * SCALE)).unwrap();
         assert!(!w.site_is_free("RPD", 66 * SCALE + SCALE / 2, 60 * SCALE), "PDs keep the 1 m margin");
+    }
+
+    /// Phase 29 fixture: `wall_world` plus a static projectile gun `RGUN` (25 dmg, 26 m,
+    /// 3 m/tick shells, fixed mount) and an optional 10 m ridge along x = 128 m.
+    fn ballistic_world(ridge: bool, gun: impl Fn(&mut WeaponType)) -> Skirmish {
+        let mut w = wall_world();
+        let mut g = ty("RGUN", Role::Mobile, 500, 0, 25, 26);
+        g.weapons[0].beam = false;
+        g.weapons[0].muzzle_velocity = 3 * SCALE;
+        gun(&mut g.weapons[0]);
+        w.catalog.types.insert("RGUN".into(), g);
+        if ridge {
+            let n = 257usize;
+            let mut h = vec![0i64; n * n];
+            for z in 0..n {
+                h[z * n + 128] = 10 * SCALE;
+            }
+            w.set_terrain(HeightField::from_samples(256, 256, SCALE, h));
+        }
+        w
+    }
+
+    #[test]
+    fn ridge_soaks_shells_and_beams_but_open_ground_does_not() {
+        for beam in [false, true] {
+            for ridge in [true, false] {
+                let mut w = ballistic_world(ridge, |wt| wt.beam = beam);
+                w.spawn_unit(0, "RGUN", (116 * SCALE, 150 * SCALE)).unwrap();
+                let target = w.spawn_unit(1, "BT", (139 * SCALE, 150 * SCALE)).unwrap();
+                w.run(60);
+                assert!(w.shots_fired() > 0, "gun fires (beam={beam}, ridge={ridge})");
+                let t = w.unit(target);
+                let hurt = t.is_none_or(|t| t.hp < t.max_hp);
+                assert_eq!(hurt, !ridge, "beam={beam} ridge={ridge}: target hurt={hurt}");
+            }
+        }
+    }
+
+    #[test]
+    fn turrets_slew_before_firing_within_tolerance() {
+        // 50 mrad/tick: turning from +z (yaw 0) to face -z (yaw π) takes ~63 ticks.
+        let mut w = ballistic_world(false, |wt| {
+            wt.turret_yaw_speed = 50;
+            wt.firing_tolerance = 35;
+        });
+        let gun = w.spawn_unit(0, "RGUN", (100 * SCALE, 150 * SCALE)).unwrap();
+        w.spawn_unit(1, "BT", (100 * SCALE, 130 * SCALE)).unwrap();
+        w.run(55);
+        assert_eq!(w.shots_fired(), 0, "still slewing");
+        assert!(combat::wrap_mrad(w.unit(gun).unwrap().weapons[0].yaw).abs() > 2_500, "turned most of the way");
+        w.run(20);
+        assert!(w.shots_fired() > 0, "fires once aimed");
+    }
+
+    #[test]
+    fn shells_hit_the_first_enemy_on_their_path_and_lead_movers() {
+        let mut w = ballistic_world(false, |_| {});
+        w.spawn_unit(0, "RGUN", (100 * SCALE, 150 * SCALE)).unwrap();
+        let wall = w.spawn_unit(1, "RWALL", (110 * SCALE, 150 * SCALE)).unwrap();
+        let tank = w.spawn_unit(1, "BT", (120 * SCALE, 150 * SCALE)).unwrap();
+        w.run(40);
+        let wl = w.unit(wall).unwrap();
+        assert!(wl.hp < wl.max_hp, "wall in the line of fire soaks the shells");
+        let t = w.unit(tank).unwrap();
+        assert_eq!(t.hp, t.max_hp, "tank behind the wall is untouched");
+
+        // A crossing target is still hit thanks to target leading; without leading the
+        // slow shells land behind it.
+        let mut hits = [0i64; 2];
+        for (i, lead) in [true, false].into_iter().enumerate() {
+            let mut w = ballistic_world(false, |wt| {
+                wt.lead_target = lead;
+                wt.muzzle_velocity = SCALE;
+            });
+            w.spawn_unit(0, "RGUN", (100 * SCALE, 100 * SCALE)).unwrap();
+            let runner = w.spawn_unit(1, "BT", (120 * SCALE, 85 * SCALE)).unwrap();
+            w.issue(1, Command::Move { units: vec![runner], x: 120 * SCALE, y: 200 * SCALE, queue: false });
+            w.run(70);
+            hits[i] = w.unit(runner).map_or(i64::MAX, |u| u.max_hp - u.hp);
+        }
+        assert!(hits[0] > hits[1], "leading lands more damage ({} vs {})", hits[0], hits[1]);
+    }
+
+    #[test]
+    fn structures_block_pathing_and_factories_roll_units_off() {
+        let mut w = wall_world();
+        let fac = w.spawn_unit(0, "RF", (128 * SCALE, 120 * SCALE)).unwrap();
+        w.step();
+        assert!(w.is_wall_cell((128 * SCALE, 120 * SCALE)), "factory footprint blocks its centre cell");
+        let tank = w.spawn_unit(0, "RT", (110 * SCALE, 120 * SCALE)).unwrap();
+        w.issue(0, Command::Move { units: vec![tank], x: 146 * SCALE, y: 120 * SCALE, queue: false });
+        for _ in 0..400 {
+            w.step();
+            let u = w.unit(tank).unwrap();
+            assert!(!w.is_wall_cell((u.pos.x, u.pos.y)), "tank walked into the factory at {:?}", u.pos);
+        }
+        assert_eq!(w.unit(tank).unwrap().pos, Vec2 { x: 146 * SCALE, y: 120 * SCALE });
+
+        // Wall the factory's exit side; the produced unit still rolls off onto open ground.
+        for x in 120..137 {
+            w.spawn_unit(0, "RWALL", (x * SCALE + SCALE / 2, 125 * SCALE + SCALE / 2)).unwrap();
+        }
+        w.armies[0].mass = 10_000 * SCALE;
+        w.armies[0].energy = 100_000 * SCALE;
+        w.issue(0, Command::Produce { factory: fac, unit_type: "RT".into(), count: 1 });
+        let before: Vec<UnitId> = w.units().map(|u| u.id).collect();
+        w.run(60);
+        let fresh: Vec<&Unit> = w.units().filter(|u| !before.contains(&u.id) && u.role == Role::Mobile).collect();
+        assert_eq!(fresh.len(), 1, "one tank produced");
+        assert!(!w.is_wall_cell((fresh[0].pos.x, fresh[0].pos.y)), "rolled off onto an open cell");
     }
 
     #[test]

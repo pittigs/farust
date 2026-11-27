@@ -2350,7 +2350,7 @@ mod tests {
         let v0 = st.game_options.victory;
         st.click(1280.0, 800.0, wx, wy);
         assert_ne!(st.game_options.victory, v0);
-        let _ = ReplayHeader { map_id: "A".into(), seed: 1, setups: vec![], options: st.game_options, mods: vec![] };
+        let _ = ReplayHeader { map_id: "A".into(), seed: 1, setups: vec![], options: st.game_options, mods: vec![], rules: crate::skirmish::RULES_VERSION };
     }
 
     #[test]

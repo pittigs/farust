@@ -13,15 +13,17 @@ use std::path::Path;
 
 use crate::mods::ModIdentity;
 use crate::skirmish::{
-    ArmyId, ArmySetup, Catalog, Command, GameOptions, MapContext, Skirmish, UnitId, VictoryCondition,
+    ArmyId, ArmySetup, Catalog, Command, GameOptions, MapContext, RULES_VERSION, Skirmish, UnitId, VictoryCondition,
 };
 
 pub const REPLAY_MAGIC: &[u8; 8] = b"FARPL1\0\0";
 pub const REPLAY_VERSION_V1: u32 = 1;
 pub const REPLAY_VERSION_V2: u32 = 2;
 pub const REPLAY_VERSION_V3: u32 = 3;
-/// Phase 24: header carries the enabled mods' identities.
-pub const REPLAY_VERSION: u32 = 4;
+pub const REPLAY_VERSION_V4: u32 = 4;
+/// Phase 24: header carries the enabled mods' identities (v4).
+/// Phase 29: header carries the sim [`RULES_VERSION`] (v5; older files are rules 1).
+pub const REPLAY_VERSION: u32 = 5;
 pub const CHECKPOINT_INTERVAL: u64 = 300;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,6 +35,22 @@ pub struct ReplayHeader {
     pub options: GameOptions,
     /// Phase 24: mods the match was played with (empty = stock content).
     pub mods: Vec<ModIdentity>,
+    /// Phase 29: sim rules generation the match was recorded under.
+    pub rules: u32,
+}
+
+impl ReplayHeader {
+    /// Phase 29: re-simulating under different sim rules would silently diverge.
+    pub fn check_rules(&self, what: &str) -> Result<(), String> {
+        if self.rules == RULES_VERSION {
+            Ok(())
+        } else {
+            Err(format!(
+                "{what} was recorded with sim rules v{} but this build simulates rules v{RULES_VERSION}",
+                self.rules
+            ))
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,6 +99,7 @@ impl ReplayRecorder {
                 setups,
                 options: GameOptions::default(),
                 mods: crate::mods::active_identities(),
+                rules: RULES_VERSION,
             },
             commands: Vec::new(),
             checkpoints: Vec::new(),
@@ -459,6 +478,7 @@ impl Replay {
         out.push(self.header.options.victory.code());
         out.extend_from_slice(&self.header.options.unit_cap.to_le_bytes());
         crate::mods::encode_identities(&mut out, &self.header.mods);
+        out.extend_from_slice(&self.header.rules.to_le_bytes());
         out.extend_from_slice(&(self.commands.len() as u32).to_le_bytes());
         for c in &self.commands {
             out.extend_from_slice(&c.tick.to_le_bytes());
@@ -519,11 +539,12 @@ impl Replay {
         } else {
             GameOptions::default()
         };
-        let mods = if ver >= REPLAY_VERSION {
+        let mods = if ver >= REPLAY_VERSION_V4 {
             crate::mods::decode_identities(data, &mut pos)?
         } else {
             Vec::new()
         };
+        let rules = if ver >= REPLAY_VERSION { read_u32(data, &mut pos)? } else { 1 };
         let n_cmds = read_u32(data, &mut pos)? as usize;
         let mut commands = Vec::with_capacity(n_cmds.min(100_000));
         for _ in 0..n_cmds {
@@ -542,7 +563,7 @@ impl Replay {
         let final_tick = read_u64(data, &mut pos)?;
         let final_hash = read_u64(data, &mut pos)?;
         Ok(Replay {
-            header: ReplayHeader { map_id, seed, setups, options, mods },
+            header: ReplayHeader { map_id, seed, setups, options, mods, rules },
             commands,
             checkpoints,
             final_tick,
@@ -577,6 +598,7 @@ impl Replay {
             ));
         }
         crate::mods::check_match(&self.header.mods, &catalog.mods, "this replay")?;
+        self.header.check_rules("this replay")?;
         let mut world = Skirmish::new(
             catalog,
             map.grid.clone(),
@@ -585,11 +607,7 @@ impl Replay {
             &self.header.setups,
             self.header.seed,
         )?;
-        world.set_domain_grids(
-            map.naval_grid.clone(),
-            map.amphib_grid.clone(),
-            map.hydro_points.clone(),
-        );
+        world.attach_map(map);
         world.set_options(self.header.options);
 
         let mut cmd_idx = 0usize;
@@ -638,6 +656,22 @@ impl Replay {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn rules_version_round_trips_and_mismatch_is_refused() {
+        let setups = (0..2)
+            .map(|i| ArmySetup { name: format!("A{i}"), faction: 0, start: (0, 0), team: i })
+            .collect();
+        let mut rec = ReplayRecorder::new("SCMP_001", 3, setups);
+        rec.header.rules = 1;
+        let r = Replay { header: rec.header.clone(), commands: vec![], checkpoints: vec![], final_tick: 0, final_hash: 0 };
+        let back = Replay::from_bytes(&r.to_bytes()).unwrap();
+        assert_eq!(back.header.rules, 1);
+        let err = back.header.check_rules("this replay").unwrap_err();
+        assert!(err.contains("rules v1") && err.contains(&format!("v{RULES_VERSION}")), "{err}");
+        assert!(ReplayRecorder::new("X", 1, vec![]).header.check_rules("x").is_ok());
+    }
+
     use super::*;
     use crate::pathfinding::PathGrid;
     use crate::scmap::{ScMap, WaterInfo};

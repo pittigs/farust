@@ -122,6 +122,7 @@ pub fn origin_world(catalog: Catalog, map: &MapContext, replay: &Replay) -> Resu
         ));
     }
     crate::mods::check_match(&replay.header.mods, &catalog.mods, "this save")?;
+    replay.header.check_rules("this save")?;
     let mut world = Skirmish::new(
         catalog,
         map.grid.clone(),
@@ -130,11 +131,7 @@ pub fn origin_world(catalog: Catalog, map: &MapContext, replay: &Replay) -> Resu
         &replay.header.setups,
         replay.header.seed,
     )?;
-    world.set_domain_grids(
-        map.naval_grid.clone(),
-        map.amphib_grid.clone(),
-        map.hydro_points.clone(),
-    );
+    world.attach_map(map);
     Ok(world)
 }
 

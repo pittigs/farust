@@ -580,11 +580,7 @@ pub fn build_match(game_dir: &Path, launch: &LobbyLaunch) -> Result<(PlaySession
         &setups,
         launch.seed,
     )?;
-    world.set_domain_grids(
-        map.naval_grid.clone(),
-        map.amphib_grid.clone(),
-        map.hydro_points.clone(),
-    );
+    world.attach_map(&map);
     let session = PlaySession::new(world, launch.human.unwrap_or(0), launch.human.is_none(), 1);
     Ok((session, map, meshes))
 }

@@ -41,6 +41,7 @@ mod sim;
 mod skirmish;
 mod skirmish_ai;
 mod spatial;
+mod terrain;
 mod stats;
 mod ttf;
 mod ui_kit;
@@ -1786,11 +1787,7 @@ fn cmd_replay(args: &[String]) -> Result<(), String> {
                 &rep.header.setups,
                 rep.header.seed,
             )?;
-            world.set_domain_grids(
-                map.naval_grid.clone(),
-                map.amphib_grid.clone(),
-                map.hydro_points.clone(),
-            );
+            world.attach_map(&map);
             world.set_options(rep.header.options);
             let final_tick = rep.final_tick;
             let mut session = play::PlaySession::new_replay(world, rep, speed);

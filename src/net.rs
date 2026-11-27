@@ -60,7 +60,8 @@ pub const DEFAULT_INPUT_DELAY: u64 = 2;
 /// v4 (Phase 24): handshake carries the enabled mods' identities.
 /// v5 (Phase 28): wall sections are buildable and block pathing (older peers would reject
 /// wall `Build` commands and desync), so mixed v4/v5 games are refused at the handshake.
-pub const PROTOCOL_VERSION: u32 = 5;
+/// v6 (Phase 29): sim rules v2 (ballistics, turrets, structure footprints).
+pub const PROTOCOL_VERSION: u32 = 6;
 /// The host's army (star-topology relay); only it may change the game speed.
 pub const HOST_ARMY: ArmyId = 0;
 /// Sender id of host-generated control messages (`Dropped`).
@@ -1973,11 +1974,7 @@ pub fn world_from_handshake(
         &hs.setups,
         hs.seed,
     )?;
-    world.set_domain_grids(
-        map.naval_grid.clone(),
-        map.amphib_grid.clone(),
-        map.hydro_points.clone(),
-    );
+    world.attach_map(map);
     Ok(world)
 }
 
