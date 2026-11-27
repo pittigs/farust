@@ -670,10 +670,27 @@ bumps `SIM_VERSION`, re-baselines golden hashes deliberately, and keeps
   at ~8:19 → defeat. Parser + runtime/determinism tests pass (324/324). Done.
 - Not done: mission editor, dialogue portraits / voice, multiplayer missions.
 
-### Phase 49 — First campaign operation (planned)
-- Reimplement one FA campaign operation (e.g. `X1CA_001`) on the scripting
-  engine using the user's map data, voice cues and objectives.
-- Exit: the operation is beatable start to finish with all primary objectives.
+### Phase 49 — First campaign operation (done: X1CA_001 "Operation: Black Day")
+- `missions/x1ca_001.farust-mission` re-creates the first Forged Alliance operation on the
+  user's `X1CA_001` map in the mission DSL: 7 armies (player LZ, Fletcher's Fort Clarke and
+  Seabring, two Order forward bases, the Seabring assault base, Gari, Shun-Ullevash),
+  3 acts, 6 primary + 2 secondary objectives and the `X01_*` voice cues as captions.
+  Main menu → CAMPAIGN starts it; `farust play --mission …` too.
+- Engine support: named markers & areas from the map's `_save.lua`
+  (`MapContext::marker/area`, `at <MarkerName>`, `in area <Name>`), `no_acu` armies,
+  start units with `hp N%`, mission-only blueprints (civilian structures) loaded from
+  `units.scd`, pre-placed extractors snapped to mass points.
+- `farust mission … --trace MIN` prints per-army income, energy, units, structures, army
+  value and AI command counts every MIN minutes (read-only, same hash as without).
+- Tuning found with the trace: the player LZ and Fort Clarke start with mass fabricators
+  but no power (−7000 E/s, nothing could ever be built) → T3 power generators added; the
+  Seabring air factory sat outside the AI's sight so the assault base could never be
+  cleared → moved into the base.
+- Exit met: `farust mission missions/x1ca_001.farust-mission --human-ai hard` → all 6
+  primaries complete, `Victory(0)` after 12104 ticks (20:10), hash `f1130450f49e4677`,
+  recorded replay verifies. Also won with `--human-ai normal` (15618 ticks) and hard on
+  seeds 7 / 99 / 1234; `--human-ai easy` loses (Seabring/Fort Clarke fall).
+- Started by an Antigravity delegate that ran out of quota; finished and tuned here.
 
 ### Phase 50 — Map authoring tools (done)
 - Byte-exact `.scmap` v2.60 writer (`src/scmap.rs`): retains header unknowns, raw

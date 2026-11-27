@@ -1568,6 +1568,37 @@ impl Catalog {
         self.roster.entries.get(id).and_then(|e| e.group)
     }
 
+    /// Phase 49: loads any mission-specific blueprints (e.g. civilian structures `XEC1301`,
+    /// `UEC1101`) from `units.scd` that are not part of the skirmish roster. No-op when all
+    /// `ids` are already loaded.
+    pub fn ensure_mission_types(&mut self, game_dir: &Path, ids: &[String]) -> Result<(), String> {
+        let missing: Vec<String> = ids
+            .iter()
+            .map(|s| s.to_ascii_uppercase())
+            .filter(|id| !self.types.contains_key(id))
+            .collect();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let units_scd = scd::gamedata_dir(game_dir).join("units.scd");
+        for id in missing {
+            if self.types.contains_key(&id) {
+                continue;
+            }
+            let inner = format!("units/{id}/{id}_unit.bp");
+            let (_, bytes) = scd::read_scd_file_ci(&units_scd, &inner)
+                .map_err(|e| format!("mission unit '{id}' not found in {}: {e}", units_scd.display()))?;
+            let root = blueprint::parse_blueprint(&String::from_utf8_lossy(&bytes))
+                .map_err(|e| format!("bad blueprint '{id}': {e}"))?;
+            let info = roster::BpInfo::from_blueprint(&id, &root);
+            let role = roster::infer_role(&info).unwrap_or_else(|_| {
+                if info.has("STRUCTURE") { Role::MassStorage } else { Role::Mobile }
+            });
+            self.types.insert(id.clone(), UnitType::from_blueprint(&id, role, &root));
+        }
+        Ok(())
+    }
+
     /// Phase 24: derives the data-driven roster from parsed blueprints and adds every
     /// playable type that the legacy tables did not load.
     fn extend_from_roster(&mut self, roots: &BTreeMap<String, Value>) {
@@ -2314,9 +2345,26 @@ pub struct MapContext {
     pub has_water: bool,
     /// Phase 34: reclaimable props (empty when their blueprints cannot be read).
     pub props: Vec<MapProp>,
+    /// Phase 49: all named markers `(x, z)` in milli-units from `_save.lua`.
+    pub markers: BTreeMap<String, (i64, i64)>,
+    /// Phase 49: named rectangular areas `(x0, z0, x1, z1)` in milli-units from `_save.lua`.
+    pub areas: BTreeMap<String, (i64, i64, i64, i64)>,
 }
 
 impl MapContext {
+    /// Phase 49: looks up a named marker (exact, then ASCII case-insensitive).
+    pub fn marker(&self, name: &str) -> Option<(i64, i64)> {
+        self.markers.get(name).copied().or_else(|| {
+            self.markers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, &v)| v)
+        })
+    }
+
+    /// Phase 49: looks up a named area rectangle `(x0, z0, x1, z1)` in milli-units.
+    pub fn area(&self, name: &str) -> Option<(i64, i64, i64, i64)> {
+        self.areas.get(name).copied().or_else(|| {
+            self.areas.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, &v)| v)
+        })
+    }
     /// Phase 34: reclaimable props of `scmap`, values from the prop blueprints in `env.scd`
     /// (case-insensitive paths, cached per blueprint).
     pub fn load_props(game_dir: &Path, scmap: &ScMap) -> Vec<MapProp> {
@@ -2372,9 +2420,20 @@ impl MapContext {
             .iter()
             .map(|m| (m.name.clone(), (q(m.position[0]), q(m.position[2]))))
             .collect::<Vec<_>>();
-        if starts.len() < 2 {
+        if starts.len() < 2 && !meta.scenario_type.eq_ignore_ascii_case("campaign") {
             return Err(format!("map '{}' has fewer than 2 start spots", files.id));
         }
+        let mdata = scenario::parse_save_mission_data_file(save).unwrap_or_default();
+        let named_markers = mdata
+            .markers
+            .into_iter()
+            .map(|(k, p)| (k, (q(p[0]), q(p[2]))))
+            .collect();
+        let areas = mdata
+            .areas
+            .into_iter()
+            .map(|(k, r)| (k, (q(r[0]), q(r[1]), q(r[2]), q(r[3]))))
+            .collect();
         let water = scmap.water.has_water.then_some(scmap.water.elevation);
         let mass_points = markers
             .mass_points
@@ -2404,6 +2463,8 @@ impl MapContext {
             hydro_points,
             has_water,
             props,
+            markers: named_markers,
+            areas,
         })
     }
 }
@@ -2682,6 +2743,108 @@ impl Skirmish {
     /// Phase 48: the mission script text (stored in replay headers).
     pub fn mission_source(&self) -> Option<String> {
         self.mission.as_ref().map(|m| m.mission.source.clone())
+    }
+
+    /// Phase 49: removes an army's tick-0 commander (`no_acu` campaign armies).
+    pub fn remove_initial_commander(&mut self, army: ArmyId) {
+        self.units.retain(|_, u| !(u.army == army && u.role == Role::Commander));
+    }
+
+    /// Phase 49: sets `id`'s hit points to `pct`% (`1..=100`) of its max health.
+    pub fn set_unit_hp_pct(&mut self, id: UnitId, pct: u8) {
+        if let Some(u) = self.units.get_mut(&id) {
+            u.hp = (u.max_hp * i64::from(pct.clamp(1, 100)) / 100).max(1);
+        }
+    }
+
+    /// Phase 49: binds pre-placed extractors/hydros to map resource markers, stamps structure
+    /// footprints, and fills initial storage caps after mission `start` placements.
+    pub fn finalize_mission_start(&mut self) {
+        let snap_sq = (MASS_SNAP as i128) * (MASS_SNAP as i128);
+        let ids: Vec<UnitId> = self.units.keys().copied().collect();
+        for id in ids {
+            let Some((role, pos, has_m, has_h)) = self
+                .units
+                .get(&id)
+                .map(|u| (u.role, (u.pos.x, u.pos.y), u.mass_point.is_some(), u.hydro_point.is_some()))
+            else {
+                continue;
+            };
+            if role == Role::Extractor && !has_m {
+                if let Some((idx, mp)) = self
+                    .mass_points
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, m)| self.mass_claims[*i].is_none() && dist_sq(pos, **m) <= snap_sq)
+                    .min_by_key(|(i, m)| (dist_sq(pos, **m), *i))
+                {
+                    let mp = *mp;
+                    self.mass_claims[idx] = Some(id);
+                    if let Some(u) = self.units.get_mut(&id) {
+                        u.pos = Vec2 { x: mp.0, y: mp.1 };
+                        u.mass_point = Some(idx);
+                    }
+                }
+            } else if role == Role::Hydro && !has_h
+                && let Some((idx, hp)) = self
+                    .hydro_points
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, h)| self.hydro_claims[*i].is_none() && dist_sq(pos, **h) <= snap_sq)
+                    .min_by_key(|(i, h)| (dist_sq(pos, **h), *i))
+            {
+                let hp = *hp;
+                self.hydro_claims[idx] = Some(id);
+                if let Some(u) = self.units.get_mut(&id) {
+                    u.pos = Vec2 { x: hp.0, y: hp.1 };
+                    u.hydro_point = Some(idx);
+                }
+            }
+        }
+        self.sync_walls();
+        self.recompute_caps();
+        for a in &mut self.armies {
+            a.mass = a.mass_cap;
+            a.energy = a.energy_cap;
+        }
+        self.rebuild_spatial();
+    }
+
+    /// Phase 49: marks `army` defeated and clears its remaining units (campaign stage cleanup).
+    pub fn defeat_army(&mut self, army: ArmyId) {
+        let Some(a) = self.armies.get_mut(army as usize) else {
+            return;
+        };
+        if a.defeated {
+            return;
+        }
+        a.defeated = true;
+        let mut lost = 0u32;
+        let mut had_structure = false;
+        self.units.retain(|_, u| {
+            if u.army == army && u.alive {
+                lost += 1;
+                had_structure |= u.role.is_structure();
+                false
+            } else {
+                true
+            }
+        });
+        self.armies[army as usize].units_lost += lost;
+        for slot in &mut self.mass_claims {
+            if slot.is_some_and(|id| !self.units.contains_key(&id)) {
+                *slot = None;
+            }
+        }
+        for slot in &mut self.hydro_claims {
+            if slot.is_some_and(|id| !self.units.contains_key(&id)) {
+                *slot = None;
+            }
+        }
+        if had_structure {
+            self.walls_dirty = true;
+            self.sync_walls();
+        }
     }
 
     /// Phase 34: reclaimable props (tests and map attachment).

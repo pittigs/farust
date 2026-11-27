@@ -173,6 +173,8 @@ enum Action {
     Quit,
     /// Phase 39: launch the built-in tutorial mission.
     StartTutorial,
+    /// Phase 49: launch the built-in Forged Alliance campaign operation.
+    StartCampaign,
     /// Phase 39 accessibility toggles.
     ToggleColorblind,
     ToggleMouseSwap,
@@ -856,10 +858,11 @@ impl MenuState {
     fn main_widgets(&self, w: f32, h: f32) -> Vec<(Rect, Action)> {
         let bx = (w * 0.08).max(48.0);
         let bw = 280.0;
-        let bh = 44.0;
-        let gap = 10.0;
+        let bh = 40.0;
+        let gap = 8.0;
         let by0 = (h * 0.30).max(185.0);
         let items = [
+            ("CAMPAIGN", Action::StartCampaign),
             ("SKIRMISH", Action::Go(ScreenId::Skirmish)),
             ("TUTORIAL", Action::StartTutorial),
             ("MULTIPLAYER", Action::Go(ScreenId::Multiplayer)),
@@ -889,9 +892,11 @@ impl MenuState {
         let lang = self.preview_lang();
         let tr = |k: &str, fb: &str| crate::loc::tr_lang(&lang, k, fb);
         let by0 = (h * 0.30).max(185.0);
-        let nav_box = Rect::new(bx - 16.0, by0 - 18.0, 312.0, 404.0);
+        // Phase 49/51: eight entries of 40 px + 8 px gaps, plus 18 px padding top and bottom.
+        let nav_box = Rect::new(bx - 16.0, by0 - 18.0, 312.0, 8.0 * 48.0 - 8.0 + 36.0);
         c.panel(nav_box);
         let labels = [
+            tr("ui.campaign", "CAMPAIGN"),
             tr("ui.skirmish", "SKIRMISH"),
             tr("ui.tutorial", "TUTORIAL"),
             tr("ui.multiplayer", "MULTIPLAYER"),
@@ -2128,6 +2133,7 @@ impl MenuState {
         }
         match act {
             Action::Go(s) => self.navigate(s),
+            Action::StartCampaign => return MenuEvent::StartCampaign,
             Action::StartTutorial => return MenuEvent::StartTutorial,
             Action::ToggleColorblind => self.draft.colorblind = !self.draft.colorblind,
             Action::ToggleMouseSwap => self.draft.mouse_swap = !self.draft.mouse_swap,
@@ -2779,6 +2785,7 @@ enum MenuEvent {
     SettingsChanged,
     StartSkirmish(crate::lobby::LobbyLaunch),
     StartReplay(Box<Replay>, Vec<Bookmark>, Option<usize>),
+    StartCampaign,
     StartTutorial,
 }
 
@@ -2858,6 +2865,13 @@ impl ShellApp {
                     Err(e) => self.state.set_status(format!("Start failed: {e}"), true),
                 }
             }
+            MenuEvent::StartCampaign => match build_campaign_from_menu(&self.state.game_dir) {
+                Ok((mut sess, map, meshes)) => {
+                    sess.muted = self.state.settings.master_volume == 0;
+                    self.enter_match(event_loop, sess, map, meshes);
+                }
+                Err(e) => self.state.set_status(format!("Campaign failed: {e}"), true),
+            },
             MenuEvent::StartTutorial => match build_tutorial_from_menu(&self.state.game_dir) {
                 Ok((mut sess, map, meshes)) => {
                     sess.muted = self.state.settings.master_volume == 0;
@@ -3223,10 +3237,13 @@ fn build_skirmish_from_menu(
     Ok((session, map, meshes))
 }
 
-/// Phase 39: the built-in tutorial mission as a ready-to-play session.
-fn build_tutorial_from_menu(game_dir: &Path) -> Result<(PlaySession, MapContext, UnitMeshCache), String> {
-    let m = crate::mission::Mission::parse(crate::mission::TUTORIAL)?;
-    let catalog = Catalog::load(game_dir)?;
+fn build_mission_from_source(
+    game_dir: &Path,
+    source: &str,
+) -> Result<(PlaySession, MapContext, UnitMeshCache), String> {
+    let m = crate::mission::Mission::parse(source)?;
+    let mut catalog = Catalog::load(game_dir)?;
+    m.ensure_catalog_types(&mut catalog, game_dir)?;
     let map = MapContext::load(game_dir, &m.map)?;
     let meshes = UnitMeshCache::load(Some(game_dir), &catalog);
     let world = crate::mission::build_world(&m, catalog, &map, crate::sim::DEFAULT_SEED)?;
@@ -3236,13 +3253,26 @@ fn build_tutorial_from_menu(game_dir: &Path) -> Result<(PlaySession, MapContext,
     Ok((session, map, meshes))
 }
 
+/// Phase 39: the built-in tutorial mission as a ready-to-play session.
+fn build_tutorial_from_menu(game_dir: &Path) -> Result<(PlaySession, MapContext, UnitMeshCache), String> {
+    build_mission_from_source(game_dir, crate::mission::TUTORIAL)
+}
+
+/// Phase 49: Forged Alliance campaign Operation 1 (`X1CA_001`) as a ready-to-play session.
+fn build_campaign_from_menu(game_dir: &Path) -> Result<(PlaySession, MapContext, UnitMeshCache), String> {
+    build_mission_from_source(game_dir, crate::mission::CAMPAIGN)
+}
+
 fn build_replay_from_menu(
     game_dir: &Path,
     rep: Replay,
     bookmarks: Vec<Bookmark>,
     jump_bm: Option<usize>,
 ) -> Result<(PlaySession, MapContext, UnitMeshCache), String> {
-    let catalog = Catalog::load(game_dir)?;
+    let mut catalog = Catalog::load(game_dir)?;
+    if let Some(src) = &rep.header.mission {
+        crate::mission::ensure_mission_types_src(src, &mut catalog, game_dir)?;
+    }
     let map = MapContext::load(game_dir, &rep.header.map_id)?;
     let meshes = UnitMeshCache::load(Some(game_dir), &catalog);
     let world = savegame::origin_world(catalog, &map, &rep)?;
@@ -3555,6 +3585,26 @@ mod tests {
         let mut c = Canvas::new(1280.0, 800.0, &st.fonts, &st.images, None);
         st.draw(&mut c);
         assert!(c.batches.iter().map(|b| b.idx.len()).sum::<usize>() > 100);
+    }
+
+    #[test]
+    fn main_menu_campaign_and_tutorial_buttons_dispatch_events() {
+        let mut st = MenuState::new(Path::new("/nonexistent"), &MenuOptions::default()).unwrap();
+        let ws = st.widgets(1280.0, 800.0);
+        let (cx, cy) = ws
+            .iter()
+            .find(|(_, a)| matches!(a, Action::StartCampaign))
+            .expect("CAMPAIGN button on main menu")
+            .0
+            .center();
+        assert!(matches!(st.click(1280.0, 800.0, cx, cy), MenuEvent::StartCampaign));
+        let (tx, ty) = ws
+            .iter()
+            .find(|(_, a)| matches!(a, Action::StartTutorial))
+            .expect("TUTORIAL button on main menu")
+            .0
+            .center();
+        assert!(matches!(st.click(1280.0, 800.0, tx, ty), MenuEvent::StartTutorial));
     }
 
     #[test]

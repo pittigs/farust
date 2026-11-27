@@ -132,7 +132,8 @@ pub fn origin_world(catalog: Catalog, map: &MapContext, replay: &Replay) -> Resu
         replay.header.seed,
     )?;
     world.attach_map(map);
-    replay.header.apply_mission(&mut world)?;
+    world.set_options(replay.header.options);
+    replay.header.apply_mission(&mut world, map)?;
     Ok(world)
 }
 

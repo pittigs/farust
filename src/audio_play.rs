@@ -59,6 +59,16 @@ const SPEC_ANNOUNCER: CueSpec = CueSpec {
     priority: 50.0,
     replace_oldest: false,
 };
+/// Phase 49: scripted campaign dialogue voice cues (`say "..." voice CUE`); highest voice
+/// priority, queued sequentially on `Bus::Voice`, purely render-side.
+const SPEC_DIALOGUE: CueSpec = CueSpec {
+    bus: Bus::Voice,
+    volume: 1.10,
+    cooldown_secs: 0.0,
+    max_instances: 1,
+    priority: 80.0,
+    replace_oldest: false,
+};
 /// Phase 24: looping construction / movement sounds (no cooldown; capped by the book).
 const SPEC_LOOP: CueSpec = CueSpec::sfx(0.32, 0.0, 8, 0.9);
 /// Unit loops audible at once (below [`xact::MAX_LOOP_VOICES`] so one-shots keep room).
@@ -1317,6 +1327,10 @@ pub struct GameAudio {
     ambient_retry: u32,
     announcer: AnnouncerQueue,
     announcer_voice: Option<u64>,
+    /// Phase 49: index into `MissionRuntime::voices` already enqueued and sequential VO queue.
+    mission_voices_seen: usize,
+    dialogue_queue: std::collections::VecDeque<String>,
+    dialogue_voice: Option<u64>,
     econ_watch: EconWatch,
     seen_experimentals: HashSet<UnitId>,
     enemy_nukes: HashMap<u32, bool>,
@@ -1378,6 +1392,9 @@ impl GameAudio {
             ambient_retry: 0,
             announcer: AnnouncerQueue::default(),
             announcer_voice: None,
+            mission_voices_seen: 0,
+            dialogue_queue: std::collections::VecDeque::new(),
+            dialogue_voice: None,
             econ_watch: EconWatch::default(),
             seen_experimentals: HashSet::new(),
             enemy_nukes: HashMap::new(),
@@ -1478,6 +1495,8 @@ impl GameAudio {
             self.engine.fade_out(v, 0.1);
         }
         self.announcer.clear_pending();
+        self.dialogue_queue.clear();
+        self.mission_voices_seen = s.world.mission().map_or(0, |rt| rt.voices.len());
         let focus = Self::focus_army(s);
         self.stamp = self.stamp.wrapping_add(1);
         self.units.clear();
@@ -1607,6 +1626,7 @@ impl GameAudio {
         let real_dt = dt / s.speed.max(1) as f32;
         if self.primed && tick == self.last_tick {
             // No sim progress since last frame (paused / input-only redraw): skip the scan.
+            self.pump_mission_dialogue(&s.world);
             self.pump_announcer();
             self.update_music_and_ambience(0.0, 0.0, cam);
             return;
@@ -1781,7 +1801,8 @@ impl GameAudio {
             self.econ_watch.seed(a.mass, a.mass_cap, a.energy, a.energy_cap);
         }
 
-        // ---- Phase 43 announcer detection (focus army + shared allied intel) -------
+        // ---- Phase 49 mission dialogue & Phase 43 announcer (render-side only) ------
+        self.pump_mission_dialogue(&s.world);
         if primed && s.world.result().is_none() {
             self.detect_announcer_events(
                 &s.world,
@@ -1956,9 +1977,54 @@ impl GameAudio {
         }
     }
 
+    fn pump_mission_dialogue(&mut self, world: &Skirmish) {
+        if let Some(rt) = world.mission() {
+            if rt.voices.len() < self.mission_voices_seen {
+                self.mission_voices_seen = rt.voices.len();
+                self.dialogue_queue.clear();
+            }
+            for (_, cue) in &rt.voices[self.mission_voices_seen..] {
+                if self.dialogue_queue.len() >= 8 {
+                    self.dialogue_queue.pop_front();
+                }
+                self.dialogue_queue.push_back(cue.clone());
+            }
+            self.mission_voices_seen = rt.voices.len();
+        } else {
+            self.mission_voices_seen = 0;
+        }
+        let dlg_active = self.dialogue_voice.is_some_and(|v| self.engine.voice_active(v));
+        if !dlg_active {
+            self.dialogue_voice = None;
+        }
+        let ann_active = self.announcer_voice.is_some_and(|v| self.engine.voice_active(v));
+        if dlg_active || ann_active {
+            return;
+        }
+        while let Some(name) = self.dialogue_queue.pop_front() {
+            let id = match self.cues.get(name.as_str()) {
+                Some(c) => *c,
+                None => {
+                    let resolved = self.engine.resolve(&name, SPEC_DIALOGUE);
+                    self.cues.insert(name.clone(), resolved);
+                    resolved
+                }
+            };
+            if let Some(cid) = id
+                && let TriggerOutcome::Played(vid) = self.engine.trigger(cid, None, 1.0)
+            {
+                *self.played.entry(name).or_insert(0) += 1;
+                self.dialogue_voice = Some(vid);
+                break;
+            }
+        }
+    }
+
     fn pump_announcer(&mut self) {
-        let voice_active = self.announcer_voice.is_some_and(|v| self.engine.voice_active(v));
-        if !voice_active {
+        let dlg_active = self.dialogue_voice.is_some_and(|v| self.engine.voice_active(v));
+        let voice_active =
+            dlg_active || self.announcer_voice.is_some_and(|v| self.engine.voice_active(v));
+        if !self.announcer_voice.is_some_and(|v| self.engine.voice_active(v)) {
             self.announcer_voice = None;
         }
         let now = self.audio_clock;
@@ -2156,7 +2222,8 @@ impl GameAudio {
         self.music_retry = self.music_retry.saturating_sub(1);
         self.ambient_retry = self.ambient_retry.saturating_sub(1);
 
-        let announcer_speaking = self.announcer_voice.is_some_and(|v| self.engine.voice_active(v));
+        let announcer_speaking = self.announcer_voice.is_some_and(|v| self.engine.voice_active(v))
+            || self.dialogue_voice.is_some_and(|v| self.engine.voice_active(v));
         let music_live = self.music.is_some_and(|id| self.engine.voice_active(id));
         if !self.result_seen {
             if let Some(tr) = self.music_dir.step(sim_dt, real_dt, music_live) {
@@ -3017,5 +3084,73 @@ mod tests {
 
         let plain = MapAmbience::from_scmap(&synth_scmap("", false, 0.0, vec![3000; 25]));
         assert_eq!((plain.biome, plain.primary_cue, plain.detail_cue), (MapBiome::Temperate, AMBIENT_RUMBLE, None));
+    }
+
+    #[test]
+    fn mission_dialogue_queues_render_side_without_affecting_world_hash() {
+        let mut w = crate::skirmish::tests::test_world(7);
+        w.set_options(crate::skirmish::GameOptions {
+            victory: crate::skirmish::VictoryCondition::Sandbox,
+            ..Default::default()
+        });
+        let src = r#"
+mission "Voice Test"
+map TESTMAP
+army 0 faction red human
+army 1 faction blue ai none
+when at 0:00 do say "HQ briefing" voice X01_HQ_M01_02881; say "Fletcher reply" voice X01_Fletcher_M01_03419
+"#;
+        w.set_mission(crate::mission::Mission::parse(src).unwrap());
+        w.step();
+        let hash_before = w.state_hash();
+        assert_eq!(w.mission().unwrap().voices.len(), 2);
+
+        let engine = AudioEngine::new(None, true);
+        let mut ga = GameAudio {
+            engine,
+            cues: HashMap::new(),
+            dyn_names: HashMap::new(),
+            units: HashMap::new(),
+            stamp: 0,
+            primed: false,
+            last_tick: 0,
+            audio_clock: 0.0,
+            selection: Vec::new(),
+            ui: None,
+            pending_seen: 0,
+            music_dir: MusicDirector::new(),
+            music: None,
+            music_retry: 0,
+            ambience: MapAmbience::default(),
+            ambient_primary: None,
+            ambient_detail: None,
+            ambient_retry: 0,
+            announcer: AnnouncerQueue::default(),
+            announcer_voice: None,
+            mission_voices_seen: 0,
+            dialogue_queue: std::collections::VecDeque::new(),
+            dialogue_voice: None,
+            econ_watch: EconWatch::default(),
+            seen_experimentals: HashSet::new(),
+            enemy_nukes: HashMap::new(),
+            at_cap_prev: false,
+            result_seen: false,
+            loops: LoopBook::default(),
+            played: BTreeMap::new(),
+            announced: BTreeMap::new(),
+            captions: Vec::new(),
+        };
+        ga.pump_mission_dialogue(&w);
+        assert_eq!(ga.mission_voices_seen, 2);
+        assert!(ga.dialogue_queue.is_empty(), "unresolvable offline cues drain cleanly");
+        assert_eq!(w.state_hash(), hash_before, "dialogue playback never mutates sim state");
+
+        let gd = crate::scd::default_game_dir();
+        if let Some(mut real_ga) = GameAudio::offline(&gd) {
+            real_ga.pump_mission_dialogue(&w);
+            assert_eq!(real_ga.played.get("X01_HQ_M01_02881"), Some(&1));
+            assert_eq!(real_ga.dialogue_queue.len(), 1, "second line waits until first finishes");
+            assert_eq!(w.state_hash(), hash_before);
+        }
     }
 }

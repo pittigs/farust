@@ -1721,26 +1721,32 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
         return lobby::run_lobby(&game_dir, map_name, seed, width, height, snapshot_out.as_deref(), has_flag(args, "--lobby-autostart"));
     }
 
-    let catalog = skirmish::Catalog::load(&game_dir)?;
-    let meshes = play::UnitMeshCache::load(Some(&game_dir), &catalog);
+    let mut catalog = skirmish::Catalog::load(&game_dir)?;
 
-    let (map, mut session) = if let Some(ref save_path) = load_file {
+    let (map, mut session, meshes) = if let Some(ref save_path) = load_file {
         let save = savegame::SaveGame::read(save_path)?;
+        if let Some(src) = &save.replay.header.mission {
+            mission::ensure_mission_types_src(src, &mut catalog, &game_dir)?;
+        }
+        let meshes = play::UnitMeshCache::load(Some(&game_dir), &catalog);
         let map = skirmish::MapContext::load(&game_dir, &save.replay.header.map_id)?;
         let mut origin = savegame::origin_world(catalog, &map, &save.replay)?;
         origin.set_options(save.replay.header.options);
         let sess = save.into_session(origin)?;
-        (map, sess)
+        (map, sess, meshes)
     } else if let Some(mpath) = flag_str(args, "--mission") {
-        // Phase 48: play a scripted mission.
+        // Phase 48/49: play a scripted mission.
         let m = mission::load_file(std::path::Path::new(&mpath))?;
+        m.ensure_catalog_types(&mut catalog, &game_dir)?;
+        let meshes = play::UnitMeshCache::load(Some(&game_dir), &catalog);
         let map = skirmish::MapContext::load(&game_dir, &m.map)?;
         let world = mission::build_world(&m, catalog, &map, seed)?;
         let human = m.human_army().unwrap_or(0) as skirmish::ArmyId;
         let mut sess = play::PlaySession::new(world, human, spectate, speed);
         sess.ais = mission::ai_armies(&m, spectate.then_some("normal"))?;
-        (map, sess)
+        (map, sess, meshes)
     } else {
+        let meshes = play::UnitMeshCache::load(Some(&game_dir), &catalog);
         let options = parse_game_options(args)?;
         let map = skirmish::MapContext::load(&game_dir, map_name)?;
         let setup = parse_skirmish_setup(args, &catalog, map.starts.len())?;
@@ -1753,7 +1759,7 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
             let pp = pers.get(ai.army as usize).copied().unwrap_or_default();
             *ai = skirmish_ai::ScriptedAi::with_personality(ai.army, d, pp);
         }
-        (map, sess)
+        (map, sess, meshes)
     };
     session.muted = has_flag(args, "--mute");
     if no_record {
@@ -1842,7 +1848,10 @@ fn cmd_replay(args: &[String]) -> Result<(), String> {
     let game_dir = positional_after(args, 4).unwrap_or_else(scd::default_game_dir);
 
     let rep = replay::Replay::load(&replay_path)?;
-    let catalog = skirmish::Catalog::load(&game_dir)?;
+    let mut catalog = skirmish::Catalog::load(&game_dir)?;
+    if let Some(src) = &rep.header.mission {
+        mission::ensure_mission_types_src(src, &mut catalog, &game_dir)?;
+    }
     let map = skirmish::MapContext::load(&game_dir, &rep.header.map_id)?;
 
     match mode {
@@ -1877,8 +1886,8 @@ fn cmd_replay(args: &[String]) -> Result<(), String> {
                 rep.header.seed,
             )?;
             world.attach_map(&map);
-            rep.header.apply_mission(&mut world)?;
             world.set_options(rep.header.options);
+            rep.header.apply_mission(&mut world, &map)?;
             let final_tick = rep.final_tick;
             let mut session = play::PlaySession::new_replay(world, rep, speed);
             if !bookmarks.is_empty() {

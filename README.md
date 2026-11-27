@@ -332,3 +332,13 @@ cargo run --release -- mods conflicts
 cargo run --release -- host 127.0.0.1:15000 SCMP_001 --players 2 --mod examples/mods/heavy_strikers
 FARUST_MODS_DIR=/tmp/empty-mods cargo run --release -- join 127.0.0.1:15000   # receives the mod
 ```
+
+## Step 49 — done: first campaign operation (X1CA_001)
+
+- `missions/x1ca_001.farust-mission`: three acts, six primary and two secondary
+  objectives, voice-cue captions, on the original `X1CA_001` map (main menu → CAMPAIGN).
+
+```sh
+cargo run --release -- play --mission missions/x1ca_001.farust-mission
+cargo run --release -- mission missions/x1ca_001.farust-mission --human-ai hard --trace 5
+```

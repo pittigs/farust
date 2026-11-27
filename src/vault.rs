@@ -488,7 +488,7 @@ pub fn collect_replay_analysis(
         replay.header.seed,
     )?;
     world.attach_map(map);
-    replay.header.apply_mission(&mut world)?;
+    replay.header.apply_mission(&mut world, map)?;
     world.set_options(replay.header.options);
 
     let army_info: Vec<(String, usize, u8)> = replay
@@ -1490,6 +1490,8 @@ mod tests {
             hydro_points: vec![],
             has_water: false,
             props: Vec::new(),
+            markers: Default::default(),
+            areas: Default::default(),
         }
     }
 
