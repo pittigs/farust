@@ -1235,12 +1235,15 @@ impl LivingBattlefield {
             dx * dx + dy * dy
         };
         let lim = 4 * crate::sim::SCALE as i128;
-        let Some(shooter) = world
-            .units()
-            .filter(|u| u.alive && u.army == p.army)
-            .min_by_key(|u| (d2(u), u.id))
-            .filter(|u| d2(u) <= lim * lim)
-        else {
+        // Phase 55: shells know their shooter; only legacy projectiles need the scan.
+        let known = (p.shooter != 0).then(|| world.unit(p.shooter)).flatten();
+        let Some(shooter) = known.or_else(|| {
+            world
+                .units()
+                .filter(|u| u.alive && u.army == p.army)
+                .min_by_key(|u| (d2(u), u.id))
+                .filter(|u| d2(u) <= lim * lim)
+        }) else {
             return (None, None);
         };
         let shooter_type = Some(shooter.type_id.clone());

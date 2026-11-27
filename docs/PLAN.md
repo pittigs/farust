@@ -705,10 +705,17 @@ bumps `SIM_VERSION`, re-baselines golden hashes deliberately, and keeps
   same-tick damage, so a parallel decide + ordered apply is exact; 2.9 ms at 10k units),
   flow-field reuse across goals (4.3 ms).
 
-### Phase 55 — GPU-driven rendering (planned)
-- Compute-shader culling + LOD selection, indirect draws, GPU instance
-  buffers updated incrementally.
-- Exit: 10k units at ≥ 60 fps at strategic zoom on the reference machine.
+### Phase 55 — 10k-unit rendering (done, without GPU-driven culling)
+- Measured first: with Phase 42's HDR pipeline, 10,000 units render at frame p50 9.4 ms
+  (≈ 106 fps; GPU 2.0 ms, CPU prep 6.3 ms) at the bench camera, so the 60 fps target holds
+  without moving culling to compute shaders.
+- Fixed the real stutter: new projectiles found their shooter (for the shell / missile
+  look) by scanning every unit; shells now carry their shooter id (artillery included —
+  not hashed, no rules change), cutting `render.begin.proj` from 3.47 to 0.42 ms average
+  and the worst prep frame from 110 ms to 10 ms at 10k units.
+- Exit: `bench-render SCMP_001 --units 10000 --frames 30 --no-sim`: frame p50 9.37 ms,
+  p95 9.94 ms. Done for the target; compute-shader culling / indirect draws (the original
+  plan) are not implemented — CPU instance preparation (≈ 6 ms) is the next lever.
 
 ### Phase 56 — Windows & macOS ports (planned)
 - Native audio output (WASAPI / CoreAudio) behind the existing silent

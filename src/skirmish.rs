@@ -6671,11 +6671,13 @@ impl Skirmish {
                             false,
                             t_air,
                         );
-                        if let Some((ticks, radius)) = stun
-                            && let Some(p) = self.projectiles.get_mut(&(self.next_projectile_id - 1))
-                        {
-                            p.stun_ticks = ticks;
-                            p.stun_radius = radius;
+                        if let Some(p) = self.projectiles.get_mut(&(self.next_projectile_id - 1)) {
+                            // Phase 55: renderers resolve the shell look from its shooter.
+                            p.shooter = id;
+                            if let Some((ticks, radius)) = stun {
+                                p.stun_ticks = ticks;
+                                p.stun_radius = radius;
+                            }
                         }
                     } else if t_air {
                         // Anti-air stays hitscan (FA AA is homing / flak).
