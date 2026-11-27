@@ -478,6 +478,210 @@ pub fn parse_save_markers(text: &str, armies: &[String]) -> Result<SaveMarkers, 
     })
 }
 
+/// Directory edited maps are written to: `$XDG_DATA_HOME/farust/maps`.
+pub fn farust_maps_dir() -> PathBuf {
+    xdg_data_home().join("farust").join("maps")
+}
+
+/// Replaces every occurrence of a map id (VFS paths, file names, LOC tags)
+/// in a scenario/save/script text when cloning a map under a new id.
+pub fn rewrite_map_id(text: &str, old_id: &str, new_id: &str) -> String {
+    if old_id.is_empty() || old_id == new_id {
+        return text.to_string();
+    }
+    text.replace(old_id, new_id)
+}
+
+fn scan_matching_brace(bytes: &[u8], open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut i = open;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'-' if bytes.get(i + 1) == Some(&b'-') => {
+                // Lua comment: long `--[[ ]]` or to end of line.
+                let mut j = i + 2;
+                if bytes.get(j) == Some(&b'[') {
+                    let mut eq = 0usize;
+                    j += 1;
+                    while bytes.get(j) == Some(&b'=') {
+                        eq += 1;
+                        j += 1;
+                    }
+                    if bytes.get(j) == Some(&b'[') {
+                        let close: Vec<u8> = std::iter::once(b']').chain(std::iter::repeat_n(b'=', eq)).chain([b']']).collect();
+                        let mut k = j + 1;
+                        let mut found = None;
+                        while k + close.len() <= bytes.len() {
+                            if &bytes[k..k + close.len()] == close.as_slice() {
+                                found = Some(k + close.len());
+                                break;
+                            }
+                            k += 1;
+                        }
+                        i = found?;
+                        continue;
+                    }
+                }
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'\'' | b'"' => {
+                let q = bytes[i];
+                i += 1;
+                while i < bytes.len() && bytes[i] != q {
+                    if bytes[i] == b'\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                i += 1;
+            }
+            b'{' => {
+                depth += 1;
+                i += 1;
+            }
+            b'}' => {
+                depth -= 1;
+                i += 1;
+                if depth == 0 {
+                    return Some(i - 1);
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+fn marker_entry_type(entry: &str) -> String {
+    let Some(tpos) = entry.find("'type'").or_else(|| entry.find("\"type\"")) else {
+        return String::new();
+    };
+    let rest = &entry[tpos..];
+    let Some(spos) = rest.find("STRING") else { return String::new() };
+    let rest = &rest[spos..];
+    let Some(q1) = rest.find(['\'', '"']) else { return String::new() };
+    let q = rest.as_bytes()[q1];
+    let rest2 = &rest[q1 + 1..];
+    let Some(q2) = rest2.find(q as char) else { return String::new() };
+    rest2[..q2].to_string()
+}
+
+fn marker_entry(name: &str, marker_type: &str, pos: [f32; 3]) -> String {
+    let (color, prop, extra) = match marker_type {
+        "Mass" => (
+            "ff808080",
+            "/env/common/props/markers/M_Mass_prop.bp",
+            "                    ['size'] = FLOAT( 1.000000 ),\n                    ['resource'] = BOOLEAN( true ),\n                    ['amount'] = FLOAT( 100.000000 ),\n                    ['editorIcon'] = STRING( '/textures/editor/marker_mass.bmp' ),\n",
+        ),
+        "Hydrocarbon" => (
+            "ff808080",
+            "/env/common/props/markers/M_Hydrocarbon_prop.bp",
+            "                    ['size'] = FLOAT( 1.000000 ),\n                    ['resource'] = BOOLEAN( true ),\n                    ['amount'] = FLOAT( 100.000000 ),\n                    ['editorIcon'] = STRING( '/textures/editor/marker_hydro.bmp' ),\n",
+        ),
+        _ => ("ff800080", "/env/common/props/markers/M_Blank_prop.bp", ""),
+    };
+    format!(
+        "                ['{name}'] = {{\n{extra}                    ['color'] = STRING( '{color}' ),\n                    ['type'] = STRING( '{marker_type}' ),\n                    ['prop'] = STRING( '{prop}' ),\n                    ['orientation'] = VECTOR3( 0, 0, 0 ),\n                    ['position'] = VECTOR3( {:.4}, {:.4}, {:.4} ),\n                }},\n",
+        pos[0], pos[1], pos[2]
+    )
+}
+
+/// Regenerates the start/resource markers of a `_save.lua` text from the
+/// given lists. All other markers and all text outside the `Markers` table
+/// are kept verbatim.
+pub fn rewrite_save_markers(
+    text: &str,
+    armies: &[String],
+    starts: &[Marker],
+    mass: &[Marker],
+    hydro: &[Marker],
+) -> Result<String, String> {
+    let bytes = text.as_bytes();
+    let master = text.find("MasterChain").ok_or("missing MasterChain in save text")?;
+    let markers_kw = text[master..]
+        .find("Markers")
+        .map(|p| master + p)
+        .ok_or("missing Markers in save text")?;
+    let open = text[markers_kw..]
+        .find('{')
+        .map(|p| markers_kw + p)
+        .ok_or("missing '{' after Markers")?;
+    let close = scan_matching_brace(bytes, open).ok_or("unterminated Markers table")?;
+
+    // Split the interior into top-level `['name'] = { ... },` entries.
+    let mut kept: Vec<String> = Vec::new();
+    let mut i = open + 1;
+    while i < close {
+        // Skip separators between entries.
+        while i < close && (bytes[i].is_ascii_whitespace() || bytes[i] == b',') {
+            i += 1;
+        }
+        if i >= close {
+            break;
+        }
+        let entry_start = i;
+        // Entry name: `['name']` or bare identifier.
+        let mut name = String::new();
+        if bytes[i] == b'[' {
+            if let Some(end) = text[i..close].find(']') {
+                let inner = &text[i + 1..i + end];
+                name = inner.trim().trim_matches(['\'', '"']).to_string();
+                i += end + 1;
+            }
+        }
+        // Find this entry's table (or scalar) end.
+        let entry_end = match text[i..close].find('{') {
+            Some(rel) => {
+                let eopen = i + rel;
+                match scan_matching_brace(bytes, eopen) {
+                    Some(eclose) => {
+                        let mut e = eclose + 1;
+                        if bytes.get(e) == Some(&b',') {
+                            e += 1;
+                        }
+                        e
+                    }
+                    None => close,
+                }
+            }
+            None => close,
+        };
+        if entry_end <= entry_start {
+            break;
+        }
+        let entry = &text[entry_start..entry_end];
+        let ty = marker_entry_type(entry);
+        let is_start = name.starts_with("ARMY_") || armies.iter().any(|a| a == &name);
+        if !is_start && ty != "Mass" && ty != "Hydrocarbon" {
+            kept.push(entry.to_string());
+            if !entry.trim_end().ends_with(',') {
+                kept.last_mut().unwrap().push(',');
+            }
+            kept.last_mut().unwrap().push('\n');
+        }
+        i = entry_end;
+    }
+
+    let mut interior = String::new();
+    interior.push('\n');
+    for m in starts {
+        interior.push_str(&marker_entry(&m.name, "Blank Marker", m.position));
+    }
+    for m in mass {
+        interior.push_str(&marker_entry(&m.name, "Mass", m.position));
+    }
+    for m in hydro {
+        interior.push_str(&marker_entry(&m.name, "Hydrocarbon", m.position));
+    }
+    for k in kept {
+        interior.push_str(&k);
+    }
+    interior.push_str("            ");
+    Ok(format!("{}{}{}{}", &text[..=open], interior, &text[close..], ""))
+}
+
 fn list_dir_files_sorted(dir: &Path) -> Result<Vec<(String, PathBuf)>, String> {
     let entries = std::fs::read_dir(dir)
         .map_err(|e| format!("failed to read directory {}: {e}", dir.display()))?;
@@ -1444,6 +1648,27 @@ description]],
         assert_eq!(meta.scenario_type, "campaign");
         assert_eq!(meta.size, (256, 512));
         assert_eq!(meta.armies, vec!["Player", "Aeon"]);
+    }
+
+    #[test]
+    fn rewrite_save_markers_regenerates_and_keeps_others() {
+        let lua = "Scenario = {\n    MasterChain = {\n        ['_MASTERCHAIN_'] = {\n            Markers = {\n                ['ARMY_1'] = {\n                    ['type'] = STRING( 'Blank Marker' ),\n                    ['position'] = VECTOR3( 10, 5, 20 ),\n                },\n                ['MASS_1'] = {\n                    ['type'] = STRING( 'Mass' ),\n                    ['position'] = VECTOR3( 30, 5, 40 ),\n                },\n                ['Transport Marker 01'] = {\n                    ['type'] = STRING( 'Transport Marker' ),\n                    ['position'] = VECTOR3( 1, 2, 3 ),\n                },\n            },\n        },\n    },\n}\n";
+        let armies = vec!["ARMY_1".to_string(), "ARMY_2".to_string()];
+        let starts = vec![
+            Marker { name: "ARMY_1".into(), marker_type: "Blank Marker".into(), position: [100.0, 9.0, 200.0] },
+            Marker { name: "ARMY_2".into(), marker_type: "Blank Marker".into(), position: [300.0, 9.0, 400.0] },
+        ];
+        let mass = vec![Marker { name: "MASS_900".into(), marker_type: "Mass".into(), position: [50.0, 7.0, 60.0] }];
+        let out = rewrite_save_markers(lua, &armies, &starts, &mass, &[]).expect("rewrite");
+        assert!(out.contains("Transport Marker 01"), "other markers kept verbatim");
+        assert!(out.starts_with("Scenario = {\n    MasterChain = {"));
+        let parsed = parse_save_markers(&out, &armies).expect("reparse rewritten save");
+        assert_eq!(parsed.start_spots.len(), 2);
+        assert_eq!(parsed.start_spots[0].position, [100.0, 9.0, 200.0]);
+        assert_eq!(parsed.mass_points.len(), 1);
+        assert_eq!(parsed.mass_points[0].name, "MASS_900");
+        assert_eq!(parsed.total_markers, 4);
+        assert_eq!(rewrite_map_id("map = '/maps/SCMP_001/SCMP_001.scmap'", "SCMP_001", "NEW1"), "map = '/maps/NEW1/NEW1.scmap'");
     }
 
     #[test]

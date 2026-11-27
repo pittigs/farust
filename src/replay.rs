@@ -670,6 +670,8 @@ mod tests {
                     elevation_deep: 8.0,
                     elevation_abyss: 2.0,
                 },
+                unknown1: 0, unknown2: 0, unknown3: 0, unknown4: 0, post_heightmap_byte: 0,
+                shader_raw: Vec::new(), background_raw: Vec::new(), sky_raw: Vec::new(), cubemaps_raw: Vec::new(), tail_bytes: Vec::new(),
                 terrain_textures: None,
             },
             grid: PathGrid::new(64, 64, 4 * SCALE),

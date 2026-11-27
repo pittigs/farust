@@ -138,6 +138,28 @@ pub struct ScMap {
     pub lighting: ScMapLighting,
     pub water: WaterInfo,
     pub terrain_textures: Option<TerrainTextures>,
+    /// Header fields the parser does not interpret, retained for the writer.
+    pub unknown1: u32,
+    pub unknown2: u32,
+    pub unknown3: u32,
+    pub unknown4: u16,
+    /// Byte after the heightmap (present when `version_minor >= 56`).
+    pub post_heightmap_byte: u8,
+    /// Original bytes of `terrain_shader` (may be non-UTF-8); empty = use the string.
+    pub shader_raw: Vec<u8>,
+    pub background_raw: Vec<u8>,
+    pub sky_raw: Vec<u8>,
+    pub cubemaps_raw: Vec<(Vec<u8>, Vec<u8>)>,
+    /// Everything after the water section, verbatim (strata/decals/props/…).
+    pub tail_bytes: Vec<u8>,
+}
+
+/// Heightmap brush mode for [`ScMap::apply_brush`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrushMode {
+    Raise,
+    Lower,
+    Smooth,
 }
 
 struct Reader<'a> {
@@ -204,13 +226,17 @@ impl<'a> Reader<'a> {
     }
 
     fn read_cstr(&mut self) -> Result<String, String> {
+        Ok(self.read_cstr_raw()?.0)
+    }
+
+    fn read_cstr_raw(&mut self) -> Result<(String, Vec<u8>), String> {
         let rest = &self.data[self.pos..];
         let rel_end = rest.iter().position(|&b| b == 0).ok_or_else(|| {
             format!("unterminated string starting at byte {}", self.pos)
         })?;
         let bytes = &rest[..rel_end];
         self.pos += rel_end + 1;
-        Ok(decode_cstr_bytes(bytes))
+        Ok((decode_cstr_bytes(bytes), bytes.to_vec()))
     }
 }
 
@@ -435,12 +461,12 @@ impl ScMap {
             return Err(format!("unsupported scmap major version: {}", version_major));
         }
 
-        let _unknown1 = r.read_u32()?;
-        let _unknown2 = r.read_u32()?;
+        let unknown1 = r.read_u32()?;
+        let unknown2 = r.read_u32()?;
         let map_width = r.read_f32()?;
         let map_height = r.read_f32()?;
-        let _unknown3 = r.read_u32()?;
-        let _unknown4 = r.read_u16()?;
+        let unknown3 = r.read_u32()?;
+        let unknown4 = r.read_u16()?;
 
         let preview_dds_len = usize::try_from(r.read_u32()?)
             .map_err(|_| "preview DDS length exceeds addressable range".to_string())?;
@@ -476,22 +502,22 @@ impl ScMap {
             heightmap.push(u16::from_le_bytes([chunk[0], chunk[1]]));
         }
 
-        if version_minor >= 56 {
-            let _ = r.read_u8()?;
-        }
+        let post_heightmap_byte = if version_minor >= 56 { r.read_u8()? } else { 0 };
 
-        let terrain_shader = r.read_cstr()?;
-        let background_path = r.read_cstr()?;
-        let sky_cubemap_path = r.read_cstr()?;
+        let (terrain_shader, shader_raw) = r.read_cstr_raw()?;
+        let (background_path, background_raw) = r.read_cstr_raw()?;
+        let (sky_cubemap_path, sky_raw) = r.read_cstr_raw()?;
 
+        let mut cubemaps_raw = Vec::new();
         let cubemaps = if version_minor >= 60 {
             let count = usize::try_from(r.read_u32()?)
                 .map_err(|_| "cubemap count exceeds addressable range".to_string())?;
             // Cap preallocation by remaining bytes (each pair needs at least two null bytes) to avoid OOM on corrupt headers.
             let mut pairs = Vec::with_capacity(count.min(r.remaining() / 2));
             for _ in 0..count {
-                let name = r.read_cstr()?;
-                let path = r.read_cstr()?;
+                let (name, name_raw) = r.read_cstr_raw()?;
+                let (path, path_raw) = r.read_cstr_raw()?;
+                cubemaps_raw.push((name_raw, path_raw));
                 pairs.push((name, path));
             }
             pairs
@@ -522,6 +548,7 @@ impl ScMap {
         let elevation_deep = r.read_f32()?;
         let elevation_abyss = r.read_f32()?;
 
+        let tail_bytes = data[r.pos..].to_vec();
         let terrain_textures = parse_terrain_textures(&data[r.pos..], hm_w as u32, hm_h as u32);
 
         Ok(ScMap {
@@ -546,7 +573,158 @@ impl ScMap {
                 elevation_abyss,
             },
             terrain_textures,
+            unknown1,
+            unknown2,
+            unknown3,
+            unknown4,
+            post_heightmap_byte,
+            shader_raw,
+            background_raw,
+            sky_raw,
+            cubemaps_raw,
+            tail_bytes,
         })
+    }
+
+    /// Serializes back to `.scmap` bytes. The structured header is rewritten
+    /// from the parsed fields; the post-water tail is emitted verbatim from
+    /// `tail_bytes`, so `write(parse(bytes)) == bytes` for stock maps.
+    pub fn write(&self) -> Vec<u8> {
+        fn cstr(out: &mut Vec<u8>, raw: &[u8], text: &str) {
+            if raw.is_empty() {
+                out.extend_from_slice(text.as_bytes());
+            } else {
+                out.extend_from_slice(raw);
+            }
+            out.push(0);
+        }
+        let mut out = Vec::with_capacity(64 + self.heightmap.len() * 2 + self.tail_bytes.len());
+        out.extend_from_slice(b"Map\x1a");
+        out.extend_from_slice(&self.version_major.to_le_bytes());
+        out.extend_from_slice(&self.unknown1.to_le_bytes());
+        out.extend_from_slice(&self.unknown2.to_le_bytes());
+        out.extend_from_slice(&self.map_width.to_le_bytes());
+        out.extend_from_slice(&self.map_height.to_le_bytes());
+        out.extend_from_slice(&self.unknown3.to_le_bytes());
+        out.extend_from_slice(&self.unknown4.to_le_bytes());
+        out.extend_from_slice(&(self.preview_dds.len() as u32).to_le_bytes());
+        out.extend_from_slice(&self.preview_dds);
+        out.extend_from_slice(&self.version_minor.to_le_bytes());
+        out.extend_from_slice(&(self.heightmap_width as i32).to_le_bytes());
+        out.extend_from_slice(&(self.heightmap_height as i32).to_le_bytes());
+        out.extend_from_slice(&self.height_scale.to_le_bytes());
+        for &s in &self.heightmap {
+            out.extend_from_slice(&s.to_le_bytes());
+        }
+        if self.version_minor >= 56 {
+            out.push(self.post_heightmap_byte);
+        }
+        cstr(&mut out, &self.shader_raw, &self.terrain_shader);
+        cstr(&mut out, &self.background_raw, &self.background_path);
+        cstr(&mut out, &self.sky_raw, &self.sky_cubemap_path);
+        if self.version_minor >= 60 {
+            out.extend_from_slice(&(self.cubemaps.len() as u32).to_le_bytes());
+            for (i, (name, path)) in self.cubemaps.iter().enumerate() {
+                let (nr, pr) = self
+                    .cubemaps_raw
+                    .get(i)
+                    .map(|(a, b)| (a.as_slice(), b.as_slice()))
+                    .unwrap_or((&[], &[]));
+                cstr(&mut out, nr, name);
+                cstr(&mut out, pr, path);
+            }
+        }
+        let l = &self.lighting;
+        let lf = [
+            l.lighting_multiplier,
+            l.sun_direction[0], l.sun_direction[1], l.sun_direction[2],
+            l.sun_ambience[0], l.sun_ambience[1], l.sun_ambience[2],
+            l.sun_color[0], l.sun_color[1], l.sun_color[2],
+            l.shadow_fill_color[0], l.shadow_fill_color[1], l.shadow_fill_color[2],
+            l.specular_color[0], l.specular_color[1], l.specular_color[2], l.specular_color[3],
+            l.bloom,
+            l.fog_color[0], l.fog_color[1], l.fog_color[2],
+            l.fog_start, l.fog_end,
+        ];
+        for v in lf {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out.push(u8::from(self.water.has_water));
+        out.extend_from_slice(&self.water.elevation.to_le_bytes());
+        out.extend_from_slice(&self.water.elevation_deep.to_le_bytes());
+        out.extend_from_slice(&self.water.elevation_abyss.to_le_bytes());
+        out.extend_from_slice(&self.tail_bytes);
+        out
+    }
+
+    /// Writes [`Self::write`] to disk.
+    pub fn write_file(&self, path: &Path) -> Result<(), String> {
+        fs::write(path, self.write()).map_err(|e| format!("failed to write '{}': {e}", path.display()))
+    }
+
+    /// Applies a heightmap brush in world coordinates (`x`, `z` on the map,
+    /// `radius` in world units, `strength` in world height units for
+    /// raise/lower). Returns the number of samples changed.
+    pub fn apply_brush(&mut self, x: f32, z: f32, radius: f32, strength: f32, mode: BrushMode) -> usize {
+        if self.heightmap_width == 0 || self.heightmap_height == 0 || radius <= 0.0 || self.height_scale == 0.0 {
+            return 0;
+        }
+        let stride = self.heightmap_width as usize + 1;
+        let gx = x / self.map_width.max(1.0) * self.heightmap_width as f32;
+        let gz = z / self.map_height.max(1.0) * self.heightmap_height as f32;
+        let gr = radius / self.map_width.max(1.0) * self.heightmap_width as f32;
+        let x0 = (gx - gr).floor().max(0.0) as usize;
+        let z0 = (gz - gr).floor().max(0.0) as usize;
+        let x1 = ((gx + gr).ceil() as usize).min(self.heightmap_width as usize);
+        let z1 = ((gz + gr).ceil() as usize).min(self.heightmap_height as usize);
+        let mut changed = 0usize;
+        // Snapshot for smooth mode so the pass is order-independent.
+        let orig = (mode == BrushMode::Smooth).then(|| self.heightmap.clone());
+        for gz_i in z0..=z1 {
+            for gx_i in x0..=x1 {
+                let d = ((gx_i as f32 - gx).powi(2) + (gz_i as f32 - gz).powi(2)).sqrt() / gr.max(0.001);
+                if d > 1.0 {
+                    continue;
+                }
+                let fall = 0.5 + 0.5 * (d * std::f32::consts::PI).cos();
+                let idx = gz_i * stride + gx_i;
+                let Some(slot) = self.heightmap.get_mut(idx) else { continue };
+                let before = *slot;
+                match mode {
+                    BrushMode::Raise | BrushMode::Lower => {
+                        let sign = if mode == BrushMode::Raise { 1.0 } else { -1.0 };
+                        let delta = (sign * strength * fall / self.height_scale).round() as i32;
+                        *slot = (*slot as i32 + delta).clamp(0, u16::MAX as i32) as u16;
+                    }
+                    BrushMode::Smooth => {
+                        let src = orig.as_ref().unwrap();
+                        let mut sum = 0u32;
+                        let mut n = 0u32;
+                        for dz in -1i32..=1 {
+                            for dx in -1i32..=1 {
+                                let nx = gx_i as i32 + dx;
+                                let nz = gz_i as i32 + dz;
+                                if nx >= 0 && nz >= 0 && (nx as usize) <= self.heightmap_width as usize && (nz as usize) <= self.heightmap_height as usize {
+                                    if let Some(&v) = src.get(nz as usize * stride + nx as usize) {
+                                        sum += v as u32;
+                                        n += 1;
+                                    }
+                                }
+                            }
+                        }
+                        if n > 0 {
+                            let avg = (sum / n) as i32;
+                            let cur = *slot as i32;
+                            *slot = (cur + ((avg - cur) as f32 * fall).round() as i32).clamp(0, u16::MAX as i32) as u16;
+                        }
+                    }
+                }
+                if *slot != before {
+                    changed += 1;
+                }
+            }
+        }
+        changed
     }
 
     /// Reads and parses a `.scmap` file from disk.
@@ -916,6 +1094,8 @@ mod tests {
                 elevation_deep: 0.0,
                 elevation_abyss: 0.0,
             },
+            unknown1: 0, unknown2: 0, unknown3: 0, unknown4: 0, post_heightmap_byte: 0,
+            shader_raw: Vec::new(), background_raw: Vec::new(), sky_raw: Vec::new(), cubemaps_raw: Vec::new(), tail_bytes: Vec::new(),
             terrain_textures: None,
         };
         assert_eq!(map.height_stats(), (0.0, 0.0, 0.0));
@@ -937,6 +1117,43 @@ mod tests {
         assert_eq!(map.height_stats(), (5.0, 45.0, 25.0));
 
         assert!(ScMap::parse_file(&path).is_err());
+    }
+
+    #[test]
+    fn writer_roundtrips_synthetic_byte_for_byte() {
+        let mut bytes = valid_v2_60_bytes();
+        bytes.extend_from_slice(b"TRAILING_SECTION_BYTES");
+        let map = ScMap::parse(&bytes).expect("parse");
+        assert_eq!(map.write(), bytes, "write(parse(bytes)) must be byte-identical");
+        let reparsed = ScMap::parse(&map.write()).expect("reparse");
+        assert_eq!(reparsed.heightmap, map.heightmap);
+        assert_eq!(reparsed.tail_bytes, map.tail_bytes);
+    }
+
+    #[test]
+    fn writer_roundtrips_edited_heightmap() {
+        let bytes = valid_v2_60_bytes();
+        let mut map = ScMap::parse(&bytes).expect("parse");
+        map.heightmap[4] = 999;
+        let written = map.write();
+        assert_ne!(written, bytes);
+        let reparsed = ScMap::parse(&written).expect("reparse edited");
+        assert_eq!(reparsed.heightmap[4], 999);
+        assert_eq!(reparsed.write(), written);
+    }
+
+    #[test]
+    fn brush_raise_changes_center_only() {
+        let bytes = valid_v2_60_bytes();
+        let mut map = ScMap::parse(&bytes).expect("parse");
+        let before = map.heightmap.clone();
+        let changed = map.apply_brush(256.0, 512.0, 100.0, 10.0, BrushMode::Raise);
+        assert!(changed > 0);
+        assert!(map.heightmap.iter().zip(&before).any(|(a, b)| a > b));
+        // Far corner (grid 0,0 is at world 0,0) untouched by a small brush at centre-ish.
+        assert_eq!(map.heightmap[0], before[0]);
+        let n = map.apply_brush(256.0, 512.0, 100.0, 10.0, BrushMode::Lower);
+        assert!(n > 0);
     }
 
     #[test]
