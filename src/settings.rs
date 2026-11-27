@@ -437,6 +437,24 @@ pub fn set_active(s: Option<Settings>) {
     if let Ok(mut g) = ACTIVE.write() {
         *g = s;
     }
+    ACCESS_FLAGS.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Phase 39: cached accessibility flags (bit 0 = known, 1 = colour-blind, 2 = mouse swap,
+/// 3 = subtitles). Read per unit per frame, so never clone the settings on the hot path.
+static ACCESS_FLAGS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+fn access_flags() -> u8 {
+    use std::sync::atomic::Ordering::Relaxed;
+    let f = ACCESS_FLAGS.load(Relaxed);
+    if f & 1 != 0 {
+        return f;
+    }
+    let s = input_settings();
+    let cb = s.colorblind || std::env::var("FARUST_COLORBLIND").is_ok_and(|v| v == "1");
+    let f = 1 | u8::from(cb) << 1 | u8::from(s.mouse_swap) << 2 | u8::from(s.subtitles) << 3;
+    ACCESS_FLAGS.store(f, Relaxed);
+    f
 }
 
 pub fn active() -> Option<Settings> {
@@ -496,17 +514,17 @@ pub fn card_hotkeys_enabled() -> bool {
 
 /// Phase 39: colour-blind safe army colours (`FARUST_COLORBLIND=1` overrides).
 pub fn colorblind() -> bool {
-    std::env::var("FARUST_COLORBLIND").is_ok_and(|v| v == "1") || input_settings().colorblind
+    access_flags() & 2 != 0
 }
 
 /// Phase 39: left / right mouse buttons swapped in matches.
 pub fn mouse_swap() -> bool {
-    input_settings().mouse_swap
+    access_flags() & 4 != 0
 }
 
 /// Phase 39: captions for announcer voice lines.
 pub fn subtitles() -> bool {
-    input_settings().subtitles
+    access_flags() & 8 != 0
 }
 
 /// Active UI visual theme (`FARUST_UI_THEME` env var overrides `settings.ini`, default `Modern`).
