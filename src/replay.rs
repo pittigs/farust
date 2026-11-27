@@ -23,7 +23,9 @@ pub const REPLAY_VERSION_V3: u32 = 3;
 pub const REPLAY_VERSION_V4: u32 = 4;
 /// Phase 24: header carries the enabled mods' identities (v4).
 /// Phase 29: header carries the sim [`RULES_VERSION`] (v5; older files are rules 1).
-pub const REPLAY_VERSION: u32 = 5;
+pub const REPLAY_VERSION_V5: u32 = 5;
+/// Phase 48: header carries the mission script text, if any (v6).
+pub const REPLAY_VERSION: u32 = 6;
 pub const CHECKPOINT_INTERVAL: u64 = 300;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,6 +39,8 @@ pub struct ReplayHeader {
     pub mods: Vec<ModIdentity>,
     /// Phase 29: sim rules generation the match was recorded under.
     pub rules: u32,
+    /// Phase 48: mission script the match ran (re-parsed on playback).
+    pub mission: Option<String>,
 }
 
 impl ReplayHeader {
@@ -50,6 +54,14 @@ impl ReplayHeader {
                 self.rules
             ))
         }
+    }
+
+    /// Phase 48: installs the recorded mission script (if any) into a fresh world.
+    pub fn apply_mission(&self, world: &mut Skirmish) -> Result<(), String> {
+        if let Some(src) = &self.mission {
+            world.set_mission(crate::mission::Mission::parse(src)?);
+        }
+        Ok(())
     }
 }
 
@@ -100,10 +112,16 @@ impl ReplayRecorder {
                 options: GameOptions::default(),
                 mods: crate::mods::active_identities(),
                 rules: RULES_VERSION,
+                mission: None,
             },
             commands: Vec::new(),
             checkpoints: Vec::new(),
         }
+    }
+
+    /// Phase 48: record the mission script the world runs.
+    pub fn set_mission(&mut self, mission: Option<String>) {
+        self.header.mission = mission;
     }
 
     /// Phase 18: record the game options the world was created with.
@@ -570,6 +588,13 @@ impl Replay {
         out.extend_from_slice(&self.header.options.unit_cap.to_le_bytes());
         crate::mods::encode_identities(&mut out, &self.header.mods);
         out.extend_from_slice(&self.header.rules.to_le_bytes());
+        match &self.header.mission {
+            Some(src) => {
+                out.push(1);
+                write_str(&mut out, src);
+            }
+            None => out.push(0),
+        }
         out.extend_from_slice(&(self.commands.len() as u32).to_le_bytes());
         for c in &self.commands {
             out.extend_from_slice(&c.tick.to_le_bytes());
@@ -635,7 +660,8 @@ impl Replay {
         } else {
             Vec::new()
         };
-        let rules = if ver >= REPLAY_VERSION { read_u32(data, &mut pos)? } else { 1 };
+        let rules = if ver >= REPLAY_VERSION_V5 { read_u32(data, &mut pos)? } else { 1 };
+        let mission = if ver >= REPLAY_VERSION && read_u8(data, &mut pos)? != 0 { Some(read_str(data, &mut pos)?) } else { None };
         let n_cmds = read_u32(data, &mut pos)? as usize;
         let mut commands = Vec::with_capacity(n_cmds.min(100_000));
         for _ in 0..n_cmds {
@@ -654,7 +680,7 @@ impl Replay {
         let final_tick = read_u64(data, &mut pos)?;
         let final_hash = read_u64(data, &mut pos)?;
         Ok(Replay {
-            header: ReplayHeader { map_id, seed, setups, options, mods, rules },
+            header: ReplayHeader { map_id, seed, setups, options, mods, rules, mission },
             commands,
             checkpoints,
             final_tick,
@@ -699,6 +725,7 @@ impl Replay {
             self.header.seed,
         )?;
         world.attach_map(map);
+        self.header.apply_mission(&mut world)?;
         world.set_options(self.header.options);
 
         let mut cmd_idx = 0usize;

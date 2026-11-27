@@ -166,6 +166,11 @@ pub struct UiState {
     pub hotbuild: Option<(&'static str, usize)>,
     /// Ferry order: pick-up point chosen, waiting for the drop-off click.
     pub ferry_from: Option<(i64, i64)>,
+    /// Phase 48: mission messages already shown, objective states last announced and the
+    /// last camera request applied.
+    pub mission_said: usize,
+    pub mission_objectives: Vec<crate::mission::ObjectiveState>,
+    pub mission_camera: Option<u64>,
 }
 
 impl UiState {

@@ -3823,6 +3823,38 @@ impl ApplicationHandler for PlayApp {
                 }
                 st.device.poll(wgpu::Maintain::Poll);
                 st.resources.poll_gpu_timer();
+                // Phase 48: mission messages / objective changes → banner, camera requests.
+                if let Some(rt) = self.session.world.mission() {
+                    let mut banner = None;
+                    if rt.log.len() > self.session.ui.mission_said {
+                        banner = rt.log.last().map(|(_, t)| t.clone());
+                    }
+                    let states: Vec<crate::mission::ObjectiveState> =
+                        rt.mission.objectives.iter().map(|o| rt.objectives[&o.id]).collect();
+                    for (i, o) in rt.mission.objectives.iter().enumerate() {
+                        if self.session.ui.mission_objectives.get(i).is_some_and(|s| *s != states[i]) {
+                            banner = Some(format!("Objective {:?}: {}", states[i], o.text));
+                        }
+                    }
+                    let cam = rt.camera;
+                    self.session.ui.mission_said = rt.log.len();
+                    self.session.ui.mission_objectives = states;
+                    if let Some(b) = banner {
+                        self.session.status_banner = b;
+                    }
+                    if let Some((t, at, zoom)) = cam
+                        && self.session.ui.mission_camera != Some(t)
+                    {
+                        self.session.ui.mission_camera = Some(t);
+                        let (wx, wz) = (at.0 as f32 / 1000.0, at.1 as f32 / 1000.0);
+                        st.camera.target = [wx, sample_terrain_y(&self.map.scmap, wx, wz), wz];
+                        if let Some(z) = zoom {
+                            st.camera.distance = z as f32;
+                        }
+                        st.resources.update_camera(&st.queue, &st.camera);
+                        st.dirty_dynamic = true;
+                    }
+                }
                 // Phase 34: hide reclaimed trees / rocks (also restores them after a seek back).
                 let gone = self.session.world.props_gone();
                 if gone.len() != st.props_hidden && st.props_filtered_at.elapsed().as_secs_f32() >= 1.0 {

@@ -132,6 +132,7 @@ pub fn origin_world(catalog: Catalog, map: &MapContext, replay: &Replay) -> Resu
         replay.header.seed,
     )?;
     world.attach_map(map);
+    replay.header.apply_mission(&mut world)?;
     Ok(world)
 }
 
@@ -183,6 +184,7 @@ impl MatchRecorder {
     /// Replay of the match up to the current state of `world` (generic `replay.rs` codec).
     pub fn to_replay(&self, map_id: &str, world: &Skirmish) -> Replay {
         let mut rec = ReplayRecorder::new(map_id, world.seed(), setups_of(world));
+        rec.set_mission(world.mission_source());
         let now = world.tick();
         for (tick, army, cmd) in self.commands.iter().filter(|c| c.0 < now) {
             rec.record(*tick, *army, cmd);

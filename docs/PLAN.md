@@ -542,12 +542,25 @@ bumps `SIM_VERSION`, re-baselines golden hashes deliberately, and keeps
 
 ### Arc E — Content & authoring (48–51)
 
-### Phase 48 — Scenario scripting engine (planned)
-- Rust-native, data-driven mission scripts (triggers, objectives, timers,
-  spawn waves, dialogue, scripted camera). Not Moho Lua; deterministic and
-  included in replays.
-- Exit: a custom "defend the base for 10 minutes" mission is playable and
-  replayable.
+### Phase 48 — Scenario scripting engine (done)
+- `src/mission.rs`: line-based `*.farust-mission` scripts — `mission`, `map`, `victory`,
+  `army N faction F [team T] human|ai DIFF|ai none`, `objective ID primary|secondary
+  "TEXT"`, `when COND do ACTION; ACTION…`. Conditions: `at m:ss`, `every m:ss from m:ss
+  [until m:ss]`, `dead commander A`, `no units A`, `count A TYPE|any in X,Z rR OP N`,
+  `objective ID complete|failed`. Actions: `say`, `spawn A TYPE xN at X,Z [attack|move
+  X,Z]`, `objective ID complete|fail`, `win A`, `lose A`, `camera X,Z [zoom D]`. Parse
+  errors carry line numbers; unknown objectives and gappy army indices are rejected.
+- The runtime is deterministic world state: evaluated after every tick's cleanup in file
+  order, hashed, cloned with the world (seek / saves), and its source travels in replay
+  v6 headers (`ReplayHeader::apply_mission` on verify, playback and save loading).
+- `farust mission FILE [--human-ai DIFF] [--record OUT]` (headless) and
+  `farust play --mission FILE` (messages and objective changes in the status banner,
+  scripted camera moves). Example: `missions/hold_the_line.farust-mission` (SCMP_009,
+  10-minute defence against scripted Cybran waves).
+- Exit: with `--human-ai normal` the example ends `Victory(0)` at 10:00 with both primary
+  objectives complete and its recorded replay verifies; with an idle player the ACU falls
+  at ~8:19 → defeat. Parser + runtime/determinism tests pass (324/324). Done.
+- Not done: mission editor, dialogue portraits / voice, multiplayer missions.
 
 ### Phase 49 — First campaign operation (planned)
 - Reimplement one FA campaign operation (e.g. `X1CA_001`) on the scripting

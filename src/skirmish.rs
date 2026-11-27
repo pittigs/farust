@@ -2432,6 +2432,8 @@ pub struct Skirmish {
     props: BTreeMap<u32, MapProp>,
     /// Phase 34: `.scmap` position bits of props reclaimed so far (render hides them).
     props_gone: Vec<(u32, u32)>,
+    /// Phase 48: running mission script (triggers evaluated after every tick's cleanup).
+    mission: Option<Box<crate::mission::MissionRuntime>>,
     flow_cache: FlowFieldCache,
     spatial: Arc<SpatialGrid>,
     spatial_snap: Arc<Vec<UnitSpatialSnap>>,
@@ -2513,6 +2515,7 @@ impl Skirmish {
             terrain: Arc::new(HeightField::flat()),
             props: BTreeMap::new(),
             props_gone: Vec::new(),
+            mission: None,
             flow_cache: FlowFieldCache::new(),
             spatial,
             spatial_snap: Arc::new(Vec::new()),
@@ -2643,6 +2646,20 @@ impl Skirmish {
         self.set_domain_grids(map.naval_grid.clone(), map.amphib_grid.clone(), map.hydro_points.clone());
         self.set_terrain(HeightField::from_scmap(&map.scmap));
         self.set_props(map.props.clone());
+    }
+
+    /// Phase 48: runs `mission` in this world from now on.
+    pub fn set_mission(&mut self, mission: crate::mission::Mission) {
+        self.mission = Some(Box::new(crate::mission::MissionRuntime::new(mission)));
+    }
+
+    pub fn mission(&self) -> Option<&crate::mission::MissionRuntime> {
+        self.mission.as_deref()
+    }
+
+    /// Phase 48: the mission script text (stored in replay headers).
+    pub fn mission_source(&self) -> Option<String> {
+        self.mission.as_ref().map(|m| m.mission.source.clone())
     }
 
     /// Phase 34: reclaimable props (tests and map attachment).
@@ -4366,6 +4383,13 @@ impl Skirmish {
         { let _p = scope("sim.weapons"); self.step_weapons(); }
         { let _p = scope("sim.projectiles"); self.step_projectiles(); }
         { let _p = scope("sim.cleanup"); self.step_cleanup(); }
+        if let Some(mut m) = self.mission.take() {
+            m.step(self);
+            if let Some(r) = m.outcome {
+                self.result = Some(r);
+            }
+            self.mission = Some(m);
+        }
         { let _p = scope("sim.spatial"); self.rebuild_spatial(); }
     }
 
@@ -7302,6 +7326,9 @@ impl Skirmish {
         m(&mut h, &self.shots_fired.to_le_bytes());
         m(&mut h, &self.kills.to_le_bytes());
         m(&mut h, &(self.props.len() as u64).to_le_bytes());
+        if let Some(ms) = &self.mission {
+            m(&mut h, &ms.digest().to_le_bytes());
+        }
         for p in self.props.values() {
             m(&mut h, &p.mass.to_le_bytes());
             m(&mut h, &p.energy.to_le_bytes());

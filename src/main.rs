@@ -21,6 +21,7 @@ mod lobby;
 mod map_author;
 mod loc;
 mod menu;
+mod mission;
 mod mods;
 mod net;
 mod net_lobby;
@@ -302,6 +303,7 @@ fn run(args: &[String], connect_lobby: Option<&str>) -> Result<(), String> {
         "loc" => loc::cmd_loc(args),
         "mods" => mods::cmd_mods(args),
         "map" => cmd_map(args),
+        "mission" => mission::cmd_mission(args),
         "map-roundtrip" => map_author::cmd_map_roundtrip(args),
         "map-edit" => map_author::cmd_map_edit(args),
         "map-editor" => map_author::cmd_map_editor(args),
@@ -1343,6 +1345,8 @@ fn positional_after(args: &[String], start: usize) -> Option<PathBuf> {
             || a == "--camera-dist"
             || a == "--out"
             || a == "--rendezvous"
+            || a == "--mission"
+            || a == "--human-ai"
         {
             i += 2;
             continue;
@@ -1504,6 +1508,7 @@ fn cmd_skirmish(args: &[String]) -> Result<(), String> {
             })
             .collect();
         let mut rec = replay::ReplayRecorder::new(&map.map_id, seed, setups);
+        rec.set_mission(world.mission_source());
         rec.set_options(options);
         rec
     });
@@ -1697,6 +1702,18 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
         origin.set_options(save.replay.header.options);
         let sess = save.into_session(origin)?;
         (map, sess)
+    } else if let Some(mpath) = flag_str(args, "--mission") {
+        // Phase 48: play a scripted mission.
+        let m = mission::load_file(std::path::Path::new(&mpath))?;
+        let map = skirmish::MapContext::load(&game_dir, &m.map)?;
+        let world = mission::build_world(&m, catalog, &map, seed)?;
+        let human = m.human_army().unwrap_or(0) as skirmish::ArmyId;
+        let mut sess = play::PlaySession::new(world, human, spectate, speed);
+        sess.ais = mission::ai_armies(&m, spectate.then_some("normal"))?
+            .into_iter()
+            .map(|(a, d)| skirmish_ai::ScriptedAi::with_difficulty(a, d))
+            .collect();
+        (map, sess)
     } else {
         let options = parse_game_options(args)?;
         let map = skirmish::MapContext::load(&game_dir, map_name)?;
@@ -1817,6 +1834,7 @@ fn cmd_replay(args: &[String]) -> Result<(), String> {
                 rep.header.seed,
             )?;
             world.attach_map(&map);
+            rep.header.apply_mission(&mut world)?;
             world.set_options(rep.header.options);
             let final_tick = rep.final_tick;
             let mut session = play::PlaySession::new_replay(world, rep, speed);

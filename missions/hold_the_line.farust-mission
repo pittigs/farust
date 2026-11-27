@@ -1,0 +1,21 @@
+# FARust example mission (Phase 48): defend your base for ten minutes against Cybran raids.
+# Run headless:  farust mission missions/hold_the_line.farust-mission --human-ai normal
+# Play it:       farust play --mission missions/hold_the_line.farust-mission
+mission "Hold the Line"
+map SCMP_009
+victory sandbox
+army 0 faction uef human
+army 1 faction cybran ai none
+
+objective hold primary "Hold the base for 10 minutes"
+objective acu primary "The Commander must survive"
+objective scout secondary "Destroy the Cybran outpost commander"
+
+when at 0:00 do say "Commander, Cybran raiders are inbound. Fortify and hold for ten minutes."; camera 672,346 zoom 90
+when at 0:45 do say "Long-range scans: first wave in fifteen seconds."
+when every 1:00 from 1:00 until 4:00 do spawn 1 URL0106 x4 at 420,620 attack 672,346
+when every 1:15 from 4:30 until 9:00 do spawn 1 URL0107 x5 at 420,620 attack 672,346; spawn 1 URL0103 x2 at 410,630 attack 672,346
+when at 5:00 do say "Halfway there. Expect heavier assaults."
+when dead commander 1 do objective scout complete; say "Outpost commander eliminated."
+when at 10:00 do objective hold complete; objective acu complete; say "Reinforcements have arrived. Well done, Commander."; win 0
+when dead commander 0 do objective acu fail; objective hold fail; lose 0
