@@ -114,6 +114,12 @@ pub struct ReplayUi {
     pub dragging: bool,
     /// Tick under the cursor while dragging the seek bar (committed on release).
     pub drag_tick: Option<u64>,
+    /// Phase 47: notable event bookmarks shown on the timeline.
+    pub bookmarks: Vec<crate::vault::Bookmark>,
+    /// Index of the most recently jumped-to bookmark.
+    pub active_bookmark: Option<usize>,
+    /// Pending camera target `(x_milli, z_milli)` after jumping to a bookmark.
+    pub camera_jump: Option<(i64, i64)>,
 }
 
 /// What an RMB drag is doing (decided once the drag threshold is crossed).
@@ -182,6 +188,9 @@ impl UiState {
                 perspective: None,
                 dragging: false,
                 drag_tick: None,
+                bookmarks: Vec::new(),
+                active_bookmark: None,
+                camera_jump: None,
             }),
             ..Self::default()
         }
@@ -1005,6 +1014,60 @@ impl PlaySession {
         self.ui.replay.as_ref().is_some_and(|r| r.seek_target.is_some())
     }
 
+    /// Phase 47: attaches vault event bookmarks to the replay timeline.
+    pub fn set_replay_bookmarks(&mut self, bookmarks: Vec<crate::vault::Bookmark>) {
+        if let Some(ref mut ui) = self.ui.replay {
+            ui.bookmarks = bookmarks;
+            ui.active_bookmark = None;
+        }
+    }
+
+    pub fn replay_bookmarks(&self) -> &[crate::vault::Bookmark] {
+        self.ui
+            .replay
+            .as_ref()
+            .map(|r| r.bookmarks.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Jumps the replay timeline to bookmark `idx` and queues a camera focus on its location.
+    pub fn jump_to_bookmark(&mut self, idx: usize) -> bool {
+        let Some(bm) = self.replay_bookmarks().get(idx).cloned() else {
+            return false;
+        };
+        self.request_seek_tick(bm.tick);
+        if let Some(ref mut ui) = self.ui.replay {
+            ui.active_bookmark = Some(idx);
+            ui.camera_jump = Some(bm.pos);
+        }
+        self.status_banner = format!(
+            "[{}] {} — {}",
+            bm.kind.tag(),
+            fmt_ticks(bm.tick),
+            bm.label
+        );
+        true
+    }
+
+    /// Jumps to the next (`forward = true`) or previous (`forward = false`) event bookmark.
+    pub fn jump_adjacent_bookmark(&mut self, forward: bool) -> bool {
+        let bms = self.replay_bookmarks();
+        if bms.is_empty() {
+            return false;
+        }
+        let cur = self.world.tick();
+        let target_idx = if forward {
+            bms.iter()
+                .position(|b| b.tick > cur.saturating_add(5))
+                .unwrap_or(0)
+        } else {
+            bms.iter()
+                .rposition(|b| b.tick < cur.saturating_sub(5))
+                .unwrap_or(bms.len() - 1)
+        };
+        self.jump_to_bookmark(target_idx)
+    }
+
     /// Cycles observer → army 0 → … → observer (fog of war from that army).
     pub fn cycle_replay_perspective(&mut self) {
         let armies: Vec<ArmyId> = self.world.armies().iter().map(|a| a.id).collect();
@@ -1766,5 +1829,60 @@ mod tests {
         s.trigger_toggle_repeat();
         s.step_sim();
         assert!(!s.world.unit(fac).unwrap().repeat_queue);
+    }
+
+    #[test]
+    fn replay_bookmark_jump_seeks_and_sets_camera_target() {
+        use crate::replay::ReplayRecorder;
+        use crate::skirmish::tests::test_world;
+        use crate::vault::{Bookmark, BookmarkKind};
+
+        let w0 = test_world(77);
+        let mut w_rec = w0.clone();
+        let setups = crate::savegame::setups_of(&w_rec);
+        let rec = ReplayRecorder::new("SYNTH", w_rec.seed(), setups);
+        w_rec.run(80);
+        let rep = rec.finish(w_rec.tick(), w_rec.state_hash());
+
+        let mut s = PlaySession::new_replay(w0, rep, 1);
+        s.set_replay_bookmarks(vec![
+            Bookmark {
+                tick: 25,
+                kind: BookmarkKind::Experimental,
+                army: Some(0),
+                pos: (50 * SCALE, 60 * SCALE),
+                label: "Fatboy done".into(),
+            },
+            Bookmark {
+                tick: 70,
+                kind: BookmarkKind::AcuDeath,
+                army: Some(1),
+                pos: (180 * SCALE, 190 * SCALE),
+                label: "ACU down".into(),
+            },
+        ]);
+
+        assert!(s.jump_adjacent_bookmark(true));
+        assert_eq!(s.ui.replay.as_ref().unwrap().active_bookmark, Some(0));
+        assert_eq!(s.ui.replay.as_ref().unwrap().camera_jump, Some((50 * SCALE, 60 * SCALE)));
+        while s.seeking() {
+            s.pump_replay_seek(Duration::from_millis(50));
+        }
+        assert_eq!(s.world.tick(), 25);
+
+        assert!(s.jump_adjacent_bookmark(true));
+        assert_eq!(s.ui.replay.as_ref().unwrap().active_bookmark, Some(1));
+        while s.seeking() {
+            s.pump_replay_seek(Duration::from_millis(50));
+        }
+        assert_eq!(s.world.tick(), 70);
+
+        // Jump backwards to bookmark 0 re-simulates deterministically to tick 25.
+        assert!(s.jump_adjacent_bookmark(false));
+        assert_eq!(s.ui.replay.as_ref().unwrap().active_bookmark, Some(0));
+        while s.seeking() {
+            s.pump_replay_seek(Duration::from_millis(50));
+        }
+        assert_eq!(s.world.tick(), 25);
     }
 }

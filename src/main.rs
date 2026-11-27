@@ -52,6 +52,7 @@ mod stats;
 mod ttf;
 mod udp_transport;
 mod ui_kit;
+mod vault;
 mod vfx;
 mod viewer;
 mod xact;
@@ -99,13 +100,17 @@ fn print_usage() {
     eprintln!("  farust ai-arena [GAME_DIR] [--maps M1,M2] [--seeds N|S1,S2] [--matchups A:B,C:D] [--factions F0,F1] [--max-ticks N] [--victory V] [--unit-cap N] [--threads K] [--json [FILE]]");
     eprintln!("  farust play [MAP] [GAME_DIR] [--armies 1,2] [--factions uef,cybran] [--ai D] [--victory V] [--unit-cap N] [--seed S] [--speed N] [--load FILE] [--spectate] [--lobby [--lobby-autostart]] [--fow] [--mute] [--no-record] [--record FILE] [--camera-dist F] [--size WxH] [--snapshot OUT.png] [--snapshot-ticks N]");
     eprintln!("  farust replay <verify|play> <FILE> [GAME_DIR] [--speed N] [--mute] [--size WxH] [--snapshot OUT.png] [--snapshot-ticks N]");
+    eprintln!("  farust replay index [GAME_DIR] [--vault DIR] [--search TEXT] [--map M] [--player P] [--faction F] [--winner W] [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--no-sim] [--rebuild] [--json]");
+    eprintln!("  farust replay upload <FILE> [--rendezvous HOST:PORT] [--vault DIR]");
+    eprintln!("  farust replay download <CODE> [--rendezvous HOST:PORT] [--vault DIR] [--out FILE] [GAME_DIR]");
     eprintln!("  farust host [<ADDR:PORT>] [MAP] [GAME_DIR] [--code] [--rendezvous ADDR] [--udp] [--netem SPEC] [--players N] [--armies 1,2] [--factions uef,cybran] [--seed S] [--play] [--mute] [--size WxH] [--headless-ticks N]");
     eprintln!("  farust join <ADDR:PORT | CODE> [GAME_DIR] [--code CODE] [--rendezvous ADDR] [--udp] [--netem SPEC] [--relay] [--play] [--mute] [--size WxH] [--headless-ticks N]");
-    eprintln!("  farust rendezvous [BIND_ADDR]                     (run invite-code + UDP hole-punch + TCP relay server)");
+    eprintln!("  farust rendezvous [BIND_ADDR] [--replay-dir DIR] [--max-replay-mb N] [--max-storage-mb N]");
     eprintln!("  global: +connect_lobby <CODE|ADDR:PORT>           (Steam-compatible lobby auto-join arg)");
     eprintln!();
     eprintln!("env:");
     eprintln!("  FA_PATH             override for the game install dir");
+    eprintln!("  FARUST_VAULT_DIR    override replay vault directory");
     eprintln!("  FARUST_RENDEZVOUS   override rendezvous server host:port (default 127.0.0.1:15050)");
     eprintln!("  FARUST_FORCE_RELAY  =1 forces client relay fallback through rendezvous server");
     eprintln!("  FARUST_UI_THEME     modern | classic (old-school FA console layout + faction skins)");
@@ -1349,6 +1354,15 @@ fn positional_after(args: &[String], start: usize) -> Option<PathBuf> {
             || a == "--rendezvous"
             || a == "--mission"
             || a == "--human-ai"
+            || a == "--vault"
+            || a == "--player"
+            || a == "--faction"
+            || a == "--winner"
+            || a == "--from"
+            || a == "--to"
+            || a == "--replay-dir"
+            || a == "--max-replay-mb"
+            || a == "--max-storage-mb"
         {
             i += 2;
             continue;
@@ -1797,10 +1811,21 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
 }
 
 fn cmd_replay(args: &[String]) -> Result<(), String> {
+    if args.len() < 3 {
+        return Err(
+            "usage: farust replay <verify|play|index|upload|download> ...".to_string(),
+        );
+    }
+    let mode = args[2].as_str();
+    match mode {
+        "index" => return cmd_replay_index(args),
+        "upload" => return cmd_replay_upload(args),
+        "download" => return cmd_replay_download(args),
+        _ => {}
+    }
     if args.len() < 4 {
         return Err("usage: farust replay <verify|play> <FILE> [GAME_DIR] [--size WxH] [--snapshot OUT.png] [--snapshot-ticks N]".to_string());
     }
-    let mode = args[2].as_str();
     let replay_path = PathBuf::from(&args[3]);
     let game_dir = positional_after(args, 4).unwrap_or_else(scd::default_game_dir);
 
@@ -1826,6 +1851,10 @@ fn cmd_replay(args: &[String]) -> Result<(), String> {
         "play" => {
             let speed = flag_usize(args, "--speed").unwrap_or(2).clamp(1, 8) as u32;
             let (width, height) = parse_size_flag(args).unwrap_or((1280, 800));
+            let vault_dir = flag_str(args, "--vault")
+                .map(PathBuf::from)
+                .unwrap_or_else(vault::default_vault_dir);
+            let bookmarks = vault::VaultIndex::bookmarks_for_path(&vault_dir, &replay_path);
             let meshes = play::UnitMeshCache::load(Some(&game_dir), &catalog);
             let mut world = skirmish::Skirmish::new(
                 catalog,
@@ -1840,6 +1869,9 @@ fn cmd_replay(args: &[String]) -> Result<(), String> {
             world.set_options(rep.header.options);
             let final_tick = rep.final_tick;
             let mut session = play::PlaySession::new_replay(world, rep, speed);
+            if !bookmarks.is_empty() {
+                session.set_replay_bookmarks(bookmarks);
+            }
             session.muted = has_flag(args, "--mute");
             if let Some(out) = flag_str(args, "--snapshot") {
                 let target_ticks = flag_usize(args, "--snapshot-ticks").unwrap_or(3000) as u64;
@@ -1880,11 +1912,243 @@ fn cmd_replay(args: &[String]) -> Result<(), String> {
                 );
                 return Ok(());
             }
-            println!("Replay: timeline click/drag seek | Space pause | +/- speed 1x-16x | [ ] seek -/+30s | Home restart | V perspective (observer/army FoW)");
+            println!("Replay: timeline click/drag seek | bookmark pips & <BM/BM> | Space pause | +/- speed 1x-16x | [ ] seek -/+30s | Home restart | V perspective (observer/army FoW)");
             play::run_play_window(Some(&game_dir), session, map, meshes, width, height)
         }
-        other => Err(format!("unknown replay subcommand '{other}' (expected verify|play)")),
+        other => Err(format!(
+            "unknown replay subcommand '{other}' (expected verify|play|index|upload|download)"
+        )),
     }
+}
+
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push(' '),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+fn cmd_replay_index(args: &[String]) -> Result<(), String> {
+    let vault_dir = flag_str(args, "--vault")
+        .map(PathBuf::from)
+        .unwrap_or_else(vault::default_vault_dir);
+    let game_dir = positional_after(args, 3).unwrap_or_else(scd::default_game_dir);
+    let game_opt = game_dir.is_dir().then_some(game_dir.as_path());
+    let opts = vault::SyncOptions {
+        run_sim: !has_flag(args, "--no-sim"),
+        generate_thumbs: true,
+        force_rebuild: has_flag(args, "--rebuild"),
+    };
+    let t0 = Instant::now();
+    let mut index = vault::VaultIndex::load_or_empty(&vault_dir);
+    let report = index.sync(&vault_dir, game_opt, opts)?;
+
+    let mut query = flag_str(args, "--search")
+        .map(vault::VaultQuery::parse)
+        .unwrap_or_default();
+    if let Some(m) = flag_str(args, "--map") {
+        query.map = Some(m.to_string());
+    }
+    if let Some(p) = flag_str(args, "--player") {
+        query.player = Some(p.to_string());
+    }
+    if let Some(f) = flag_str(args, "--faction") {
+        query.faction = Some(f.to_string());
+    }
+    if let Some(w) = flag_str(args, "--winner") {
+        query.winner = Some(w.to_string());
+    }
+    if let Some(from) = flag_str(args, "--from") {
+        query.date_from = Some(from.to_string());
+    }
+    if let Some(to) = flag_str(args, "--to") {
+        query.date_to = Some(to.to_string());
+    }
+
+    let matches = index.search(&query);
+    if has_flag(args, "--json") {
+        println!("[");
+        for (i, e) in matches.iter().enumerate() {
+            let comma = if i + 1 < matches.len() { "," } else { "" };
+            let winner = e
+                .winner
+                .as_ref()
+                .map(|w| format!("\"{}\"", json_escape(&w.label())))
+                .unwrap_or_else(|| "null".to_string());
+            let code = e
+                .share_code
+                .as_ref()
+                .map(|c| format!("\"{}\"", json_escape(c)))
+                .unwrap_or_else(|| "null".to_string());
+            println!(
+                "  {{\"file\":\"{}\",\"map_id\":\"{}\",\"map_name\":\"{}\",\"date\":\"{}\",\"duration_ticks\":{},\"rules\":{},\"needs_older_build\":{},\"winner\":{},\"bookmarks\":{},\"size\":{},\"share_code\":{}}}{comma}",
+                json_escape(&e.file_name),
+                json_escape(&e.map_id),
+                json_escape(&e.map_name),
+                json_escape(&e.date_ymd),
+                e.duration_ticks,
+                e.rules,
+                e.needs_older_build(),
+                winner,
+                e.bookmarks.len(),
+                e.file_size,
+                code
+            );
+        }
+        println!("]");
+        return Ok(());
+    }
+
+    println!(
+        "Replay vault: {} ({} total, {} cached, {} indexed, {} sim-analyzed, {} removed in {:.0}ms)",
+        vault_dir.display(),
+        report.total,
+        report.cached,
+        report.indexed,
+        report.sim_analyzed,
+        report.removed,
+        t0.elapsed().as_secs_f64() * 1000.0
+    );
+    for err in &report.errors {
+        eprintln!("  warn: {err}");
+    }
+    if matches.is_empty() {
+        println!("No matching replays.");
+        return Ok(());
+    }
+    for e in matches {
+        let rules_note = if e.needs_older_build() {
+            format!(" [needs older build: rules v{}]", e.rules)
+        } else {
+            String::new()
+        };
+        let code_note = e
+            .share_code
+            .as_ref()
+            .map(|c| format!(" [code:{c}]"))
+            .unwrap_or_default();
+        println!(
+            "  {} | {} ({}) | {} | {} | {} | winner: {} | {} bm | {:.1} KiB{}{}",
+            e.file_name,
+            e.map_id,
+            e.map_name,
+            e.date_ymd,
+            e.duration_mmss(),
+            e.armies_summary(),
+            e.winner_label(),
+            e.bookmarks.len(),
+            e.file_size as f64 / 1024.0,
+            rules_note,
+            code_note
+        );
+    }
+    Ok(())
+}
+
+fn cmd_replay_upload(args: &[String]) -> Result<(), String> {
+    if args.len() < 4 || args[3].starts_with("--") {
+        return Err("usage: farust replay upload <FILE> [--rendezvous HOST:PORT] [--vault DIR]".into());
+    }
+    let file = PathBuf::from(&args[3]);
+    let rv_addr = flag_str(args, "--rendezvous")
+        .map(str::to_string)
+        .unwrap_or_else(|| settings::effective_rendezvous(None));
+    let bytes = std::fs::read(&file)
+        .map_err(|e| format!("failed to read {}: {e}", file.display()))?;
+    let up = rendezvous::upload_replay(&rv_addr, &bytes, std::time::Duration::from_secs(10))?;
+
+    // Cache the returned share code in the vault index if the file is in the vault.
+    let vault_dir = flag_str(args, "--vault")
+        .map(PathBuf::from)
+        .unwrap_or_else(vault::default_vault_dir);
+    if let Some(fname) = file.file_name().map(|s| s.to_string_lossy().to_string()) {
+        let mut idx = vault::VaultIndex::load_or_empty(&vault_dir);
+        if idx.set_share_code(&fname, &up.code) {
+            let _ = idx.save(&vault_dir);
+        }
+    }
+
+    println!(
+        "replay uploaded: code={} size={} hash={:016x} via {}",
+        up.code, up.size, up.content_hash, rv_addr
+    );
+    Ok(())
+}
+
+fn cmd_replay_download(args: &[String]) -> Result<(), String> {
+    if args.len() < 4 || args[3].starts_with("--") {
+        return Err("usage: farust replay download <CODE> [--rendezvous HOST:PORT] [--vault DIR] [--out FILE] [GAME_DIR]".into());
+    }
+    let code = &args[3];
+    let rv_addr = flag_str(args, "--rendezvous")
+        .map(str::to_string)
+        .unwrap_or_else(|| settings::effective_rendezvous(None));
+    let timeout = std::time::Duration::from_secs(10);
+
+    if let Some(out) = flag_str(args, "--out") {
+        let dl = rendezvous::download_replay(&rv_addr, code, timeout)?;
+        let out_path = PathBuf::from(out);
+        if let Some(parent) = out_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+        }
+        std::fs::write(&out_path, &dl.bytes)
+            .map_err(|e| format!("failed to write {}: {e}", out_path.display()))?;
+        println!(
+            "replay downloaded: code={} map={} ticks={} size={} -> {}",
+            dl.code,
+            dl.replay.header.map_id,
+            dl.replay.final_tick,
+            dl.bytes.len(),
+            out_path.display()
+        );
+        return Ok(());
+    }
+
+    let vault_dir = flag_str(args, "--vault")
+        .map(PathBuf::from)
+        .unwrap_or_else(vault::default_vault_dir);
+    let (saved_path, dl) =
+        rendezvous::download_replay_into_vault(&rv_addr, code, &vault_dir, timeout)?;
+
+    let game_dir = positional_after(args, 4).unwrap_or_else(scd::default_game_dir);
+    let game_opt = game_dir.is_dir().then_some(game_dir.as_path());
+    let mut idx = vault::VaultIndex::load_or_empty(&vault_dir);
+    let _ = idx.sync(
+        &vault_dir,
+        game_opt,
+        vault::SyncOptions {
+            run_sim: !has_flag(args, "--no-sim"),
+            generate_thumbs: true,
+            force_rebuild: false,
+        },
+    );
+    if let Some(fname) = saved_path.file_name().map(|s| s.to_string_lossy().to_string())
+        && idx.set_share_code(&fname, &dl.code)
+    {
+        let _ = idx.save(&vault_dir);
+    }
+
+    println!(
+        "replay downloaded: code={} map={} ticks={} size={} -> {}",
+        dl.code,
+        dl.replay.header.map_id,
+        dl.replay.final_tick,
+        dl.bytes.len(),
+        saved_path.display()
+    );
+    Ok(())
 }
 
 fn cmd_rendezvous(args: &[String]) -> Result<(), String> {
@@ -1893,10 +2157,21 @@ fn cmd_rendezvous(args: &[String]) -> Result<(), String> {
         .filter(|a| !a.starts_with("--"))
         .map(String::as_str)
         .unwrap_or("0.0.0.0:15050");
-    let srv = rendezvous::RendezvousServer::bind(bind_addr)?;
+    let mut cfg = rendezvous::ReplayStoreConfig::default();
+    if let Some(d) = flag_str(args, "--replay-dir") {
+        cfg.dir = PathBuf::from(d);
+    }
+    if let Some(mb) = flag_usize(args, "--max-replay-mb") {
+        cfg.max_replay_bytes = (mb.clamp(1, 8)) * 1024 * 1024;
+    }
+    if let Some(mb) = flag_usize(args, "--max-storage-mb") {
+        cfg.max_total_bytes = (mb.max(1) as u64) * 1024 * 1024;
+    }
+    let srv = rendezvous::RendezvousServer::bind_with_replays(bind_addr, cfg)?;
     println!(
-        "FARust rendezvous (UDP hole-punch + TCP relay) listening on {} (TCP+UDP)",
-        srv.local_addr()
+        "FARust rendezvous (UDP hole-punch + TCP relay + replay sharing) listening on {} (TCP+UDP) | replays={}",
+        srv.local_addr(),
+        srv.replay_dir().display()
     );
     srv.run_forever();
     Ok(())

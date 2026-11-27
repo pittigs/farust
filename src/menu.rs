@@ -1,7 +1,6 @@
 //! Phase 20 front-end shell: Main Menu, Skirmish, Multiplayer (Host/Join/Lobby), Replays,
 //! and Options on a single `winit` event loop that hands over cleanly to `play::PlayApp`.
 
-use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::{Duration, Instant};
@@ -27,6 +26,7 @@ use crate::ui_kit::{
     Align, Canvas, ClassicPalette, Fonts, Frame, ImageStore, Rect, WState, WindowGpu, body, bold, render_png,
     theme, title,
 };
+use crate::vault::{self, Bookmark, VaultEntry, VaultIndex, VaultQuery};
 
 const UNIT_CAPS: [u32; 6] = [250, 500, 1000, 1500, 2000, 0];
 
@@ -130,8 +130,8 @@ pub fn run(game_dir: &Path, opts: MenuOptions) -> Result<(), String> {
 #[derive(Debug, Clone)]
 struct ReplayItem {
     path: PathBuf,
-    name: String,
-    replay: Replay,
+    thumb_key: String,
+    entry: VaultEntry,
 }
 
 enum MpSession {
@@ -149,6 +149,8 @@ enum FocusField {
     MpChat,
     OptPlayerName,
     OptLastHost,
+    ReplaySearch,
+    ReplayDownloadCode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -192,7 +194,11 @@ enum Action {
     SelectReplay(usize),
     VerifyReplay,
     WatchReplay,
+    WatchReplayBookmark(usize),
     RefreshReplays,
+    ClearReplaySearch,
+    ShareReplay,
+    DownloadReplay,
     // Options
     CycleResolution,
     ToggleFullscreen,
@@ -226,7 +232,11 @@ struct MenuState {
     lobby: Option<LobbyState>,
     ai_difficulty: Difficulty,
     game_options: GameOptions,
+    vault_dir: PathBuf,
+    vault_index: VaultIndex,
     replays: Vec<ReplayItem>,
+    replay_search: String,
+    replay_download_code: String,
     replay_selected: usize,
     replay_scroll: usize,
     /// Phase 23 Keys screen: action being rebound (`add` = keep existing chords).
@@ -292,7 +302,7 @@ impl MenuState {
             )
         });
         let map_count = lobby.as_ref().map(|l| l.maps.len()).unwrap_or(0);
-        let replays = scan_replays();
+        let vault_dir = vault::default_vault_dir();
         let rendezvous = settings::effective_rendezvous(Some(&settings));
 
         let mut st = Self {
@@ -305,7 +315,11 @@ impl MenuState {
             lobby,
             ai_difficulty: Difficulty::Normal,
             game_options: GameOptions::default(),
-            replays,
+            vault_dir,
+            vault_index: VaultIndex::default(),
+            replays: Vec::new(),
+            replay_search: String::new(),
+            replay_download_code: String::new(),
             replay_selected: 0,
             replay_scroll: 0,
             keys_capture: None,
@@ -324,6 +338,8 @@ impl MenuState {
             status_err: false,
             map_count,
         };
+        #[cfg(not(test))]
+        st.refresh_replays(opts.screen == ScreenId::Replays);
         st.ensure_lobby_preview_image();
         if let Some(ref target) = opts.connect_lobby {
             st.mp_join_addr = target.clone();
@@ -457,6 +473,74 @@ impl MenuState {
         self.focus = FocusField::None;
     }
 
+    fn refresh_replays(&mut self, full_index: bool) {
+        let game_opt = self.game_dir.is_dir().then_some(self.game_dir.as_path());
+        self.vault_index = VaultIndex::load_or_empty(&self.vault_dir);
+        let _ = self.vault_index.sync(
+            &self.vault_dir,
+            game_opt,
+            vault::SyncOptions {
+                run_sim: full_index,
+                generate_thumbs: full_index,
+                force_rebuild: false,
+            },
+        );
+        self.apply_replay_filter();
+        if full_index {
+            self.ensure_replay_thumbnails();
+        }
+    }
+
+    fn apply_replay_filter(&mut self) {
+        let q = VaultQuery::parse(&self.replay_search);
+        let selected_name = self
+            .replays
+            .get(self.replay_selected)
+            .map(|r| r.entry.file_name.clone());
+        self.replays = self
+            .vault_index
+            .search(&q)
+            .into_iter()
+            .map(|e| ReplayItem {
+                path: e.path_in(&self.vault_dir),
+                thumb_key: format!("rthumb:{:016x}", e.content_hash),
+                entry: e.clone(),
+            })
+            .collect();
+        if let Some(name) = selected_name
+            && let Some(pos) = self.replays.iter().position(|r| r.entry.file_name == name)
+        {
+            self.replay_selected = pos;
+        } else if self.replay_selected >= self.replays.len() {
+            self.replay_selected = 0;
+        }
+        let max_scroll = self.replays.len().saturating_sub(1);
+        self.replay_scroll = self.replay_scroll.min(max_scroll);
+    }
+
+    fn ensure_replay_thumbnails(&mut self) {
+        let game_opt = self.game_dir.is_dir().then_some(self.game_dir.as_path());
+        for it in &self.replays {
+            if self.images.contains(&it.thumb_key) {
+                continue;
+            }
+            let loaded = it
+                .entry
+                .thumb_path_in(&self.vault_dir)
+                .and_then(|p| vault::load_rgba_png(&p).ok());
+            let img = loaded.unwrap_or_else(|| {
+                vault::render_thumbnail(
+                    game_opt,
+                    &it.entry.map_id,
+                    &it.entry.setups(),
+                    it.entry.winner.as_ref().and_then(|w| w.army_id()),
+                    None,
+                )
+            });
+            self.images.insert(&it.thumb_key, img);
+        }
+    }
+
     fn navigate(&mut self, to: ScreenId) {
         self.focus = FocusField::None;
         let from = self.screen;
@@ -478,11 +562,18 @@ impl MenuState {
                 self.set_status("Click a binding and press a key (Shift+click adds an alternative)", false);
             }
             ScreenId::Replays => {
-                self.replays = scan_replays();
-                if self.replay_selected >= self.replays.len() {
-                    self.replay_selected = 0;
-                }
-                self.set_status(format!("{} replay file(s) found", self.replays.len()), false);
+                #[cfg(not(test))]
+                self.refresh_replays(true);
+                #[cfg(test)]
+                self.apply_replay_filter();
+                self.set_status(
+                    format!(
+                        "{} replay(s) in vault ({})",
+                        self.replays.len(),
+                        self.vault_dir.display()
+                    ),
+                    false,
+                );
             }
             ScreenId::Skirmish => {
                 if let Some(ref mut lob) = self.lobby {
@@ -1009,109 +1100,328 @@ impl MenuState {
         c.footer_status(&f, &bar_msg, if self.status_err { theme::BAD } else { theme::DIM });
     }
 
-    // ---- Replay Browser ------------------------------------------------------
+    // ---- Replay Vault Browser (Phase 20 / 47) --------------------------------
 
     fn replay_widgets(&self, w: f32, h: f32) -> Vec<(Rect, Action)> {
         let f = Frame::new(w, h);
         let c = f.content;
-        let list_w = (c.w * 0.44).clamp(320.0, 560.0);
+        let list_w = (c.w * 0.45).clamp(350.0, 560.0);
         let mut out = Vec::new();
-        let row_y0 = c.y + 52.0;
-        let max_rows = ((c.h - 68.0) / 28.0).floor().max(1.0) as usize;
+
+        // Search input + optional Clear button at top of left list panel.
+        let search_y = c.y + 42.0;
+        let has_search = !self.replay_search.is_empty();
+        let clear_w = if has_search { 56.0 } else { 0.0 };
+        let search_w = (list_w - 24.0 - if has_search { clear_w + 6.0 } else { 0.0 }).max(120.0);
+        out.push((
+            Rect::new(c.x + 12.0, search_y, search_w, 28.0),
+            Action::Focus(FocusField::ReplaySearch),
+        ));
+        if has_search {
+            out.push((
+                Rect::new(c.x + 12.0 + search_w + 6.0, search_y, clear_w, 28.0),
+                Action::ClearReplaySearch,
+            ));
+        }
+
+        // Scrollable replay rows (each 56px tall with 48x48 thumbnail).
+        let row_y0 = search_y + 36.0;
+        let row_step = 60.0;
+        let max_rows = ((c.bottom() - 10.0 - row_y0) / row_step).floor().max(1.0) as usize;
         for r in 0..max_rows {
             let idx = self.replay_scroll + r;
             if idx >= self.replays.len() {
                 break;
             }
+            let ry = row_y0 + r as f32 * row_step;
+            if ry + 56.0 > c.bottom() - 6.0 {
+                break;
+            }
             out.push((
-                Rect::new(c.x + 12.0, row_y0 + r as f32 * 28.0, list_w - 24.0, 25.0),
+                Rect::new(c.x + 12.0, ry, list_w - 24.0, 56.0),
                 Action::SelectReplay(idx),
             ));
         }
+
+        // Right panel: bookmark buttons + bottom Share / Download bar.
+        let rx = cnt_right_x(c.x, list_w);
+        let rw = (c.right() - rx).max(260.0);
+        let det_x = rx + 14.0;
+        let det_w = (rw - 28.0).max(220.0);
+
+        let share_bar_y = c.bottom() - 42.0;
         let has_sel = self.replays.get(self.replay_selected).is_some();
-        out.push((f.footer_button(0, false, 160.0), Action::BackToMain));
-        out.push((f.footer_button(1, false, 160.0), Action::RefreshReplays));
+
+        // Clickable event bookmarks inside the details panel (between armies and share bar).
+        if let Some(it) = self.replays.get(self.replay_selected) {
+            let bm_y0 = replay_bookmarks_top(c.y, &it.entry);
+            let max_bm_y = share_bar_y - 16.0;
+            let mut by = bm_y0 + 22.0;
+            for (bi, _) in it.entry.bookmarks.iter().enumerate() {
+                if by + 22.0 > max_bm_y {
+                    break;
+                }
+                out.push((
+                    Rect::new(det_x, by, det_w, 21.0),
+                    Action::WatchReplayBookmark(bi),
+                ));
+                by += 24.0;
+            }
+        }
+
+        // Share / Download-by-code controls along bottom of right details panel.
+        let share_btn_w = if has_sel { 112.0 } else { 0.0 };
+        let dl_btn_w = 112.0;
+        let gap = 8.0;
+        let mut sx = det_x;
         if has_sel {
-            out.push((f.footer_button(1, true, 190.0), Action::VerifyReplay));
-            out.push((f.footer_button(0, true, 190.0), Action::WatchReplay));
+            out.push((Rect::new(sx, share_bar_y, share_btn_w, 30.0), Action::ShareReplay));
+            sx += share_btn_w + gap;
+        }
+        let code_w = (det_x + det_w - sx - dl_btn_w - gap).max(90.0);
+        out.push((
+            Rect::new(sx, share_bar_y, code_w, 30.0),
+            Action::Focus(FocusField::ReplayDownloadCode),
+        ));
+        out.push((
+            Rect::new(sx + code_w + gap, share_bar_y, dl_btn_w, 30.0),
+            Action::DownloadReplay,
+        ));
+
+        // Footer buttons.
+        out.push((f.footer_button(0, false, 150.0), Action::BackToMain));
+        out.push((f.footer_button(1, false, 150.0), Action::RefreshReplays));
+        if has_sel {
+            out.push((f.footer_button(1, true, 180.0), Action::VerifyReplay));
+            out.push((f.footer_button(0, true, 180.0), Action::WatchReplay));
         }
         out
     }
 
     fn draw_replays(&self, c: &mut Canvas) {
         let f = Frame::new(c.w, c.h);
-        c.chrome(&f, "REPLAYS", &format!("{} saved replays", self.replays.len()));
+        let total = self.vault_index.entries.len().max(self.replays.len());
+        let subtitle = if self.replay_search.is_empty() {
+            format!("{} replays in vault", self.replays.len())
+        } else {
+            format!("{} of {} replays matching filter", self.replays.len(), total)
+        };
+        c.chrome(&f, "REPLAY VAULT", &subtitle);
         let cnt = f.content;
-        let list_w = (cnt.w * 0.44).clamp(320.0, 560.0);
+        let list_w = (cnt.w * 0.45).clamp(350.0, 560.0);
         let list_r = Rect::new(cnt.x, cnt.y, list_w, cnt.h);
         c.titled_panel(list_r, "RECORDED MATCHES");
 
+        let rx = cnt_right_x(cnt.x, list_w);
+        let rw = (cnt.right() - rx).max(260.0);
+        let det_in = c.titled_panel(Rect::new(rx, cnt.y, rw, cnt.h), "REPLAY DETAILS");
+
         if self.replays.is_empty() {
-            c.text(cnt.x + 16.0, cnt.y + 62.0, body(15.0), "No .farust-replay files found.", theme::DIM);
-            c.text(cnt.x + 16.0, cnt.y + 88.0, body(14.0), "Matches auto-record to fa-unpack/replays/.", theme::DIM);
+            let msg = if self.replay_search.is_empty() {
+                "No .farust-replay files in vault."
+            } else {
+                "No replays match the search filter."
+            };
+            c.text(cnt.x + 16.0, cnt.y + 92.0, body(15.0), msg, theme::DIM);
+            c.text(
+                cnt.x + 16.0,
+                cnt.y + 118.0,
+                body(13.0),
+                "Filter tips: map:SCMP_009  faction:uef  winner:cybran  from:2026-01-01",
+                theme::FAINT,
+            );
         }
 
-        let mut actions_seen = false;
+        // Details panel metadata, big thumbnail, armies, bookmarks header.
+        if let Some(it) = self.replays.get(self.replay_selected) {
+            let e = &it.entry;
+            let thumb_sz = 148.0f32.min((det_in.w * 0.34).max(110.0));
+            let thumb_r = Rect::new(det_in.x, det_in.y + 4.0, thumb_sz, thumb_sz);
+            c.rect(thumb_r, theme::FIELD);
+            if !c.image(&it.thumb_key, thumb_r.inset(1.0), [1.0; 4]) {
+                c.text_in(thumb_r, body(12.0), &e.map_id, theme::DIM, Align::Center);
+            }
+            c.outline(thumb_r, 1.5, theme::BORDER);
+
+            let mx = thumb_r.right() + 14.0;
+            let mw = (det_in.right() - mx).max(120.0);
+            let mut my = det_in.y + 4.0;
+            let map_line = if e.map_name.eq_ignore_ascii_case(&e.map_id) {
+                e.map_id.clone()
+            } else {
+                format!("{} ({})", e.map_name, e.map_id)
+            };
+            c.text(mx, my, bold(16.0), &c.fonts.fit(bold(16.0), &map_line, mw), theme::GOLD);
+            my += 23.0;
+
+            let rules_col = if e.needs_older_build() { theme::BAD } else { theme::GOOD };
+            let win_col = if e.winner.is_some() { theme::GOOD } else { theme::DIM };
+            let rows: Vec<(&str, String, [f32; 4])> = vec![
+                ("Date", vault::format_utc_datetime(e.mtime_secs), theme::TEXT),
+                ("Duration", format!("{} ({} ticks)", e.duration_mmss(), e.duration_ticks), theme::ACCENT),
+                ("Winner", e.winner_label(), win_col),
+                ("Rules", e.rules_status(), rules_col),
+                ("Size", format!("{:.1} KiB · {} cmds", e.file_size as f64 / 1024.0, e.commands), theme::TEXT),
+                (
+                    "Mode",
+                    match &e.mission_name {
+                        Some(m) => format!("Mission: {m}"),
+                        None if !e.mods.is_empty() => format!("{} · {} mod(s)", e.victory.label(), e.mods.len()),
+                        None => format!("{} · Cap {}", e.victory.label(), if e.unit_cap == 0 { "Unlim".into() } else { e.unit_cap.to_string() }),
+                    },
+                    theme::TEXT,
+                ),
+            ];
+            for (k, v, col) in rows {
+                c.text(mx, my, bold(13.0), k, theme::DIM);
+                let val_r = Rect::new(mx + 74.0, my - 1.0, (mw - 74.0).max(40.0), 19.0);
+                let fit = c.fonts.fit(body(13.0), &v, val_r.w);
+                c.text_in(val_r, body(13.0), &fit, col, Align::Left);
+                my += 20.0;
+            }
+            if let Some(ref code) = e.share_code {
+                c.text(mx, my, bold(13.0), "Share", theme::DIM);
+                c.text(mx + 74.0, my, bold(13.0), code, theme::GOLD);
+            }
+
+            // Armies section below thumbnail.
+            let mut ay = det_in.y + 162.0;
+            c.text(det_in.x, ay, bold(13.0), "ARMIES", theme::GOLD);
+            ay += 20.0;
+            let cols = if e.armies.len() > 2 { 2 } else { 1 };
+            let col_w = det_in.w / cols as f32;
+            let win_id = e.winner.as_ref().and_then(|w| w.army_id());
+            for (i, a) in e.armies.iter().enumerate() {
+                let col = i % cols;
+                let row = i / cols;
+                let ax = det_in.x + col as f32 * col_w;
+                let ry = ay + row as f32 * 20.0;
+                c.rect(Rect::new(ax, ry + 3.0, 11.0, 11.0), theme::SLOT_COLORS[i % 8]);
+                let tag = if win_id == Some(i as u8) { " [WIN]" } else { "" };
+                let line = format!("{} ({}, T{}){tag}", a.name, vault::sim_faction_label(a.faction), a.team + 1);
+                let fit = c.fonts.fit(body(13.0), &line, col_w - 22.0);
+                c.text(ax + 17.0, ry, body(13.0), &fit, if !tag.is_empty() { theme::GOOD } else { theme::TEXT });
+            }
+
+            // Event bookmarks header (rows are painted in the widget pass below).
+            let bm_y = replay_bookmarks_top(cnt.y, e);
+            c.text(
+                det_in.x,
+                bm_y,
+                bold(13.0),
+                &format!("EVENT BOOKMARKS ({}) — click to jump", e.bookmarks.len()),
+                theme::GOLD,
+            );
+            if e.bookmarks.is_empty() {
+                let hint = if e.needs_older_build() {
+                    "Re-sim unavailable: recorded under older sim rules."
+                } else if !e.sim_indexed {
+                    "Click REFRESH to analyze match events."
+                } else {
+                    "No major bookmark events recorded in this replay."
+                };
+                c.text(det_in.x, bm_y + 22.0, body(13.0), hint, theme::DIM);
+            }
+        } else {
+            c.text(det_in.x, det_in.y + 12.0, body(15.0), "Select a replay on the left, or download by share code below.", theme::DIM);
+        }
+
+        // Paint interactive widgets (search box, list rows with thumbnails, bookmarks, share/download, footer).
         for (r, act) in self.replay_widgets(c.w, c.h) {
             let st = WState { hover: c.is_hover(r), ..Default::default() };
             match act {
+                Action::Focus(FocusField::ReplaySearch) => {
+                    c.text_field(
+                        r,
+                        &self.replay_search,
+                        self.focus == FocusField::ReplaySearch,
+                        "Search map, player, faction, winner, from:YYYY-MM-DD...",
+                        st,
+                    );
+                }
+                Action::ClearReplaySearch => c.button(r, "CLR", st),
                 Action::SelectReplay(idx) => {
-                    actions_seen = true;
                     let it = &self.replays[idx];
+                    let e = &it.entry;
                     let sel = idx == self.replay_selected;
                     c.list_row(r, sel, st.hover);
-                    let secs = it.replay.final_tick / crate::sim::TICK_HZ;
-                    let left = c.fonts.fit(body(14.0), &it.name, r.w - 130.0);
-                    let right = format!("{}  {:02}:{:02}", it.replay.header.map_id, secs / 60, secs % 60);
-                    c.text_in(Rect::new(r.x + 8.0, r.y, r.w - 130.0, r.h), body(14.0), &left, if sel { theme::TEXT } else { theme::DIM }, Align::Left);
-                    c.text_in(Rect::new(r.right() - 122.0, r.y, 114.0, r.h), body(13.0), &right, theme::ACCENT, Align::Right);
+                    let tr = Rect::new(r.x + 4.0, r.y + 4.0, 48.0, 48.0);
+                    c.rect(tr, theme::FIELD);
+                    if !c.image(&it.thumb_key, tr.inset(1.0), [1.0; 4]) {
+                        c.text_in(tr, body(10.0), "MAP", theme::FAINT, Align::Center);
+                    }
+                    c.outline(tr, 1.0, if sel { theme::ACCENT } else { theme::BORDER });
+
+                    let tx = tr.right() + 8.0;
+                    let tw = (r.right() - tx - 8.0).max(60.0);
+                    let dur_text = e.duration_mmss();
+                    let top_title = if e.map_name.eq_ignore_ascii_case(&e.map_id) {
+                        e.map_id.clone()
+                    } else {
+                        format!("{} ({})", e.map_name, e.map_id)
+                    };
+                    let fit_top = c.fonts.fit(bold(13.5), &top_title, (tw - 58.0).max(40.0));
+                    c.text(tx, r.y + 4.0, bold(13.5), &fit_top, if sel { theme::TEXT } else { theme::DIM });
+                    c.text_in(
+                        Rect::new(r.right() - 60.0, r.y + 4.0, 52.0, 18.0),
+                        body(12.5),
+                        &dur_text,
+                        theme::ACCENT,
+                        Align::Right,
+                    );
+
+                    let mid = c.fonts.fit(body(12.0), &e.armies_summary(), tw);
+                    c.text(tx, r.y + 22.0, body(12.0), &mid, theme::DIM);
+
+                    let mut meta_parts = vec![e.date_ymd.clone()];
+                    if let Some(ref w) = e.winner {
+                        meta_parts.push(format!("Win:{}", w.short_label()));
+                    }
+                    if !e.bookmarks.is_empty() {
+                        meta_parts.push(format!("{} BM", e.bookmarks.len()));
+                    }
+                    if let Some(ref sc) = e.share_code {
+                        meta_parts.push(sc.clone());
+                    }
+                    if e.needs_older_build() {
+                        meta_parts.push(format!("OLD v{}", e.rules));
+                    }
+                    let bot = c.fonts.fit(body(11.5), &meta_parts.join(" · "), tw);
+                    let bot_col = if e.needs_older_build() { theme::BAD } else { theme::GOLD };
+                    c.text(tx, r.y + 39.0, body(11.5), &bot, bot_col);
                 }
+                Action::WatchReplayBookmark(bi) => {
+                    if let Some(it) = self.replays.get(self.replay_selected)
+                        && let Some(bm) = it.entry.bookmarks.get(bi)
+                    {
+                        c.list_row(r, false, st.hover);
+                        let pill = Rect::new(r.x + 3.0, r.y + 3.0, 44.0, r.h - 6.0);
+                        c.rect(pill, bm.kind.color());
+                        c.text_in(pill, bold(10.5), bm.kind.tag(), [0.05, 0.06, 0.08, 1.0], Align::Center);
+                        let ts = crate::controls::fmt_ticks(bm.tick);
+                        c.text(pill.right() + 6.0, r.y + 3.0, bold(12.0), &ts, theme::ACCENT);
+                        let lx = pill.right() + 56.0;
+                        let fit = c.fonts.fit(body(12.5), &bm.label, (r.right() - lx - 6.0).max(40.0));
+                        c.text(lx, r.y + 3.0, body(12.5), &fit, theme::TEXT);
+                    }
+                }
+                Action::ShareReplay => c.button(r, "SHARE", st),
+                Action::Focus(FocusField::ReplayDownloadCode) => {
+                    c.text_field(
+                        r,
+                        &self.replay_download_code,
+                        self.focus == FocusField::ReplayDownloadCode,
+                        "Download code (XXXX-XXXX)",
+                        st,
+                    );
+                }
+                Action::DownloadReplay => c.button(r, "DOWNLOAD", st),
                 Action::BackToMain => c.button(r, "BACK", st),
                 Action::RefreshReplays => c.button(r, "REFRESH", st),
                 Action::VerifyReplay => c.button(r, "VERIFY HASH", st),
                 Action::WatchReplay => c.button(r, "WATCH REPLAY", WState { primary: true, ..st }),
                 _ => {}
             }
-        }
-        let _ = actions_seen;
-
-        let rx = cnt.x + list_w + 20.0;
-        let rw = (cnt.right() - rx).max(200.0);
-        let det_in = c.titled_panel(Rect::new(rx, cnt.y, rw, cnt.h), "REPLAY DETAILS");
-        if let Some(it) = self.replays.get(self.replay_selected) {
-            let rep = &it.replay;
-            let secs = rep.final_tick / crate::sim::TICK_HZ;
-            let cap = if rep.header.options.unit_cap == 0 {
-                "Unlimited".to_string()
-            } else {
-                rep.header.options.unit_cap.to_string()
-            };
-            let mut y = det_in.y + 4.0;
-            for (k, v) in [
-                ("File", it.path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()),
-                ("Map", rep.header.map_id.clone()),
-                ("Duration", format!("{:02}:{:02} ({} ticks)", secs / 60, secs % 60, rep.final_tick)),
-                ("Victory", rep.header.options.victory.label().to_string()),
-                ("Unit Cap", cap),
-                ("Seed", rep.header.seed.to_string()),
-                ("Commands", rep.commands.len().to_string()),
-                ("Checkpoints", rep.checkpoints.len().to_string()),
-                ("Final Hash", format!("{:016x}", rep.final_hash)),
-            ] {
-                c.text(det_in.x, y, bold(14.0), k, theme::DIM);
-                c.text_in(Rect::new(det_in.x + 120.0, y - 2.0, det_in.w - 120.0, 22.0), body(14.0), &c.fonts.fit(body(14.0), &v, det_in.w - 124.0), theme::TEXT, Align::Left);
-                y += 26.0;
-            }
-            y += 10.0;
-            c.text(det_in.x, y, bold(14.0), "ARMIES", theme::GOLD);
-            y += 24.0;
-            for (i, a) in rep.header.setups.iter().enumerate() {
-                c.rect(Rect::new(det_in.x, y + 3.0, 12.0, 12.0), theme::SLOT_COLORS[i % 8]);
-                c.text(det_in.x + 20.0, y, body(14.0), &format!("{}  ({})  Team {}", a.name, faction_label(a.faction), a.team + 1), theme::TEXT);
-                y += 22.0;
-            }
-        } else {
-            c.text(det_in.x, det_in.y + 12.0, body(15.0), "Select a replay on the left.", theme::DIM);
         }
         c.footer_status(&f, &self.status, if self.status_err { theme::BAD } else { theme::GOOD });
     }
@@ -1450,22 +1760,25 @@ impl MenuState {
             Action::SelectReplay(idx) => {
                 if idx < self.replays.len() {
                     self.replay_selected = idx;
-                    self.set_status("Ready to verify or watch replay", false);
+                    self.set_status("Ready to verify, watch, or share replay", false);
                 }
             }
+            Action::ClearReplaySearch => {
+                self.replay_search.clear();
+                self.apply_replay_filter();
+                self.set_status("Search cleared", false);
+            }
             Action::RefreshReplays => {
-                self.replays = scan_replays();
-                if self.replay_selected >= self.replays.len() {
-                    self.replay_selected = 0;
-                }
-                self.set_status(format!("Refreshed ({} replays)", self.replays.len()), false);
+                self.refresh_replays(true);
+                self.set_status(format!("Vault refreshed ({} replays)", self.replays.len()), false);
             }
             Action::VerifyReplay => {
                 if let Some(it) = self.replays.get(self.replay_selected) {
                     let t0 = Instant::now();
-                    let res = Catalog::load(&self.game_dir).and_then(|cat| {
-                        let map = MapContext::load(&self.game_dir, &it.replay.header.map_id)?;
-                        it.replay.verify(cat, &map)
+                    let res = Replay::load(&it.path).and_then(|rep| {
+                        let cat = Catalog::load(&self.game_dir)?;
+                        let map = MapContext::load(&self.game_dir, &rep.header.map_id)?;
+                        rep.verify(cat, &map)
                     });
                     match res {
                         Ok(r) => self.set_status(
@@ -1478,9 +1791,48 @@ impl MenuState {
             }
             Action::WatchReplay => {
                 if let Some(it) = self.replays.get(self.replay_selected).cloned() {
-                    return MenuEvent::StartReplay(it.replay);
+                    match Replay::load(&it.path) {
+                        Ok(rep) => return MenuEvent::StartReplay(Box::new(rep), it.entry.bookmarks, None),
+                        Err(e) => self.set_status(format!("Cannot open replay: {e}"), true),
+                    }
                 }
             }
+            Action::WatchReplayBookmark(bi) => {
+                if let Some(it) = self.replays.get(self.replay_selected).cloned() {
+                    match Replay::load(&it.path) {
+                        Ok(rep) => return MenuEvent::StartReplay(Box::new(rep), it.entry.bookmarks, Some(bi)),
+                        Err(e) => self.set_status(format!("Cannot open replay: {e}"), true),
+                    }
+                }
+            }
+            Action::ShareReplay => {
+                if let Some(it) = self.replays.get(self.replay_selected).cloned() {
+                    let rv = if !self.mp_rendezvous.trim().is_empty() {
+                        self.mp_rendezvous.trim().to_string()
+                    } else {
+                        settings::effective_rendezvous(Some(&self.settings))
+                    };
+                    match std::fs::read(&it.path)
+                        .map_err(|e| format!("read {}: {e}", it.path.display()))
+                        .and_then(|bytes| crate::rendezvous::upload_replay(&rv, &bytes, Duration::from_secs(10)))
+                    {
+                        Ok(up) => {
+                            if self.vault_index.set_share_code(&it.entry.file_name, &up.code) {
+                                let _ = self.vault_index.save(&self.vault_dir);
+                                self.apply_replay_filter();
+                            }
+                            let copied = copy_to_clipboard(&up.code);
+                            let note = if copied { " (copied)" } else { "" };
+                            self.set_status(
+                                format!("Shared! Code: {}{note} ({:.1} KiB)", up.code, up.size as f64 / 1024.0),
+                                false,
+                            );
+                        }
+                        Err(e) => self.set_status(format!("Share failed: {e}"), true),
+                    }
+                }
+            }
+            Action::DownloadReplay => self.download_replay_by_code(),
             Action::CycleResolution => {
                 let i = RESOLUTIONS.iter().position(|r| *r == self.draft.resolution).unwrap_or(0);
                 self.draft.resolution = RESOLUTIONS[(i + 1) % RESOLUTIONS.len()];
@@ -1760,6 +2112,47 @@ impl MenuState {
         }
     }
 
+    fn download_replay_by_code(&mut self) {
+        let code = self.replay_download_code.trim().to_string();
+        if code.is_empty() {
+            self.set_status("Enter a share code (XXXX-XXXX) to download", true);
+            return;
+        }
+        let rv = if !self.mp_rendezvous.trim().is_empty() {
+            self.mp_rendezvous.trim().to_string()
+        } else {
+            settings::effective_rendezvous(Some(&self.settings))
+        };
+        match crate::rendezvous::download_replay_into_vault(
+            &rv,
+            &code,
+            &self.vault_dir,
+            Duration::from_secs(10),
+        ) {
+            Ok((saved, dl)) => {
+                self.replay_download_code.clear();
+                self.refresh_replays(true);
+                if let Some(fname) = saved.file_name().map(|s| s.to_string_lossy().to_string()) {
+                    if self.vault_index.set_share_code(&fname, &dl.code) {
+                        let _ = self.vault_index.save(&self.vault_dir);
+                        self.apply_replay_filter();
+                    }
+                    if let Some(pos) = self.replays.iter().position(|r| r.entry.file_name == fname) {
+                        self.replay_selected = pos;
+                    }
+                }
+                self.set_status(
+                    format!(
+                        "Downloaded {} ({}, {} ticks) into vault",
+                        dl.code, dl.replay.header.map_id, dl.replay.final_tick
+                    ),
+                    false,
+                );
+            }
+            Err(e) => self.set_status(format!("Download failed: {e}"), true),
+        }
+    }
+
     fn active_field_mut(&mut self) -> Option<&mut String> {
         match self.focus {
             FocusField::MpHostAddr => Some(&mut self.mp_host_addr),
@@ -1768,9 +2161,25 @@ impl MenuState {
             FocusField::MpChat => Some(&mut self.mp_chat_input),
             FocusField::OptPlayerName => Some(&mut self.draft.player_name),
             FocusField::OptLastHost => Some(&mut self.draft.last_host),
+            FocusField::ReplaySearch => Some(&mut self.replay_search),
+            FocusField::ReplayDownloadCode => Some(&mut self.replay_download_code),
             FocusField::None => None,
         }
     }
+}
+
+fn cnt_right_x(cx: f32, list_w: f32) -> f32 {
+    cx + list_w + 18.0
+}
+
+fn replay_bookmarks_top(cnt_y: f32, e: &VaultEntry) -> f32 {
+    let det_top = cnt_y + 40.0;
+    let army_rows = if e.armies.len() > 2 {
+        e.armies.len().div_ceil(2)
+    } else {
+        e.armies.len()
+    };
+    det_top + 162.0 + 20.0 + army_rows as f32 * 20.0 + 10.0
 }
 
 fn copy_to_clipboard(text: &str) -> bool {
@@ -1804,7 +2213,7 @@ enum MenuEvent {
     Quit,
     SettingsChanged,
     StartSkirmish(crate::lobby::LobbyLaunch),
-    StartReplay(Replay),
+    StartReplay(Box<Replay>, Vec<Bookmark>, Option<usize>),
     StartTutorial,
 }
 
@@ -1891,8 +2300,8 @@ impl ShellApp {
                 }
                 Err(e) => self.state.set_status(format!("Tutorial failed: {e}"), true),
             },
-            MenuEvent::StartReplay(rep) => {
-                match build_replay_from_menu(&self.state.game_dir, rep) {
+            MenuEvent::StartReplay(rep, bookmarks, jump_bm) => {
+                match build_replay_from_menu(&self.state.game_dir, *rep, bookmarks, jump_bm) {
                     Ok((mut sess, map, meshes)) => {
                         sess.muted = self.state.settings.master_volume == 0;
                         self.enter_match(event_loop, sess, map, meshes);
@@ -2118,29 +2527,38 @@ impl ApplicationHandler for ShellApp {
                         PhysicalKey::Code(KeyCode::Enter | KeyCode::NumpadEnter) => {
                             if self.state.focus == FocusField::MpChat {
                                 self.state.submit_mp_chat();
+                            } else if self.state.focus == FocusField::ReplayDownloadCode {
+                                self.state.download_replay_by_code();
+                                self.state.focus = FocusField::None;
                             } else {
                                 self.state.focus = FocusField::None;
                             }
                             redraw = true;
                         }
                         PhysicalKey::Code(KeyCode::Backspace) => {
+                            let is_search = self.state.focus == FocusField::ReplaySearch;
                             if let Some(f) = self.state.active_field_mut() {
                                 f.pop();
+                            }
+                            if is_search {
+                                self.state.apply_replay_filter();
                             }
                             redraw = true;
                         }
                         _ => {
-                            if let Some(t) = &event.text
-                                && let Some(f) = self.state.active_field_mut()
-                            {
-                                for ch in t.chars() {
-                                    if ch.is_ascii_graphic() || ch == ' ' {
-                                        if f.len() < 48 {
+                            if let Some(t) = &event.text {
+                                let is_search = self.state.focus == FocusField::ReplaySearch;
+                                if let Some(f) = self.state.active_field_mut() {
+                                    for ch in t.chars() {
+                                        if (ch.is_ascii_graphic() || ch == ' ') && f.len() < 48 {
                                             f.push(ch);
                                         }
                                     }
+                                    if is_search {
+                                        self.state.apply_replay_filter();
+                                    }
+                                    redraw = true;
                                 }
-                                redraw = true;
                             }
                         }
                     }
@@ -2253,12 +2671,21 @@ fn build_tutorial_from_menu(game_dir: &Path) -> Result<(PlaySession, MapContext,
 fn build_replay_from_menu(
     game_dir: &Path,
     rep: Replay,
+    bookmarks: Vec<Bookmark>,
+    jump_bm: Option<usize>,
 ) -> Result<(PlaySession, MapContext, UnitMeshCache), String> {
     let catalog = Catalog::load(game_dir)?;
     let map = MapContext::load(game_dir, &rep.header.map_id)?;
     let meshes = UnitMeshCache::load(Some(game_dir), &catalog);
     let world = savegame::origin_world(catalog, &map, &rep)?;
-    Ok((PlaySession::new_replay(world, rep, 1), map, meshes))
+    let mut session = PlaySession::new_replay(world, rep, 1);
+    if !bookmarks.is_empty() {
+        session.set_replay_bookmarks(bookmarks);
+    }
+    if let Some(bi) = jump_bm {
+        session.jump_to_bookmark(bi);
+    }
+    Ok((session, map, meshes))
 }
 
 fn start_net_host_match(
@@ -2293,44 +2720,6 @@ fn start_net_client_match(
     Ok((session, map, meshes))
 }
 
-fn scan_replays() -> Vec<ReplayItem> {
-    let mut dirs = Vec::new();
-    let d_replays = savegame::data_dir("replays");
-    if d_replays.is_dir() {
-        dirs.push(d_replays);
-    }
-    let cwd = PathBuf::from(".");
-    if cwd.is_dir() {
-        dirs.push(cwd);
-    }
-    let mut seen = BTreeSet::new();
-    let mut out = Vec::new();
-    for dir in dirs {
-        let Ok(rd) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in rd.filter_map(Result::ok) {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some(savegame::REPLAY_EXT) {
-                continue;
-            }
-            let key = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
-            if !seen.insert(key) {
-                continue;
-            }
-            if let Ok(replay) = Replay::load(&path) {
-                let name = path
-                    .file_stem()
-                    .map(|s| s.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "replay".into());
-                out.push(ReplayItem { path, name, replay });
-            }
-        }
-    }
-    out.sort_by(|a, b| b.name.cmp(&a.name));
-    out
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -2338,9 +2727,46 @@ fn scan_replays() -> Vec<ReplayItem> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::replay::{ReplayHeader, ReplayRecorder};
-    use crate::skirmish::ArmySetup;
+    use crate::replay::ReplayHeader;
     use crate::ui_kit::hit_test;
+
+    fn sample_vault_entry(name: &str, map_id: &str) -> VaultEntry {
+        VaultEntry {
+            file_name: name.into(),
+            file_size: 2048,
+            mtime_secs: 1_760_000_000,
+            mtime_nanos: 0,
+            content_hash: 0x1234_5678,
+            map_id: map_id.into(),
+            map_name: format!("{map_id} Valley"),
+            date_ymd: "2026-10-09".into(),
+            duration_ticks: 1800,
+            seed: 42,
+            victory: VictoryCondition::Assassination,
+            unit_cap: 500,
+            rules: crate::skirmish::RULES_VERSION,
+            armies: vec![
+                vault::VaultArmy { name: "Alpha".into(), faction: 0, team: 0, start: (0, 0) },
+                vault::VaultArmy { name: "Beta".into(), faction: 2, team: 1, start: (1000, 1000) },
+            ],
+            winner: Some(vault::VaultWinner::Army { id: 0, name: "Alpha".into(), faction: 0, team: 0 }),
+            mods: vec![],
+            mission_name: None,
+            commands: 42,
+            checkpoints: 6,
+            final_hash: 0x1234,
+            bookmarks: vec![vault::Bookmark {
+                tick: 1750,
+                kind: vault::BookmarkKind::AcuDeath,
+                army: Some(1),
+                pos: (1000, 1000),
+                label: "Beta (Cybran) ACU destroyed".into(),
+            }],
+            sim_indexed: true,
+            thumb_file: None,
+            share_code: Some("ABCD-2345".into()),
+        }
+    }
 
     #[test]
     fn screen_id_parses_all_variants() {
@@ -2362,19 +2788,12 @@ mod tests {
             &MenuOptions::default(),
         )
         .unwrap();
-        let rep = ReplayRecorder::new(
-            "SCMP_001",
-            42,
-            vec![
-                ArmySetup { name: "A".into(), faction: 0, start: (0, 0), team: 0 },
-                ArmySetup { name: "B".into(), faction: 1, start: (1000, 1000), team: 1 },
-            ],
-        )
-        .finish(600, 0x1234);
+        let entry = sample_vault_entry("test.farust-replay", "SCMP_001");
+        st.vault_index.entries.push(entry.clone());
         st.replays.push(ReplayItem {
             path: PathBuf::from("/tmp/test.farust-replay"),
-            name: "test".into(),
-            replay: rep,
+            thumb_key: "rthumb:1234".into(),
+            entry,
         });
         st.lobby = Some(LobbyState::with_maps(
             Path::new("/nonexistent"),
@@ -2551,5 +2970,34 @@ mod tests {
         let mut c = Canvas::new(1280.0, 800.0, &st.fonts, &st.images, None);
         st.draw(&mut c);
         assert!(c.batches.iter().map(|b| b.idx.len()).sum::<usize>() > 100);
+    }
+
+    #[test]
+    fn replays_screen_filters_and_exposes_bookmarks_and_share_controls() {
+        let mut st = MenuState::new(Path::new("/nonexistent"), &MenuOptions::default()).unwrap();
+        st.vault_index.entries = vec![
+            sample_vault_entry("a.farust-replay", "SCMP_001"),
+            sample_vault_entry("b.farust-replay", "SCMP_009"),
+        ];
+        st.navigate(ScreenId::Replays);
+        assert_eq!(st.replays.len(), 2);
+
+        // Search filter narrows list live.
+        st.replay_search = "map:scmp_009".into();
+        st.apply_replay_filter();
+        assert_eq!(st.replays.len(), 1);
+        assert_eq!(st.replays[0].entry.map_id, "SCMP_009");
+
+        let ws = st.replay_widgets(1280.0, 800.0);
+        assert!(ws.iter().any(|(_, a)| matches!(a, Action::ClearReplaySearch)));
+        assert!(ws.iter().any(|(_, a)| matches!(a, Action::ShareReplay)));
+        assert!(ws.iter().any(|(_, a)| matches!(a, Action::DownloadReplay)));
+        assert!(ws.iter().any(|(_, a)| matches!(a, Action::WatchReplayBookmark(0))));
+
+        // Clicking Clear restores both replays.
+        let clr = ws.iter().find(|(_, a)| matches!(a, Action::ClearReplaySearch)).unwrap().0.center();
+        st.click(1280.0, 800.0, clr.0, clr.1);
+        assert!(st.replay_search.is_empty());
+        assert_eq!(st.replays.len(), 2);
     }
 }
