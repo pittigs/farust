@@ -926,12 +926,16 @@ struct Uniforms {
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
+@group(0) @binding(1) var t_vfx: texture_2d_array<f32>;
+@group(0) @binding(2) var s_vfx_clamp: sampler;
+@group(0) @binding(3) var s_vfx_repeat: sampler;
 
 struct VsIn {
     @location(0) position: vec3<f32>,
     @location(1) uv: vec2<f32>,
     @location(2) color: vec4<f32>,
     @location(3) mode: f32,
+    @location(4) tex_layer: u32,
 };
 
 struct VsOut {
@@ -939,6 +943,7 @@ struct VsOut {
     @location(0) uv: vec2<f32>,
     @location(1) color: vec4<f32>,
     @location(2) mode: f32,
+    @location(3) @interpolate(flat) tex_layer: u32,
 };
 
 @vertex
@@ -948,29 +953,65 @@ fn vs_main(in: VsIn) -> VsOut {
     out.uv = in.uv;
     out.color = in.color;
     out.mode = in.mode;
+    out.tex_layer = in.tex_layer;
     return out;
 }
 
+// Uses premultiplied alpha blending (ONE, ONE_MINUS_SRC_ALPHA):
+// - Alpha-blended particles return vec4(rgb * a, a)
+// - Additive particles return vec4(rgb * a, 0.0)
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    if (in.mode >= 3.5) {
+        let layer = i32(in.tex_layer);
+        var tex: vec4<f32>;
+        if (in.mode >= 5.5) {
+            tex = textureSampleLevel(t_vfx, s_vfx_repeat, in.uv, layer, 0.0);
+        } else {
+            tex = textureSampleLevel(t_vfx, s_vfx_clamp, in.uv, layer, 0.0);
+        }
+        let is_add = (in.mode >= 4.5 && in.mode < 5.5) || (in.mode >= 6.5);
+        let rgb = tex.rgb * in.color.rgb;
+        if (is_add) {
+            let a = max(tex.a, max(tex.r, max(tex.g, tex.b))) * in.color.a;
+            let out_rgb = rgb * a * 1.35;
+            if (max(out_rgb.r, max(out_rgb.g, out_rgb.b)) < 0.004) {
+                discard;
+            }
+            return vec4<f32>(out_rgb, 0.0);
+        } else {
+            let a = clamp(tex.a * in.color.a, 0.0, 1.0);
+            if (a < 0.01) {
+                discard;
+            }
+            return vec4<f32>(rgb * a, a);
+        }
+    }
+
     let centered = in.uv * 2.0 - vec2<f32>(1.0, 1.0);
     let d = length(centered);
     var mask = 0.0;
+    var is_add = false;
     if (in.mode >= 2.5) {
         mask = (1.0 - smoothstep(0.55, 1.0, d)) * (0.45 + 0.55 * smoothstep(0.15, 0.8, d));
     } else if (in.mode >= 1.5) {
         let ring = exp(-pow((d - 0.78) * 7.5, 2.0));
         mask = ring * (1.0 - smoothstep(0.90, 1.0, d));
+        is_add = true;
     } else if (in.mode >= 0.5) {
         mask = exp(-d * d * 3.0) * (1.0 - smoothstep(0.65, 1.0, d));
     } else {
         mask = pow(clamp(1.0 - d, 0.0, 1.0), 1.5);
+        is_add = true;
     }
     let a = mask * in.color.a;
     if (a < 0.01) {
         discard;
     }
-    return vec4<f32>(in.color.rgb, a);
+    if (is_add) {
+        return vec4<f32>(in.color.rgb * a, 0.0);
+    }
+    return vec4<f32>(in.color.rgb * a, a);
 }
 "#;
 
@@ -993,6 +1034,8 @@ pub(crate) struct GpuSceneResources {
     hud_icons_bind_group: wgpu::BindGroup,
     strat_icons_bind_group: wgpu::BindGroup,
     uniform_only_bg: wgpu::BindGroup,
+    vfx_bgl: wgpu::BindGroupLayout,
+    vfx_bind_group: wgpu::BindGroup,
 
     bone_bgl: wgpu::BindGroupLayout,
     #[allow(dead_code)]
@@ -1308,6 +1351,91 @@ fn create_rgba_bind_group(
             wgpu::BindGroupEntry {
                 binding: 2,
                 resource: wgpu::BindingResource::Sampler(sampler),
+            },
+        ],
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_vfx_array_bind_group(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    layout: &wgpu::BindGroupLayout,
+    uniform_buf: &wgpu::Buffer,
+    sampler_clamp: &wgpu::Sampler,
+    sampler_repeat: &wgpu::Sampler,
+    width: u32,
+    height: u32,
+    layers: &[RgbaImage],
+) -> wgpu::BindGroup {
+    let w = width.max(1);
+    let h = height.max(1);
+    let layer_count = layers.len().clamp(1, 256) as u32;
+    let tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("vfx_tex_array"),
+        size: wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: layer_count,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let expected = (w as usize) * (h as usize) * 4;
+    let fallback_pixels = vec![255u8; expected];
+    for (i, img) in layers.iter().take(layer_count as usize).enumerate() {
+        let data = if img.width == w && img.height == h && img.pixels.len() == expected {
+            img.pixels.as_slice()
+        } else {
+            fallback_pixels.as_slice()
+        };
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x: 0, y: 0, z: i as u32 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            data,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(w * 4),
+                rows_per_image: Some(h),
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+    let view = tex.create_view(&wgpu::TextureViewDescriptor {
+        dimension: Some(wgpu::TextureViewDimension::D2Array),
+        ..Default::default()
+    });
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("vfx_array_bg"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniform_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(&view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::Sampler(sampler_clamp),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::Sampler(sampler_repeat),
             },
         ],
     })
@@ -1726,6 +1854,11 @@ impl GpuSceneResources {
                     offset: 36,
                     shader_location: 3,
                     format: wgpu::VertexFormat::Float32,
+                },
+                wgpu::VertexAttribute {
+                    offset: 40,
+                    shader_location: 4,
+                    format: wgpu::VertexFormat::Uint32,
                 },
             ],
         };
@@ -2401,14 +2534,72 @@ impl GpuSceneResources {
             cache: None,
         });
 
-        // GPU billboard particle VFX pipeline
+        // GPU billboard particle VFX pipeline (supports procedural + FA texture_2d_array sprites/beams)
+        let vfx_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("vfx_bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let vfx_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("vfx_pl"),
+            bind_group_layouts: &[&vfx_bgl],
+            push_constant_ranges: &[],
+        });
+        let vfx_placeholder = RgbaImage {
+            width: 2,
+            height: 2,
+            pixels: vec![255u8; 2 * 2 * 4],
+        };
+        let vfx_bind_group = create_vfx_array_bind_group(
+            device,
+            queue,
+            &vfx_bgl,
+            &uniform_buf,
+            &sampler_clamp,
+            &sampler_repeat,
+            2,
+            2,
+            std::slice::from_ref(&vfx_placeholder),
+        );
         let vfx_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("farust_vfx_shader"),
             source: wgpu::ShaderSource::Wgsl(VFX_SHADER_WGSL.into()),
         });
         let vfx_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("vfx_pipeline"),
-            layout: Some(&uniform_only_pl),
+            layout: Some(&vfx_pl),
             vertex: wgpu::VertexState {
                 module: &vfx_shader,
                 entry_point: Some("vs_main"),
@@ -2420,7 +2611,7 @@ impl GpuSceneResources {
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: target_format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
@@ -2622,6 +2813,8 @@ impl GpuSceneResources {
             hud_icons_bind_group,
             strat_icons_bind_group,
             uniform_only_bg,
+            vfx_bgl,
+            vfx_bind_group,
             bone_bgl,
             bone_buf,
             bone_buf_cap,
@@ -3087,6 +3280,30 @@ impl GpuSceneResources {
         self.shield_instances = Some((inst_buf, instances.len() as u32));
     }
 
+    pub(crate) fn set_vfx_texture_array(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        width: u32,
+        height: u32,
+        layers: &[RgbaImage],
+    ) {
+        if layers.is_empty() || width == 0 || height == 0 {
+            return;
+        }
+        self.vfx_bind_group = create_vfx_array_bind_group(
+            device,
+            queue,
+            &self.vfx_bgl,
+            &self.uniform_buf,
+            &self.sampler_clamp,
+            &self.sampler_repeat,
+            width,
+            height,
+            layers,
+        );
+    }
+
     pub(crate) fn set_vfx(
         &mut self,
         device: &wgpu::Device,
@@ -3386,7 +3603,7 @@ impl GpuSceneResources {
         // GPU Billboard Particle VFX
         if let Some((vb, ib, n)) = &self.vfx_draw {
             rpass.set_pipeline(&self.vfx_pipeline);
-            rpass.set_bind_group(0, &self.uniform_only_bg, &[]);
+            rpass.set_bind_group(0, &self.vfx_bind_group, &[]);
             rpass.set_vertex_buffer(0, vb.slice(..));
             rpass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
             { st.add(*n, 1); rpass.draw_indexed(0..*n, 0, 0..1); }

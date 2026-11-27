@@ -1569,7 +1569,7 @@ pub(crate) fn build_skirmish_render_frame(
                 prog,
                 [0.20, 0.85, 1.0, 0.15],
             );
-            if u.role.is_builder() {
+            if u.role.is_builder() && !meshes.living.has_effect_library() {
                 let bx = job.x as f32 / scale;
                 let bz = job.y as f32 / scale;
                 let by = sample_terrain_y(scmap, bx, bz) + 1.2;
@@ -1586,6 +1586,7 @@ pub(crate) fn build_skirmish_render_frame(
 
         if let Some((tid, shot_tick)) = u.last_shot
             && world.tick().saturating_sub(shot_tick) <= 2
+            && !meshes.living.has_weapon_beam(&u.type_id)
             && let Some(t) = world.unit(tid)
         {
             let tx = t.pos.x as f32 / scale;

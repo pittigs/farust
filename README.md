@@ -197,6 +197,24 @@ cargo run --release -- join --code XXXX-XXXX --rendezvous 127.0.0.1:15050 --play
 FARUST_UI_THEME=classic cargo run --release -- play SCMP_001
 ```
 
+## Step 40 — done: FA effect blueprints
+
+- **Effect blueprint parser & Lua mapping** (`src/effects.rs`, `src/blueprint.rs`, `src/fuzz.rs`):
+  Parses all 2,827 `.bp` files in `effects.scd` (`EmitterBlueprint`, `BeamBlueprint`,
+  `TrailEmitterBlueprint`) and maps weapons via `lua/EffectTemplates.lua` + unit/projectile
+  Lua class chains (`404/404 = 100.0%` weapon coverage, `368` exact Lua + `2` name match +
+  `34` faction/category FA fallback).
+- **Curve-driven GPU particle & beam pool** (`src/vfx.rs`, `src/viewer.rs`, `src/render_prep.rs`):
+  Evaluates FA emitter curves and DDS color ramps into a `128×128` GPU `texture_2d_array`
+  with single-pass premultiplied alpha/additive blending for muzzle flashes, impacts, explosions,
+  nukes, shield hits, projectile trails, and faction build beams. Render-only; sim hashes unchanged.
+
+```sh
+cargo run --release -- effects --check
+cargo run --release -- effects --coverage
+cargo run --release -- play SCMP_001 --snapshot fa-unpack/renders/phase40_battle.png --snapshot-ticks 7200
+```
+
 ## Step 50 — done: map authoring tools
 
 - **`.scmap` v2.60 writer & round-trip** (`src/scmap.rs`, `src/map_author.rs`): byte-exact

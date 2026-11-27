@@ -645,6 +645,23 @@ struct ProjDraw {
     scale: f32,
 }
 
+/// One immediate FA `BeamBlueprint` ribbon to draw this frame.
+struct BeamDraw {
+    a: [f32; 3],
+    b: [f32; 3],
+    beam: crate::effects::CompiledBeam,
+    width_scale: f32,
+    tint: Option<[f32; 3]>,
+}
+
+/// Active builder beam/spark emission record for one frame.
+struct BuilderFx {
+    src: [f32; 3],
+    dst: [f32; 3],
+    rgb: [f32; 3],
+    faction: crate::effects::Faction,
+}
+
 #[derive(Default)]
 struct LivingFrame {
     time: f32,
@@ -659,16 +676,22 @@ struct LivingFrame {
     icons: Vec<([f32; 3], [f32; 4], [f32; 4], f32)>,
     fow_digest: Option<u64>,
     icons_uploaded: bool,
+    vfx_tex_uploaded: bool,
     units: U32Map<UnitVis>,
     dying: Vec<Dying>,
     wrecks_seen: U32Map<(f32, u64)>,
     proj_kind: U32Map<Option<String>>,
+    proj_shooter: U32Map<String>,
     prev_proj: U32Map<([f32; 3], f32, u64)>,
     proj_draw: Vec<ProjDraw>,
     shields: Vec<GpuUnitInstance>,
     /// Immediate (this frame only) glow billboards `(pos, size, rgba)` and streaks `(a, b, width, rgba)`.
     glows: Vec<([f32; 3], f32, [f32; 4])>,
     streaks: Vec<([f32; 3], [f32; 3], f32, [f32; 4])>,
+    /// Immediate FA `BeamBlueprint` ribbons drawn through `vfx_pipeline`.
+    beams: Vec<BeamDraw>,
+    /// Immediate FA `TrailEmitterBlueprint` projectile ribbons `(tail, head, trail, width_scale)`.
+    trails: Vec<([f32; 3], [f32; 3], crate::effects::CompiledTrail, f32)>,
     /// Skeletal poses queued by [`LivingBattlefield::skin_instance`] for this frame, solved in
     /// parallel by [`LivingBattlefield::resolve_pose_jobs`].
     pose_jobs: Vec<PoseJob>,
@@ -725,6 +748,7 @@ pub struct LivingBattlefield {
     proj_meshes: Arc<BTreeMap<String, ProjMesh>>,
     icon_names: Arc<BTreeMap<String, String>>,
     icon_atlas: Option<Arc<crate::scene::StrategicIconAtlas>>,
+    effects: Arc<crate::effects::EffectLibrary>,
     wall_clock: std::cell::Cell<Option<std::time::Instant>>,
     frame: std::cell::RefCell<LivingFrame>,
     /// Lazily created persistent pool for per-frame pose sampling.
@@ -739,6 +763,7 @@ impl Clone for LivingBattlefield {
             proj_meshes: Arc::clone(&self.proj_meshes),
             icon_names: Arc::clone(&self.icon_names),
             icon_atlas: self.icon_atlas.clone(),
+            effects: Arc::clone(&self.effects),
             wall_clock: std::cell::Cell::new(self.wall_clock.get()),
             frame: std::cell::RefCell::new(LivingFrame::default()),
             pose_pool: self.pose_pool.clone(),
@@ -847,8 +872,10 @@ impl LivingBattlefield {
         let ids: Vec<String> = catalog.types.keys().cloned().collect();
         let icon_list: Vec<String> = icon_names.values().cloned().collect();
 
-        let (assets, proj_meshes, atlas) = std::thread::scope(|scope| {
+        let (assets, proj_meshes, atlas, effects) = std::thread::scope(|scope| {
             let atlas_job = scope.spawn(|| crate::scene::load_strategic_icon_atlas(Some(game_dir), &icon_list));
+            let effects_ids = ids.clone();
+            let effects_job = scope.spawn(move || crate::effects::load_effect_library(game_dir, &effects_ids));
 
             // Pass 1: blueprints, meshes and LOD1 textures in one archive sweep.
             let mut wanted = BTreeSet::new();
@@ -1048,7 +1075,12 @@ impl LivingBattlefield {
                     asset_index.insert(id, idx);
                 }
             }
-            ((assets, asset_index), proj_meshes, atlas_job.join().ok())
+            (
+                (assets, asset_index),
+                proj_meshes,
+                atlas_job.join().ok(),
+                effects_job.join().unwrap_or_default(),
+            )
         });
 
         Self {
@@ -1057,10 +1089,23 @@ impl LivingBattlefield {
             proj_meshes: Arc::new(proj_meshes),
             icon_names: Arc::new(icon_names),
             icon_atlas: atlas.map(Arc::new),
+            effects: Arc::new(effects),
             wall_clock: std::cell::Cell::new(None),
             frame: std::cell::RefCell::new(LivingFrame::default()),
             pose_pool: std::sync::OnceLock::new(),
         }
+    }
+
+    /// True when the FA `EffectLibrary` (Phase 40 emitters/beams/trails + texture array) loaded.
+    pub fn has_effect_library(&self) -> bool {
+        self.effects.is_loaded()
+    }
+
+    /// True when `type_id` has an FA `BeamBlueprint` weapon beam.
+    pub fn has_weapon_beam(&self, type_id: &str) -> bool {
+        self.effects
+            .unit_weapon_fx(type_id)
+            .is_some_and(|w| w.beam.is_some())
     }
 
     fn asset(&self, type_id: &str) -> Option<&UnitRenderAssets> {
@@ -1179,25 +1224,30 @@ impl LivingBattlefield {
         unit_lift_at(u, self.frame.borrow().time)
     }
 
-    /// Picks the projectile template for a freshly spawned projectile from the weapon blueprint of
-    /// the unit that fired it (the same-army unit standing on the projectile's start point).
-    fn resolve_projectile_key(&self, world: &crate::skirmish::Skirmish, p: &crate::skirmish::Projectile) -> Option<String> {
-        if p.is_overcharge {
-            return None;
-        }
+    /// Picks the projectile template + shooter type_id for a freshly spawned projectile from the
+    /// weapon blueprint of the unit that fired it.
+    fn resolve_projectile_key(&self, world: &crate::skirmish::Skirmish, p: &crate::skirmish::Projectile) -> (Option<String>, Option<String>) {
         let d2 = |u: &crate::skirmish::Unit| {
             let dx = (u.pos.x - p.start.x) as i128;
             let dy = (u.pos.y - p.start.y) as i128;
             dx * dx + dy * dy
         };
         let lim = 4 * crate::sim::SCALE as i128;
-        let shooter = world
+        let Some(shooter) = world
             .units()
             .filter(|u| u.alive && u.army == p.army)
             .min_by_key(|u| (d2(u), u.id))
-            .filter(|u| d2(u) <= lim * lim)?;
+            .filter(|u| d2(u) <= lim * lim)
+        else {
+            return (None, None);
+        };
+        let shooter_type = Some(shooter.type_id.clone());
+        if p.is_overcharge {
+            return (None, shooter_type);
+        }
         let fx = self.fx_info(&shooter.type_id);
-        if p.is_missile || p.is_nuke { fx.missile_proj } else { fx.shell_proj }
+        let mesh_key = if p.is_missile || p.is_nuke { fx.missile_proj } else { fx.shell_proj };
+        (mesh_key, shooter_type)
     }
 
     /// Starts a render frame: advances the render clock, clears the bone palette / icon list and
@@ -1234,6 +1284,8 @@ impl LivingBattlefield {
         f.proj_draw.clear();
         f.glows.clear();
         f.streaks.clear();
+        f.beams.clear();
+        f.trails.clear();
 
         let scale = crate::sim::SCALE as f32;
         let zb = zoom_boost.max(1.0);
@@ -1281,7 +1333,7 @@ impl LivingBattlefield {
         // (shielded targets flash on the dome instead); motion, aim and work-clip history.
         let mut alive_count = 0usize;
         let mut vanished_fx: Vec<(u32, FxUnit)> = Vec::new();
-        let mut builders = Vec::new();
+        let mut builders: Vec<BuilderFx> = Vec::new();
         let mut shots: Vec<([f32; 3], [f32; 3])> = Vec::new();
         for u in world.units() {
             if !u.alive {
@@ -1364,17 +1416,43 @@ impl LivingBattlefield {
                         let pitch = crate::sca::aim_pitch(dist, tp[1] - pos[1], arc, -0.26, fx.max_pitch);
                         st.aim_target = Some((u.turret_yaw_mrad as f32 / 1000.0, pitch));
                     }
+                    let dir = [tp[0] - pos[0], tp[1] - pos[1], tp[2] - pos[2]];
+                    let len = (dir[0] * dir[0] + dir[2] * dir[2]).sqrt().max(1e-3);
+                    let off = (radius * zb * 0.9).min(len * 0.5);
+                    let muzzle = [pos[0] + dir[0] / len * off, pos[1] + 0.4 * zb, pos[2] + dir[2] / len * off];
+                    let wfx = self.effects.unit_weapon_fx(&u.type_id);
+                    if vis
+                        && tick.saturating_sub(shot_tick) <= 2
+                        && let Some(beam) = wfx.and_then(|w| w.beam.as_ref())
+                    {
+                        f.beams.push(BeamDraw {
+                            a: muzzle,
+                            b: tp,
+                            beam: beam.clone(),
+                            width_scale: zb.sqrt(),
+                            tint: None,
+                        });
+                    }
                     if fresh {
                         st.shot_at = t;
                         shots.push((pos, tp));
                         if vis {
-                            let dir = [tp[0] - pos[0], tp[1] - pos[1], tp[2] - pos[2]];
-                            let len = (dir[0] * dir[0] + dir[2] * dir[2]).sqrt().max(1e-3);
-                            let off = (radius * zb * 0.9).min(len * 0.5);
-                            let muzzle = [pos[0] + dir[0] / len * off, pos[1] + 0.4 * zb, pos[2] + dir[2] / len * off];
-                            f.vfx.spawn_muzzle_flash(muzzle, dir, 0.9 * zb);
+                            if let Some(w) = wfx
+                                && !w.muzzle.is_empty()
+                            {
+                                f.vfx.spawn_emitters(&w.muzzle, muzzle, dir, 0.85 * zb, None, false);
+                            } else {
+                                f.vfx.spawn_muzzle_flash(muzzle, dir, 0.9 * zb);
+                            }
                             if !covering_shield(tp, u.army) {
-                                f.vfx.spawn_explosion(tp, 0.9 * zb);
+                                if let Some(w) = wfx
+                                    && !w.impact.is_empty()
+                                {
+                                    let back = [-dir[0], -dir[1], -dir[2]];
+                                    f.vfx.spawn_emitters(&w.impact, tp, back, 0.85 * zb, None, false);
+                                } else {
+                                    f.vfx.spawn_explosion(tp, 0.9 * zb);
+                                }
                             }
                         }
                     }
@@ -1453,7 +1531,10 @@ impl LivingBattlefield {
                 && let Some(job) = &u.build
             {
                 let c = army_rgb_fast(u.army);
-                builders.push((ground(job.x, job.y, 0.6 * zb), c));
+                let src = [pos[0], pos[1] + 0.7 * zb, pos[2]];
+                let dst = ground(job.x, job.y, 0.6 * zb);
+                let fac = crate::effects::Faction::from_unit_id(&u.type_id);
+                builders.push(BuilderFx { src, dst, rgb: c, faction: fac });
             }
         }
 
@@ -1481,7 +1562,14 @@ impl LivingBattlefield {
                     st.hit_dir = dir;
                     st.hit_at = t;
                     if visible(u) {
-                        f.vfx.spawn_shield_hit(add_scaled(c, dir, r), s.4);
+                        let hit_pos = add_scaled(c, dir, r);
+                        let fac = crate::effects::Faction::from_unit_id(&u.type_id);
+                        let sh_fx = self.effects.shield_hit_fx(fac);
+                        if !sh_fx.is_empty() {
+                            f.vfx.spawn_emitters(sh_fx, hit_pos, dir, zb, Some(s.4), false);
+                        } else {
+                            f.vfx.spawn_shield_hit(hit_pos, s.4);
+                        }
                     }
                 } else {
                     st.hit_at = t;
@@ -1553,9 +1641,18 @@ impl LivingBattlefield {
             vanished_fx.sort_unstable_by_key(|(id, _)| *id);
             for (_, d) in vanished_fx {
                 if d.acu {
+                    if !self.effects.nuke.is_empty() {
+                        f.vfx.spawn_emitters(&self.effects.nuke, d.pos, [0.0, 1.0, 0.0], 2.5, None, true);
+                    }
                     f.vfx.spawn_acu_nuke(d.pos);
                 } else {
-                    f.vfx.spawn_explosion(d.pos, d.radius * zb * 1.4);
+                    let rad = d.radius * zb * 1.4;
+                    let exp_fx = self.effects.explosion_fx(rad);
+                    if !exp_fx.is_empty() {
+                        f.vfx.spawn_emitters(exp_fx, d.pos, [0.0, 1.0, 0.0], (rad * 0.45).clamp(0.6, 4.0), None, true);
+                    } else {
+                        f.vfx.spawn_explosion(d.pos, rad);
+                    }
                 }
             }
         }
@@ -1623,11 +1720,18 @@ impl LivingBattlefield {
             let key = match f.proj_kind.get(&p.id) {
                 Some(k) => k.clone(),
                 None => {
-                    let k = self.resolve_projectile_key(world, p);
+                    let (k, shooter_tid) = self.resolve_projectile_key(world, p);
                     f.proj_kind.insert(p.id, k.clone());
+                    if let Some(tid) = shooter_tid {
+                        f.proj_shooter.insert(p.id, tid);
+                    }
                     k
                 }
             };
+            let proj_wfx = f
+                .proj_shooter
+                .get(&p.id)
+                .and_then(|tid| self.effects.unit_weapon_fx(tid));
             let rgb = army_rgb_fast(p.army);
             let hot = [0.55 + rgb[0] * 0.45, 0.55 + rgb[1] * 0.45, 0.55 + rgb[2] * 0.45, 0.95];
             let mesh_len = key.as_ref().and_then(|k| self.proj_meshes.get(k)).map(|m| m.length);
@@ -1650,21 +1754,42 @@ impl LivingBattlefield {
                     .prev_proj
                     .get(&p.id)
                     .map(|(pp, _, _)| add_scaled(*pp, dir, -len * 0.5));
+                let fa_trails = proj_wfx.map(|w| w.trail_emitters.as_slice()).unwrap_or(&[]);
                 match prev_tail {
                     Some(a) if f.primed => {
-                        for q in points_along(a, tail, 0.7 * zb.sqrt(), 24) {
-                            f.vfx.spawn_missile_trail(q);
+                        for q in points_along(a, tail, 0.9 * zb.sqrt(), 16) {
+                            if !fa_trails.is_empty() {
+                                f.vfx.spawn_emitter(&fa_trails[0], q, [-dir[0], -dir[1], -dir[2]], 0.7 * zb.sqrt(), None, false);
+                            } else {
+                                f.vfx.spawn_missile_trail(q);
+                            }
                         }
                     }
                     _ => {
                         for i in 0..6 {
-                            f.vfx.spawn_missile_trail(add_scaled(tail, dir, -(i as f32) * 0.8 * zb));
+                            let q = add_scaled(tail, dir, -(i as f32) * 0.8 * zb);
+                            if !fa_trails.is_empty() {
+                                f.vfx.spawn_emitter(&fa_trails[0], q, [-dir[0], -dir[1], -dir[2]], 0.7 * zb.sqrt(), None, false);
+                            } else {
+                                f.vfx.spawn_missile_trail(q);
+                            }
                         }
                     }
                 }
             } else {
                 f.glows.push((pos, if key.is_some() { 0.7 } else { 1.1 } * zb, hot));
-                f.streaks.push((add_scaled(pos, dir, -2.6 * zb), pos, 0.45 * zb, [hot[0], hot[1], hot[2], 0.7]));
+                if let Some(poly) = proj_wfx.and_then(|w| w.poly_trail.as_ref()) {
+                    let tlen = (poly.bp.trail_length * 0.45 * zb).clamp(1.8 * zb, 9.0 * zb);
+                    f.trails.push((add_scaled(pos, dir, -tlen), pos, poly.clone(), zb.sqrt()));
+                } else {
+                    f.streaks.push((add_scaled(pos, dir, -2.6 * zb), pos, 0.45 * zb, [hot[0], hot[1], hot[2], 0.7]));
+                }
+                if let Some(w) = proj_wfx
+                    && !w.trail_emitters.is_empty()
+                    && (frame_no + u64::from(p.id)).is_multiple_of(2)
+                {
+                    f.vfx.spawn_emitter(&w.trail_emitters[0], tail, [-dir[0], -dir[1], -dir[2]], 0.5 * zb.sqrt(), None, false);
+                }
             }
             f.prev_proj.insert(p.id, (pos, r, frame_no));
             if key.is_some() {
@@ -1681,8 +1806,12 @@ impl LivingBattlefield {
             vanished_proj.sort_unstable_by_key(|(id, _, _)| *id);
             for (id, pos, r) in vanished_proj {
                 f.prev_proj.remove(&id);
+                let shooter_tid = f.proj_shooter.remove(&id);
                 if f.primed {
                     if r >= 18.0 {
+                        if !self.effects.nuke.is_empty() {
+                            f.vfx.spawn_emitters(&self.effects.nuke, pos, [0.0, 1.0, 0.0], 2.5, None, true);
+                        }
                         f.vfx.spawn_acu_nuke(pos);
                     } else if shields.iter().any(|s| {
                         let dx = pos[0] - s.1[0];
@@ -1690,8 +1819,20 @@ impl LivingBattlefield {
                         dx * dx + dz * dz <= s.2 * s.2
                     }) {
                         // Absorbed by a dome: the ripple/flash comes from the shield HP diff.
+                    } else if let Some(imp) = shooter_tid
+                        .as_deref()
+                        .and_then(|tid| self.effects.unit_weapon_fx(tid))
+                        .filter(|w| !w.impact.is_empty())
+                        .map(|w| w.impact.as_slice())
+                    {
+                        f.vfx.spawn_emitters(imp, pos, [0.0, 1.0, 0.0], (r * 0.65).clamp(0.6, 3.5), None, true);
                     } else {
-                        f.vfx.spawn_explosion(pos, r);
+                        let exp_fx = self.effects.explosion_fx(r);
+                        if !exp_fx.is_empty() {
+                            f.vfx.spawn_emitters(exp_fx, pos, [0.0, 1.0, 0.0], (r * 0.55).clamp(0.6, 3.5), None, true);
+                        } else {
+                            f.vfx.spawn_explosion(pos, r);
+                        }
                     }
                 }
             }
@@ -1699,8 +1840,11 @@ impl LivingBattlefield {
         if f.proj_kind.len() > proj_count {
             f.proj_kind.retain(|id, _| f.prev_proj.contains_key(id));
         }
+        if f.proj_shooter.len() > proj_count {
+            f.proj_shooter.retain(|id, _| f.prev_proj.contains_key(id));
+        }
 
-        // Build sparks (~24/s per active builder), dt-driven.
+        // Build beams (`BeamBlueprint`) and build sparks (`EmitterBlueprint`, ~24/s per active builder).
         let spark_n = if f.primed {
             f.spark_accum += dt * 24.0;
             let s = f.spark_accum.floor();
@@ -1709,9 +1853,25 @@ impl LivingBattlefield {
         } else {
             6
         };
-        for (pos, c) in &builders {
-            for _ in 0..spark_n.min(8) {
-                f.vfx.spawn_build_spark(*pos, *c);
+        for b in &builders {
+            if let Some(beam) = self.effects.build_beam_fx(b.faction) {
+                f.beams.push(BeamDraw {
+                    a: b.src,
+                    b: b.dst,
+                    beam: beam.clone(),
+                    width_scale: zb.sqrt(),
+                    tint: Some(b.rgb),
+                });
+            }
+            let bfx = self.effects.build_sparks_fx(b.faction);
+            if !bfx.is_empty() {
+                if spark_n > 0 {
+                    f.vfx.spawn_emitters(bfx, b.dst, [0.0, 1.0, 0.0], 0.55 * zb.sqrt(), Some(b.rgb), false);
+                }
+            } else {
+                for _ in 0..spark_n.min(8) {
+                    f.vfx.spawn_build_spark(b.dst, b.rgb);
+                }
             }
         }
 
@@ -2050,6 +2210,13 @@ impl LivingBattlefield {
             resources.set_bone_palette(device, &queue, &f.palette);
         }
 
+        if !f.vfx_tex_uploaded
+            && let Some(ref arr) = self.effects.texture_array
+        {
+            resources.set_vfx_texture_array(device, &queue, arr.width, arr.height, &arr.layers);
+            f.vfx_tex_uploaded = true;
+        }
+
         let view = camera.view_matrix();
         let right = [view[0][0], view[1][0], view[2][0]];
         let up = [view[0][1], view[1][1], view[2][1]];
@@ -2060,6 +2227,12 @@ impl LivingBattlefield {
         }
         for &(p, s, c) in &f.glows {
             crate::vfx::append_glow(&mut vv, &mut vi, p, s, c, right, up);
+        }
+        for bd in &f.beams {
+            crate::vfx::append_fa_beam(&mut vv, &mut vi, bd.a, bd.b, &bd.beam, bd.width_scale, f.time, eye, bd.tint);
+        }
+        for (tail, head, trail, wscale) in &f.trails {
+            crate::vfx::append_fa_trail(&mut vv, &mut vi, *tail, *head, trail, *wscale, f.time, eye);
         }
         resources.set_vfx(device, &vv, &vi);
         resources.set_shield_instances(device, &f.shields);
