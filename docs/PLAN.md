@@ -3,8 +3,8 @@
 Goal: Rust engine that loads original Forged Alliance data from the user's own
 install and runs a deterministic, multicore-capable RTS. No game assets in git.
 
-Game dir (default, override with `FA_PATH`):
-`/home/bas_pit/.local/share/Steam/steamapps/common/Supreme Commander Forged Alliance`
+Game dir: discovered automatically (Steam libraries, GOG, retail; `farust platform`),
+override with `FA_PATH`.
 
 ## Principles
 
@@ -854,6 +854,185 @@ bumps `SIM_VERSION`, re-baselines golden hashes deliberately, and keeps
   Flatpak YAML parse.
 - Exit pending: "tagged 1.0 builds produced by CI for all three platforms" needs the
   repository pushed to GitHub (no remote is configured here) plus the license decision.
+
+## Roadmap — Phases 58–87 (planned)
+
+Same rules as 28–57: sim-touching phases bump `RULES_VERSION` (and
+`PROTOCOL_VERSION` when the wire changes), re-baseline golden hashes on purpose and
+keep `1t == Nt`; render/audio/UI phases leave every hash unchanged. Each phase has
+one concrete exit check. Open items of 38/45/46/55/56/57 are folded in below.
+
+### Arc H — Ship 1.0 (58–62)
+
+### Phase 58 — CI green & clippy backlog (planned)
+- Get `ci.yml` green on all five runners (fix platform-specific test assumptions:
+  paths, line endings, temp dirs, socket timing on loaded runners).
+- Clear the ~97 pre-existing clippy warnings, then make CI run `-D warnings`;
+  add `cargo fmt --check` once the tree is formatted in one mechanical commit.
+- Exit: CI green on Linux x86_64/aarch64, Windows, macOS arm64/x86_64 with
+  `-D warnings`; aarch64 runner passes `golden_hashes_pin_cross_platform_determinism`.
+
+### Phase 59 — Cross-platform lockstep proof (planned; closes 56)
+- Windows build via MinGW (local) and CI artifacts; CI job that runs a 3-peer
+  loopback match with one peer per OS-built binary where runners allow (or a
+  scripted Linux host + Windows/Wine + macOS artifact matrix job).
+- Exercise WinMM / CoreAudio sinks on real machines; fix device-change handling.
+- Exit: Linux host + Windows client + macOS client end a headless match on one hash.
+
+### Phase 60 — Rejoin everywhere (planned; closes 45 limits)
+- Rejoin and late observers for UDP, invite-code/relay and menu-lobby hosts
+  (rendezvous remembers the session code for the match's lifetime).
+- Interactive "RECONNECTING… (re-simulating x %)" overlay; auto-retry on drop;
+  recording/replay of a rejoined client covers the whole match.
+- Exit: kill a client of a `--code --udp` match, rejoin via the code → same final hash
+  as an uninterrupted run.
+
+### Phase 61 — Host migration (planned)
+- When the host (relay) drops, the lowest remaining army becomes host: peers already
+  hold every bundle up to their last turn; the new host re-binds (direct or via the
+  rendezvous) and resumes from the agreed turn.
+- Exit: kill the host mid-match → remaining peers continue and agree on the final hash.
+
+### Phase 62 — 1.0 release (planned; closes 57)
+- License chosen, app id/homepage set, version 1.0.0, release notes from PLAN arcs,
+  tag → `release.yml` artifacts verified on each OS, checklist in `docs/RELEASE.md`.
+- Exit: published GitHub release `v1.0.0` with CI-built archives for all platforms.
+
+### Arc I — Campaign (63–67)
+
+### Phase 63 — Campaign shell (planned)
+- Operation select, briefing screen (map preview, objectives, voice line captions),
+  debrief with stats, per-operation difficulty, persistent progress in the data dir.
+- Mission DSL v2: named mission phases, map expansion (playable-area changes),
+  timed reinforcements, scripted camera moves ("NIS"), objective markers on the
+  minimap/HUD.
+- Exit: CAMPAIGN → select X1CA_001 → briefing → play → debrief → progress saved.
+
+### Phase 64 — Operations 2–3 (planned)
+- `X1CA_002`, `X1CA_003` on the DSL v2, same tuning loop (`--trace`) as Phase 49.
+- Exit: both beatable with `--human-ai hard` (all primaries) and losable on easy.
+
+### Phase 65 — Operations 4–6 (planned)
+- `X1CA_004`–`X1CA_006`, including the final operation's experimental set pieces.
+- Exit: all six operations beatable end to end; `mission --suite campaign` runs them.
+
+### Phase 66 — Co-op campaign (planned)
+- Operations playable by 2 humans over lockstep (shared player team, mission
+  runtime inside the deterministic sim already); co-op pings and lend-units.
+- Exit: 2-peer co-op X1CA_001 ends on the same hash on both peers with Victory.
+
+### Phase 67 — Campaign AI base managers (planned)
+- Scripted enemy armies rebuild bases, send waves from build templates and react to
+  the player instead of `spawn`-only waves; difficulty scales economy and wave size.
+- Exit: Op 1 with base managers stays beatable on hard and takes measurably longer.
+
+### Arc J — Observer & caster II (68–69)
+
+### Phase 68 — Caster tools (planned; closes 38 leftovers)
+- Army-value / income graphs over time, follow-unit camera, picture-in-picture
+  minimap, player-POV fog toggle, unit-count breakdown per tier.
+- Exit: observer session shows graphs + follow cam; render/HUD tests; hashes unchanged.
+
+### Phase 69 — Broadcast relay (planned)
+- Delayed (e.g. 2–5 min) observer stream through the rendezvous: many observers fed
+  from one bundle stream without touching player latency.
+- Exit: 1 match, 20 relay observers, players' turn latency unchanged, all hashes agree.
+
+### Arc K — Rendering IV (70–74)
+
+### Phase 70 — GPU-driven culling (planned; closes 55 leftover)
+- Compute-shader frustum + LOD culling into indirect draws; CPU prep < 2 ms at 10k.
+- Exit: 20k units ≥ 60 fps at the bench camera on the reference GPU.
+
+### Phase 71 — Shadows (planned)
+- Cascaded shadow maps for terrain + units + props, PCF, map-driven sun direction.
+- Exit: shadow snapshot set; frame p50 at 10k units still ≤ 16.6 ms.
+
+### Phase 72 — Water II (planned)
+- Planar reflections, refraction with depth tint, shoreline foam, wakes from naval
+  units, map water parameters from `.scmap`.
+- Exit: naval map snapshots match FA's look side-by-side; budget held.
+
+### Phase 73 — Mesh LOD & strategic zoom polish (planned)
+- FA LOD meshes (`.scm` LOD chain) with distance switch, cross-fade to strategic
+  icons, icon de-cluttering at full zoom-out.
+- Exit: 10k-unit zoom-out sweep without popping artifacts; ≥ 20 % GPU time saved.
+
+### Phase 74 — GPU particles (planned)
+- Move FA effect emitters to a compute-simulated particle pool with budgets.
+- Exit: large battle with 3× effect density at the same frame time.
+
+### Arc L — AI IV (75–78)
+
+### Phase 75 — Self-play tuner (planned)
+- Offline tuner that runs arena matches (`--threads`) and hill-climbs AI profile
+  parameters against the Elo ladder; results checked in as data, not code.
+- Exit: tuned "hard" beats the current hard ≥ 60 % over 200 held-out games.
+
+### Phase 76 — Naval & air depth (planned)
+- Naval build/attack logic (fleets, sub hunting, shore bombardment), air control
+  (fighter screens, bomber runs, gunship raids), transport drops.
+- Exit: on water maps AI vs AI produces naval battles; hard AI wins ≥ 60 % vs Phase 52.
+
+### Phase 77 — Experimentals & artillery AI (planned)
+- When to tech to experimentals, escort and target them; T3 artillery / nukes /
+  anti-nuke decisions.
+- Exit: in 60-minute games the AI fields experimentals and defends against nukes.
+
+### Phase 78 — Adaptive difficulty (planned)
+- AI that tracks the player's performance in a match and adjusts aggression/eco.
+- Exit: win rate of scripted "weak" and "strong" human stand-ins both land at 40–60 %.
+
+### Arc M — Online II (79–82)
+
+### Phase 79 — Matchmaking & ranking (planned)
+- Rendezvous-side 1v1/2v2 queue with ratings (Elo → TrueSkill-like), results
+  confirmed from both peers' final hashes, anti-abuse (mismatching reports void).
+- Exit: 4 headless clients queue, get matched, play, ratings update consistently.
+
+### Phase 80 — Profiles & stats (planned)
+- Persistent player profiles (name, rating history, faction stats) on the
+  rendezvous, opt-in, exportable; no personal data beyond the chosen name.
+- Exit: profile page in the menu shows history after 3 ranked games.
+
+### Phase 81 — Lobby II (planned)
+- Map/mod vote, team balance by rating, chat moderation (mute), lobby browser
+  filters, kick/ban list per host.
+- Exit: 6-player lobby balanced by rating, starts and plays with mods synced.
+
+### Phase 82 — Steamworks (planned, blocked; was 46)
+- Steam lobbies, friend invites, rich presence, Steam Datagram Relay transport.
+- Blocked until a Steam App ID exists.
+
+### Arc N — Modding II (83–85)
+
+### Phase 83 — Mod browser (planned)
+- Rendezvous-hosted mod index (upload/download like replays, hash-addressed),
+  in-game browser, dependencies and version constraints.
+- Exit: publish a mod from client A, install it from client B's browser, play.
+
+### Phase 84 — Map & mission packs (planned)
+- Mods may ship maps and missions; lobby sync transfers maps too; map/mission
+  validation (mission DSL lint, unreachable objectives detector via `--trace`).
+- Exit: a client without the host's map receives it and the match starts.
+
+### Phase 85 — Data-driven abilities II (planned)
+- Remaining unit abilities as blueprint data (teleport, cloak fields, buffs from
+  enhancements, shield variants) so mods can add them without code.
+- Exit: a mod adds a new ability via blueprint only; sim test covers it.
+
+### Arc O — Quality & reach (86–87)
+
+### Phase 86 — Accessibility & UI II (planned)
+- UI scale setting, controller/gamepad camera, full key rebinding coverage,
+  colour-blind HUD audit, all FA languages in `loc` coverage reports.
+- Exit: menu + match usable at 1280×720 to 4K with UI scale; loc coverage ≥ 95 %.
+
+### Phase 87 — Desync & perf triage tools (planned)
+- Desync bisector: replays two dumps and reports the first divergent tick and the
+  differing unit/army state; per-system sim profiler in CI with regression gates.
+- Exit: an injected desync is pinpointed to its tick + field automatically; CI
+  fails on a > 10 % ticks/s regression.
 
 ### Other known gaps
 - FAF network/replay compatibility stays out of scope (see Risks).
