@@ -2640,16 +2640,18 @@ fn cmd_ai_arena(args: &[String]) -> Result<(), String> {
             o.hash
         );
     }
+    let elo = skirmish_ai::elo_ratings(&outcomes.iter().map(|o| (o.d0, o.d1, o.winner)).collect::<Vec<_>>());
     println!("standings:");
     for (diff, rec) in &table {
         println!(
-            "  {:<9} games={:<3} wins={:<3} losses={:<3} draws={:<3} avg_ticks={}",
+            "  {:<9} games={:<3} wins={:<3} losses={:<3} draws={:<3} avg_ticks={:<6} elo={:.0}",
             diff.name(),
             rec.games,
             rec.wins,
             rec.losses,
             rec.draws,
-            rec.ticks / rec.games.max(1) as u64
+            rec.ticks / rec.games.max(1) as u64,
+            elo.get(diff).copied().unwrap_or(1500.0)
         );
     }
     if let Some(ref path) = json_file {

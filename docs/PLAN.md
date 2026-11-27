@@ -618,11 +618,25 @@ bumps `SIM_VERSION`, re-baselines golden hashes deliberately, and keeps
 
 ### Arc F — AI III (52–53)
 
-### Phase 52 — Strategic AI planner (planned)
-- Map-aware expansion and mex control, multi-front army management,
-  experimental timing, naval/air dominance goals, built on `ai_threat.rs`.
-  Elo ladder added to `farust ai-arena`.
-- Exit: the new `hard` AI beats Phase 19 `hard` in ≥ 70% of 100 arena games.
+### Phase 52 — Strategic AI planner (done)
+- New `hard` built on the Phase 19 one, which is kept frozen as the `hard19` benchmark
+  difficulty (`--ai hard19`, not in the menu):
+  - tech push: a busy land factory is reserved for its T1→T2→T3 upgrade (no new
+    production, upgrade the moment it idles) — Phase 19 only upgraded idle factories,
+    which never happened because every factory was refilled each think;
+  - map awareness: when no enemy base is land-reachable (island maps such as
+    `SCMP_005`), air and naval factories scale with income;
+  - economy: leaner power (energy ratio 5, batches of 2) — hard19 overbuilt generators
+    while starving mass — plus 2 parallel extractor jobs, 3 parallel engineers, up to 14
+    engineers / 8 land factories;
+  - committed fighting: attack at 110 %, retreat at 180 %, a single raid group.
+- `farust ai-arena` standings print a batch-Elo ladder (`skirmish_ai::elo_ratings`).
+- Exit: 100-game arena (`SCMP_001/002/005/009/014` × seeds 1–10 × both sides,
+  60 min limit): new hard 70 – 22 – 8 vs hard19; held-out seeds 11–20: 69 – 23 – 8
+  (≈ 75 % of decisive games). Ladder on a 144-game mixed arena: hard 1572, normal 1480,
+  hard19 1448. Normal AI unchanged (`skirmish SCMP_001` hash identical). Done.
+- Tried and rejected (no gain or worse): earlier tech thresholds, earlier extractor
+  upgrades, harder commitment (100 / 220 %), capping land factories on island maps.
 
 ### Phase 53 — AI personalities & co-op commands (planned)
 - Personalities (turtle, rush, air, tech), allied AI that responds to pings

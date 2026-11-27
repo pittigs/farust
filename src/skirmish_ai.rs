@@ -63,6 +63,8 @@ pub enum Difficulty {
     Hard,
     /// Starts as `normal`, then plays harder while losing and softer while winning.
     Adaptive,
+    /// Phase 52: the Phase 19 `hard` profile, frozen as an arena benchmark (`hard19`).
+    Hard19,
 }
 
 impl Difficulty {
@@ -81,6 +83,7 @@ impl Difficulty {
             Difficulty::Normal => "normal",
             Difficulty::Hard => "hard",
             Difficulty::Adaptive => "adaptive",
+            Difficulty::Hard19 => "hard19",
         }
     }
 
@@ -92,6 +95,7 @@ impl Difficulty {
             Difficulty::Normal => "faction openings, threat-map targeting, scouting, retreats",
             Difficulty::Hard => "fast APM, tight queued openings, raids, overcharge & focus-fire micro",
             Difficulty::Adaptive => "normal that plays harder while losing and softer while winning",
+            Difficulty::Hard19 => "the Phase 19 hard AI, kept as a benchmark",
         }
     }
 }
@@ -107,6 +111,7 @@ impl FromStr for Difficulty {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.trim().to_ascii_lowercase().as_str() {
             "legacy" | "old" => Ok(Difficulty::Legacy),
+            "hard19" => Ok(Difficulty::Hard19),
             "easy" => Ok(Difficulty::Easy),
             "normal" | "medium" => Ok(Difficulty::Normal),
             "hard" => Ok(Difficulty::Hard),
@@ -116,6 +121,35 @@ impl FromStr for Difficulty {
             )),
         }
     }
+}
+
+/// Phase 52: Elo ladder over arena results `(left, right, winner side)` (draws = ½).
+/// Batch Elo: 40 passes over the games with a shrinking K so the ratings do not depend
+/// on game order; everyone starts at 1500.
+pub fn elo_ratings(games: &[(Difficulty, Difficulty, Option<u8>)]) -> std::collections::BTreeMap<Difficulty, f64> {
+    let mut r: std::collections::BTreeMap<Difficulty, f64> = std::collections::BTreeMap::new();
+    for &(a, b, _) in games {
+        r.entry(a).or_insert(1500.0);
+        r.entry(b).or_insert(1500.0);
+    }
+    for pass in 0..40 {
+        let k = 32.0 / (1.0 + pass as f64 * 0.5);
+        for &(a, b, w) in games {
+            if a == b {
+                continue;
+            }
+            let (ra, rb) = (r[&a], r[&b]);
+            let ea = 1.0 / (1.0 + 10f64.powf((rb - ra) / 400.0));
+            let sa = match w {
+                Some(0) => 1.0,
+                Some(_) => 0.0,
+                None => 0.5,
+            };
+            *r.get_mut(&a).unwrap() += k * (sa - ea);
+            *r.get_mut(&b).unwrap() -= k * (sa - ea);
+        }
+    }
+    r
 }
 
 /// Parses `hard` (every army) or a per-army list `hard,normal` (cycled to `armies`).
@@ -181,6 +215,9 @@ pub struct Profile {
     pub tech: bool,
     pub air: bool,
     pub naval: bool,
+    /// Phase 52: reserve a busy factory for its tech upgrade (stop feeding it, upgrade as
+    /// soon as it falls idle) instead of waiting for an idle one that never comes.
+    pub tech_push: bool,
 }
 
 impl Profile {
@@ -219,6 +256,7 @@ impl Profile {
             tech: true,
             air: true,
             naval: true,
+            tech_push: false,
         };
         match d {
             Difficulty::Easy => Self {
@@ -252,7 +290,25 @@ impl Profile {
                 naval: false,
                 ..normal
             },
+            // Phase 52: hard keeps hard19's economy / APM but fights like a committed
+            // normal (Phase 19 hard over-retreated and bled units into raids).
             Difficulty::Hard => Self {
+                attack_ratio: 110,
+                retreat_ratio: 180,
+                min_attack_power: 900,
+                raids: 1,
+                mex_danger: 150,
+                tech_push: true,
+                mex_parallel: 2,
+                eng_max: 14,
+                max_land_fac: 8,
+                eng_parallel: 3,
+                energy_ratio: 5,
+                max_pgen_batch: 2,
+                energy_margin: 100,
+                ..Self::of(Difficulty::Hard19)
+            },
+            Difficulty::Hard19 => Self {
                 think: 10,
                 max_cmds: 40,
                 reorder: 20,
@@ -720,6 +776,8 @@ struct Smart {
     base_hit_tick: u64,
     base_hit_peak: i32,
     last_adapt: u64,
+    /// Phase 52 tech push: factory held back for its upgrade.
+    upgrade_reserve: Option<UnitId>,
 }
 
 impl Smart {
@@ -755,6 +813,7 @@ impl Smart {
             base_hit_tick: 0,
             base_hit_peak: 0,
             last_adapt: 0,
+            upgrade_reserve: None,
         }
     }
 
@@ -1197,6 +1256,19 @@ impl Smart {
         }
         if p.naval && self.naval_home.is_some() && has(w, &f.naval_factory) && inc >= 10 && lands >= 2 {
             want.naval = 1 + u32::from(p.micro && inc >= 30);
+        }
+        // Phase 52 map awareness: when no enemy base is reachable by land (island maps),
+        // scale air / naval production with income.
+        let island = p.tech_push
+            && !v.enemy_starts.is_empty()
+            && self.land.as_ref().is_some_and(|r| v.enemy_starts.iter().all(|(_, s)| !r.near(*s, 2)));
+        if island {
+            if p.air && has(w, &f.air_factory) && lands >= 1 {
+                want.air = (2 + (inc / 30) as u32).min(5);
+            }
+            if p.naval && self.naval_home.is_some() && has(w, &f.naval_factory) && lands >= 1 {
+                want.naval = (2 + (inc / 30) as u32).min(5);
+            }
         }
         if has(w, &f.point_defense) {
             let attacked = self.base_hit_tick > 0 && v.tick < self.base_hit_tick + 1_500;
@@ -1866,7 +1938,7 @@ impl Smart {
 
     fn pick_factory_upgrade(&self, v: &View) -> Option<(UnitId, String)> {
         let p = v.p;
-        if !p.fac_upgrade || v.factories.iter().any(|f| upgrading(f)) || v.want.pgens > 0 {
+        if !p.fac_upgrade || v.factories.iter().any(|f| upgrading(f)) || (v.want.pgens > 0 && !p.tech_push) {
             return None;
         }
         let inc = v.inc_m_s();
@@ -1881,7 +1953,7 @@ impl Smart {
         let mut cands: Vec<&&Unit> = v
             .factories
             .iter()
-            .filter(|f| is_idle(f) && f.production.is_empty())
+            .filter(|f| p.tech_push || (is_idle(f) && f.production.is_empty()))
             .filter(|f| match (f.role, f.tier) {
                 (Role::Factory, 1) => inc >= 15,
                 (Role::Factory, 2) => inc >= 35,
@@ -1899,7 +1971,22 @@ impl Smart {
         let tick = v.tick;
         let p = v.p;
         let op = ai_build::opening(&v.f.key, p.sloppy_opening);
-        let upgrade = self.pick_factory_upgrade(v);
+        let mut upgrade = self.pick_factory_upgrade(v);
+        if p.tech_push {
+            // Keep one reserved factory until it has upgraded (or died).
+            let still = self.upgrade_reserve.and_then(|id| v.factories.iter().find(|f| f.id == id && !upgrading(f)).map(|f| f.id));
+            match (still, &upgrade) {
+                (Some(id), _) => {
+                    let f = v.factories.iter().find(|f| f.id == id).unwrap();
+                    upgrade = upgrade_target(v.w, f).map(|t| (id, t));
+                    if upgrade.is_none() {
+                        self.upgrade_reserve = None;
+                    }
+                }
+                (None, Some((id, _))) => self.upgrade_reserve = Some(*id),
+                (None, None) => self.upgrade_reserve = None,
+            }
+        }
         let first_land = v.factories.iter().filter(|f| f.role == Role::Factory).map(|f| f.id).min();
         let mut eng_total = v.have[Role::Engineer.code() as usize] as usize + v.eng_queued;
         let mut eng_now = v.eng_queued;
@@ -1927,6 +2014,7 @@ impl Smart {
             {
                 if out.push(Command::Upgrade { unit: fac.id, target_type: ty.clone() }) {
                     self.mark(&[fac.id], tick);
+                    self.upgrade_reserve = None;
                 }
                 continue;
             }
@@ -2681,6 +2769,21 @@ mod tests {
         assert_eq!(parse_difficulty_list("legacy", 2).unwrap(), vec![Difficulty::Legacy; 2]);
         assert!(parse_difficulty_list("", 2).is_err());
         assert!(parse_difficulty_list("hard,nope", 2).is_err());
+    }
+
+    #[test]
+    fn elo_ladder_ranks_the_stronger_side_higher() {
+        let mut games = Vec::new();
+        for i in 0..100u32 {
+            let hard_wins = i % 10 < 7;
+            let (l, r) = if i % 2 == 0 { (Difficulty::Hard, Difficulty::Hard19) } else { (Difficulty::Hard19, Difficulty::Hard) };
+            let hard_side = if l == Difficulty::Hard { 0 } else { 1 };
+            games.push((l, r, Some(if hard_wins { hard_side } else { 1 - hard_side })));
+        }
+        let e = elo_ratings(&games);
+        let gap = e[&Difficulty::Hard] - e[&Difficulty::Hard19];
+        assert!((100.0..200.0).contains(&gap), "70% wins ≈ +147 Elo, got {gap}");
+        assert!((e[&Difficulty::Hard] + e[&Difficulty::Hard19] - 3000.0).abs() < 1e-6, "zero-sum");
     }
 
     #[test]
