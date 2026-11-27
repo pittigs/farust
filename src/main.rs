@@ -50,6 +50,7 @@ mod templates;
 mod terrain;
 mod stats;
 mod ttf;
+mod udp_transport;
 mod ui_kit;
 mod vfx;
 mod viewer;
@@ -98,9 +99,9 @@ fn print_usage() {
     eprintln!("  farust ai-arena [GAME_DIR] [--maps M1,M2] [--seeds N|S1,S2] [--matchups A:B,C:D] [--factions F0,F1] [--max-ticks N] [--victory V] [--unit-cap N] [--threads K] [--json [FILE]]");
     eprintln!("  farust play [MAP] [GAME_DIR] [--armies 1,2] [--factions uef,cybran] [--ai D] [--victory V] [--unit-cap N] [--seed S] [--speed N] [--load FILE] [--spectate] [--lobby [--lobby-autostart]] [--fow] [--mute] [--no-record] [--record FILE] [--camera-dist F] [--size WxH] [--snapshot OUT.png] [--snapshot-ticks N]");
     eprintln!("  farust replay <verify|play> <FILE> [GAME_DIR] [--speed N] [--mute] [--size WxH] [--snapshot OUT.png] [--snapshot-ticks N]");
-    eprintln!("  farust host [<ADDR:PORT>] [MAP] [GAME_DIR] [--code] [--rendezvous ADDR] [--players N] [--armies 1,2] [--factions uef,cybran] [--seed S] [--play] [--mute] [--size WxH] [--headless-ticks N]");
-    eprintln!("  farust join <ADDR:PORT | CODE> [GAME_DIR] [--code CODE] [--rendezvous ADDR] [--relay] [--play] [--mute] [--size WxH] [--headless-ticks N]");
-    eprintln!("  farust rendezvous [BIND_ADDR]                     (run lightweight invite-code + TCP relay server)");
+    eprintln!("  farust host [<ADDR:PORT>] [MAP] [GAME_DIR] [--code] [--rendezvous ADDR] [--udp] [--netem SPEC] [--players N] [--armies 1,2] [--factions uef,cybran] [--seed S] [--play] [--mute] [--size WxH] [--headless-ticks N]");
+    eprintln!("  farust join <ADDR:PORT | CODE> [GAME_DIR] [--code CODE] [--rendezvous ADDR] [--udp] [--netem SPEC] [--relay] [--play] [--mute] [--size WxH] [--headless-ticks N]");
+    eprintln!("  farust rendezvous [BIND_ADDR]                     (run invite-code + UDP hole-punch + TCP relay server)");
     eprintln!("  global: +connect_lobby <CODE|ADDR:PORT>           (Steam-compatible lobby auto-join arg)");
     eprintln!();
     eprintln!("env:");
@@ -1893,13 +1894,22 @@ fn cmd_rendezvous(args: &[String]) -> Result<(), String> {
         .map(String::as_str)
         .unwrap_or("0.0.0.0:15050");
     let srv = rendezvous::RendezvousServer::bind(bind_addr)?;
-    println!("FARust rendezvous + TCP relay listening on {}", srv.local_addr());
+    println!(
+        "FARust rendezvous (UDP hole-punch + TCP relay) listening on {} (TCP+UDP)",
+        srv.local_addr()
+    );
     srv.run_forever();
     Ok(())
 }
 
 fn cmd_host(args: &[String]) -> Result<(), String> {
     let use_code = has_flag(args, "--code");
+    let netem_spec = flag_str(args, "--netem");
+    let netem = match netem_spec {
+        Some(spec) => udp_transport::NetemConfig::parse(spec)?,
+        None => udp_transport::NetemConfig::default(),
+    };
+    let use_udp = has_flag(args, "--udp") || netem_spec.is_some();
     let rv_addr = flag_str(args, "--rendezvous")
         .map(str::to_string)
         .unwrap_or_else(|| settings::effective_rendezvous(None));
@@ -1911,7 +1921,7 @@ fn cmd_host(args: &[String]) -> Result<(), String> {
         let a = args[i].as_str();
         if matches!(
             a,
-            "--seed" | "--headless-ticks" | "--players" | "--armies" | "--factions" | "--size" | "--rendezvous"
+            "--seed" | "--headless-ticks" | "--players" | "--armies" | "--factions" | "--size" | "--rendezvous" | "--netem"
         ) {
             i += 2;
             continue;
@@ -1928,7 +1938,7 @@ fn cmd_host(args: &[String]) -> Result<(), String> {
         Some(first) if first.contains(':') => (first, 1usize),
         _ if use_code => ("0.0.0.0:0", 0usize),
         _ => {
-            return Err("usage: farust host [<ADDR:PORT>] [MAP] [GAME_DIR] [--code] [--rendezvous ADDR] [--players N] [--armies 1,2,3] [--factions uef,cybran] [--seed S] [--play] [--headless-ticks N]".to_string());
+            return Err("usage: farust host [<ADDR:PORT>] [MAP] [GAME_DIR] [--code] [--rendezvous ADDR] [--udp] [--netem SPEC] [--players N] [--armies 1,2,3] [--factions uef,cybran] [--seed S] [--play] [--headless-ticks N]".to_string());
         }
     };
     let map_name = pos.get(map_idx).copied().unwrap_or("SCMP_001");
@@ -1986,14 +1996,30 @@ fn cmd_host(args: &[String]) -> Result<(), String> {
         assigned_army: 0,
     };
 
+    let proto_label = match (use_udp, netem_spec) {
+        (true, Some(spec)) => format!("UDP (netem {spec})"),
+        (true, None) => "UDP".to_string(),
+        (false, _) => "TCP".to_string(),
+    };
     println!(
-        "Hosting {players}-player lockstep match on {addr} ({}, {} armies, {} AI, seed {seed}); waiting for {} client(s)...",
+        "Hosting {players}-player {proto_label} lockstep match on {addr} ({}, {} armies, {} AI, seed {seed}); waiting for {} client(s)...",
         map.map_id,
         hs.setups.len(),
         hs.setups.len() - players,
         players - 1
     );
-    let (host, bound) = if use_code {
+    let (host, bound) = if use_code && use_udp {
+        let (h, b, _code) = net::LockstepHost::bind_players_udp_with_code(
+            addr,
+            &rv_addr,
+            &hs,
+            netem,
+            |army, peer, via| {
+                println!("  army {army} joined from {peer} ({})", via.label());
+            },
+        )?;
+        (h, b)
+    } else if use_code {
         let (h, b, _code) = net::LockstepHost::bind_players_with_code(
             addr,
             &rv_addr,
@@ -2004,6 +2030,10 @@ fn cmd_host(args: &[String]) -> Result<(), String> {
             },
         )?;
         (h, b)
+    } else if use_udp {
+        net::LockstepHost::bind_players_udp(addr, &hs, netem, |army, peer| {
+            println!("  army {army} joined from {peer} (udp)");
+        })?
     } else {
         net::LockstepHost::bind_players(addr, &hs, |army, peer| {
             println!("  army {army} joined from {peer}");
@@ -2019,7 +2049,17 @@ fn cmd_host(args: &[String]) -> Result<(), String> {
         net::NetHandle::start(&session.world, &hs, Box::new(host))?.attach(&mut session);
         return play::run_play_window(Some(&game_dir), session, map, meshes, width, height);
     }
-    run_headless_peer("host", Box::new(host), world, &hs, ticks)
+    let mut host = host;
+    let res = run_headless_peer("host", &mut host, world, &hs, ticks);
+    if let Some(st) = host.netem_stats()
+        && (st.dropped > 0 || st.duplicated > 0 || st.reordered > 0)
+    {
+        println!(
+            "host netem: sent={} dropped={} dup={} reordered={}",
+            st.sent, st.dropped, st.duplicated, st.reordered
+        );
+    }
+    res
 }
 
 fn cmd_join(args: &[String], connect_lobby: Option<&str>) -> Result<(), String> {
@@ -2030,12 +2070,18 @@ fn cmd_join(args: &[String], connect_lobby: Option<&str>) -> Result<(), String> 
         .map(str::to_string)
         .unwrap_or_else(|| settings::effective_rendezvous(None));
     let force_relay = has_flag(args, "--relay");
+    let netem_spec = flag_str(args, "--netem");
+    let netem = match netem_spec {
+        Some(spec) => udp_transport::NetemConfig::parse(spec)?,
+        None => udp_transport::NetemConfig::default(),
+    };
+    let use_udp = has_flag(args, "--udp") || netem_spec.is_some();
 
     let mut pos: Vec<&str> = Vec::new();
     let mut i = 2usize;
     while i < args.len() {
         let a = args[i].as_str();
-        if matches!(a, "--code" | "--rendezvous" | "--headless-ticks" | "--size") {
+        if matches!(a, "--code" | "--rendezvous" | "--headless-ticks" | "--size" | "--netem") {
             i += 2;
             continue;
         }
@@ -2051,7 +2097,7 @@ fn cmd_join(args: &[String], connect_lobby: Option<&str>) -> Result<(), String> 
         Some(c) => (c, 0usize),
         None => {
             let first = pos.first().copied().ok_or_else(|| {
-                "usage: farust join <ADDR:PORT | CODE> [GAME_DIR] [--code CODE] [--rendezvous ADDR] [--relay] [--play] [--headless-ticks N]".to_string()
+                "usage: farust join <ADDR:PORT | CODE> [GAME_DIR] [--code CODE] [--rendezvous ADDR] [--udp] [--netem SPEC] [--relay] [--play] [--headless-ticks N]".to_string()
             })?;
             (first.to_string(), 1usize)
         }
@@ -2063,15 +2109,29 @@ fn cmd_join(args: &[String], connect_lobby: Option<&str>) -> Result<(), String> 
     let interactive = has_flag(args, "--play");
 
     let (client, hs) = if rendezvous::looks_like_code(&target) {
-        let (c, hs, via) = net::LockstepClient::connect_code_retry(
-            &rv_addr,
-            &target,
-            force_relay,
-            std::time::Duration::from_secs(30),
-        )?;
-        let kind = if via.is_relayed() { "relay" } else { "direct" };
-        println!("Connected via code {target} ({kind} @ {})", via.addr());
-        (c, hs)
+        if use_udp {
+            let (c, hs, via) = net::LockstepClient::connect_code_udp_retry(
+                &rv_addr,
+                &target,
+                force_relay,
+                netem,
+                std::time::Duration::from_secs(30),
+            )?;
+            println!("Connected via code {target} ({} @ {})", via.label(), via.addr());
+            (c, hs)
+        } else {
+            let (c, hs, via) = net::LockstepClient::connect_code_retry(
+                &rv_addr,
+                &target,
+                force_relay,
+                std::time::Duration::from_secs(30),
+            )?;
+            let kind = if via.is_relayed() { "relay" } else { "direct" };
+            println!("Connected via code {target} ({kind} @ {})", via.addr());
+            (c, hs)
+        }
+    } else if use_udp {
+        net::LockstepClient::connect_udp_retry(&target, netem, std::time::Duration::from_secs(30))?
     } else {
         net::LockstepClient::connect_retry(&target, std::time::Duration::from_secs(30))?
     };
@@ -2104,12 +2164,22 @@ fn cmd_join(args: &[String], connect_lobby: Option<&str>) -> Result<(), String> 
         net::NetHandle::start(&session.world, &hs, Box::new(client))?.attach(&mut session);
         return play::run_play_window(Some(&game_dir), session, map, meshes, width, height);
     }
-    run_headless_peer("client", Box::new(client), world, &hs, ticks)
+    let mut client = client;
+    let res = run_headless_peer("client", &mut client, world, &hs, ticks);
+    if let Some(st) = client.netem_stats()
+        && (st.dropped > 0 || st.duplicated > 0 || st.reordered > 0)
+    {
+        println!(
+            "client netem: sent={} dropped={} dup={} reordered={}",
+            st.sent, st.dropped, st.duplicated, st.reordered
+        );
+    }
+    res
 }
 
 fn run_headless_peer(
     role: &str,
-    mut transport: Box<dyn net::TurnTransport>,
+    transport: &mut dyn net::TurnTransport,
     mut world: skirmish::Skirmish,
     hs: &net::Handshake,
     ticks: u64,
@@ -2122,7 +2192,7 @@ fn run_headless_peer(
         core.shared_ai_armies()
     );
     let t0 = Instant::now();
-    let final_hash = net::run_headless(transport.as_mut(), &mut core, &mut world, ticks)?;
+    let final_hash = net::run_headless(transport, &mut core, &mut world, ticks)?;
     println!(
         "lockstep {role} complete: army={} players={} ticks={} turns={} hash={final_hash:016x} ({:.0}ms)",
         hs.assigned_army,

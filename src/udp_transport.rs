@@ -46,12 +46,13 @@ const FRAG_END: u8 = 0x02;
 
 const MAX_SEND_WINDOW: usize = 128;
 const MAX_RECV_WINDOW: u32 = 256;
-const INITIAL_RTO_MS: f64 = 80.0;
+const INITIAL_RTO_MS: f64 = 250.0;
 const MIN_RTO_MS: f64 = 25.0;
 const MAX_RTO_MS: f64 = 2000.0;
 const FAST_RETX_THRESHOLD: u8 = 3;
 const KEEPALIVE_INTERVAL: Duration = Duration::from_millis(1000);
 const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const GRACEFUL_CLOSE_TIMEOUT: Duration = Duration::from_millis(1500);
 const SYN_RETRY_INTERVAL: Duration = Duration::from_millis(60);
 const PUNCH_RETRY_INTERVAL: Duration = Duration::from_millis(40);
 const PUNCH_LINGER: Duration = Duration::from_millis(600);
@@ -414,7 +415,7 @@ impl NetemSocket {
             if self.cfg.jitter_ms > 0 {
                 wait_ms += self.next_u64() % (self.cfg.jitter_ms + 1);
             }
-            if self.cfg.reorder_window > 0 && self.next_u64() % 3 == 0 {
+            if self.cfg.reorder_window > 0 && self.next_u64().is_multiple_of(3) {
                 let extra = 2 + (self.next_u64() % ((self.cfg.reorder_window as u64) * 4).max(1));
                 wait_ms += extra;
                 reordered_inc += 1;
@@ -493,6 +494,12 @@ impl RttEstimator {
         self.rto_ms
     }
 
+    /// Karn's algorithm part 2: adopt backed-off RTO for subsequent segments until a fresh
+    /// unambiguous (`send_count == 1`) RTT sample arrives.
+    pub fn backoff(&mut self) {
+        self.rto_ms = (self.rto_ms * 2.0).min(MAX_RTO_MS);
+    }
+
     pub fn srtt_ms(&self) -> Option<f64> {
         self.srtt_ms
     }
@@ -530,7 +537,10 @@ struct SentSeg {
 
 enum OutCmd {
     Frame(Vec<u8>),
+    /// Graceful close: flush pending/unacked segments up to `GRACEFUL_CLOSE_TIMEOUT` before sending FIN.
     Close,
+    /// Immediate abort: send FIN now and drop unacked segments.
+    Abort,
 }
 
 struct PeerState {
@@ -538,7 +548,9 @@ struct PeerState {
     remote: SocketAddr,
     established: bool,
     connect_deadline: Option<Instant>,
+    first_syn: Option<Instant>,
     last_syn: Instant,
+    syn_count: u32,
     connect_reply: Option<Sender<Result<(), String>>>,
     next_seq: u32,
     send_unacked: BTreeMap<u32, SentSeg>,
@@ -555,10 +567,14 @@ struct PeerState {
     idle_timeout: Arc<Mutex<Option<Duration>>>,
     out_rx: Receiver<OutCmd>,
     in_tx: Sender<Result<Vec<u8>, String>>,
+    closing: bool,
+    close_deadline: Option<Instant>,
+    remote_fin_seq: Option<u32>,
     closed: bool,
 }
 
 impl PeerState {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         conn_id: u32,
         remote: SocketAddr,
@@ -576,7 +592,9 @@ impl PeerState {
             remote,
             established,
             connect_deadline,
+            first_syn: None,
             last_syn: now - SYN_RETRY_INTERVAL,
+            syn_count: 0,
             connect_reply,
             next_seq: 1,
             send_unacked: BTreeMap::new(),
@@ -593,6 +611,9 @@ impl PeerState {
             idle_timeout,
             out_rx,
             in_tx,
+            closing: false,
+            close_deadline: None,
+            remote_fin_seq: None,
             closed: false,
         }
     }
@@ -680,11 +701,12 @@ impl PeerState {
     }
 
     fn send_fin(&mut self, sock: &mut NetemSocket, now: Instant) {
+        let last_seq = self.next_seq.saturating_sub(1);
         let pkt = encode_chan_packet(
             ChanHeader {
                 kind: PKT_FIN,
                 conn_id: self.conn_id,
-                seq: 0,
+                seq: last_seq,
                 ack: self.recv_ack,
                 ack_bits: self.compute_ack_bits(),
             },
@@ -694,6 +716,10 @@ impl PeerState {
         let _ = sock.send_to(&pkt, self.remote);
         let _ = sock.send_to(&pkt, self.remote);
         self.last_send = now;
+    }
+
+    fn has_unsent_or_unacked(&self) -> bool {
+        !self.pending_chunks.is_empty() || !self.send_unacked.is_empty()
     }
 
     fn drain_send_window(&mut self, sock: &mut NetemSocket, now: Instant) {
@@ -807,6 +833,12 @@ impl PeerState {
                 }
             }
         }
+        if let Some(fin_seq) = self.remote_fin_seq
+            && self.recv_ack >= fin_seq
+        {
+            self.closed = true;
+            let _ = self.in_tx.send(Err("udp peer closed connection".into()));
+        }
     }
 
     fn on_packet(&mut self, hdr: ChanHeader, payload: &[u8], src: SocketAddr, sock: &mut NetemSocket, now: Instant) {
@@ -817,6 +849,12 @@ impl PeerState {
                 if !self.established {
                     self.established = true;
                     self.connect_deadline = None;
+                    if self.syn_count == 1
+                        && let Some(t0) = self.first_syn
+                    {
+                        self.rtt.observe(now.duration_since(t0).as_secs_f64() * 1000.0);
+                        self.sync_stats(0, 0, 0);
+                    }
                     if let Some(tx) = self.connect_reply.take() {
                         let _ = tx.send(Ok(()));
                     }
@@ -868,8 +906,14 @@ impl PeerState {
                 }
             }
             PKT_FIN => {
-                self.closed = true;
-                let _ = self.in_tx.send(Err("udp peer closed connection".into()));
+                if self.established {
+                    self.process_acks(hdr.ack, hdr.ack_bits, sock, now);
+                }
+                self.remote_fin_seq = Some(hdr.seq);
+                if self.recv_ack >= hdr.seq || self.closing {
+                    self.closed = true;
+                    let _ = self.in_tx.send(Err("udp peer closed connection".into()));
+                }
             }
             _ => {}
         }
@@ -880,24 +924,30 @@ impl PeerState {
             return;
         }
         // Drain outbound application commands.
-        loop {
-            match self.out_rx.try_recv() {
-                Ok(OutCmd::Frame(f)) => self.enqueue_frame(f),
-                Ok(OutCmd::Close) => {
-                    self.send_fin(sock, now);
-                    self.closed = true;
-                    return;
-                }
-                Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    self.send_fin(sock, now);
-                    self.closed = true;
-                    return;
+        if !self.closing {
+            loop {
+                match self.out_rx.try_recv() {
+                    Ok(OutCmd::Frame(f)) => self.enqueue_frame(f),
+                    Ok(OutCmd::Abort) => {
+                        self.send_fin(sock, now);
+                        self.closed = true;
+                        return;
+                    }
+                    Ok(OutCmd::Close) | Err(mpsc::TryRecvError::Disconnected) => {
+                        self.closing = true;
+                        self.close_deadline = Some(now + GRACEFUL_CLOSE_TIMEOUT);
+                        break;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => break,
                 }
             }
         }
         // Pending client SYN handshake.
         if !self.established {
+            if self.closing {
+                self.closed = true;
+                return;
+            }
             if let Some(dl) = self.connect_deadline
                 && now >= dl
             {
@@ -919,6 +969,10 @@ impl PeerState {
                     &[],
                 );
                 let _ = sock.send_to(&syn, self.remote);
+                if self.first_syn.is_none() {
+                    self.first_syn = Some(now);
+                }
+                self.syn_count += 1;
                 self.last_syn = now;
                 self.last_send = now;
             }
@@ -945,6 +999,16 @@ impl PeerState {
         // Fill send window from queued chunks.
         self.drain_send_window(sock, now);
 
+        // If closing gracefully, finish once all queued/unacked segments are acknowledged (or deadline hits).
+        if self.closing {
+            let timed_out_close = self.close_deadline.is_some_and(|dl| now >= dl);
+            if !self.has_unsent_or_unacked() || timed_out_close {
+                self.send_fin(sock, now);
+                self.closed = true;
+                return;
+            }
+        }
+
         // RTO retransmissions with Karn exponential backoff.
         let mut timed_out: Vec<(u32, u8, Vec<u8>)> = Vec::new();
         for (&seq, seg) in &mut self.send_unacked {
@@ -958,6 +1022,9 @@ impl PeerState {
             }
         }
         let retx = timed_out.len() as u64;
+        if retx > 0 {
+            self.rtt.backoff();
+        }
         for (seq, flags, payload) in timed_out {
             self.send_data_seg(sock, seq, flags, &payload, now);
         }
@@ -1069,9 +1136,9 @@ impl UdpMux {
         };
         let wake_addr = SocketAddr::new(wake_ip, local_addr.port());
         let wake_sock = UdpSocket::bind(if wake_addr.is_ipv4() {
-            "127.0.0.1:0"
+            "0.0.0.0:0"
         } else {
-            "[::1]:0"
+            "[::]:0"
         })
         .ok();
 
@@ -1154,14 +1221,14 @@ impl UdpMux {
             .map_err(|_| "udp mux closed".to_string())?;
         self.wake();
         match rep_rx.recv_timeout(timeout + Duration::from_millis(250)) {
-            Ok(Ok(())) => Ok(UdpChannel {
-                _mux: self.clone(),
+            Ok(Ok(())) => Ok(UdpChannel::new(
+                self.clone(),
                 remote,
                 out_tx,
-                in_rx: Arc::new(Mutex::new(in_rx)),
+                in_rx,
                 stats,
                 idle_timeout,
-            }),
+            )),
             Ok(Err(e)) => Err(e),
             Err(_) => Err(format!("udp connect to {remote} timed out")),
         }
@@ -1251,17 +1318,53 @@ impl Drop for UdpMux {
     }
 }
 
+struct ChannelCloseGuard {
+    mux: Arc<UdpMux>,
+    out_tx: Sender<OutCmd>,
+}
+
+impl Drop for ChannelCloseGuard {
+    fn drop(&mut self) {
+        let _ = self.out_tx.send(OutCmd::Close);
+        self.mux.wake();
+    }
+}
+
+type FrameRx = Arc<Mutex<Receiver<Result<Vec<u8>, String>>>>;
+
 /// Reliable, ordered, MTU-fragmented frame channel over UDP.
 pub struct UdpChannel {
-    _mux: Arc<UdpMux>,
+    guard: Arc<ChannelCloseGuard>,
     remote: SocketAddr,
     out_tx: Sender<OutCmd>,
-    in_rx: Arc<Mutex<Receiver<Result<Vec<u8>, String>>>>,
+    in_rx: FrameRx,
     stats: Arc<Mutex<ChannelStats>>,
     idle_timeout: Arc<Mutex<Option<Duration>>>,
 }
 
 impl UdpChannel {
+    fn new(
+        mux: Arc<UdpMux>,
+        remote: SocketAddr,
+        out_tx: Sender<OutCmd>,
+        in_rx: Receiver<Result<Vec<u8>, String>>,
+        stats: Arc<Mutex<ChannelStats>>,
+        idle_timeout: Arc<Mutex<Option<Duration>>>,
+    ) -> Self {
+        let guard = Arc::new(ChannelCloseGuard {
+            mux,
+            out_tx: out_tx.clone(),
+        });
+        Self {
+            guard,
+            remote,
+            out_tx,
+            in_rx: Arc::new(Mutex::new(in_rx)),
+            stats,
+            idle_timeout,
+        }
+    }
+
     /// Connects directly to `addr` on a fresh ephemeral UDP socket (with optional `netem`).
     pub fn connect(addr: &str, netem: NetemConfig, timeout: Duration) -> Result<Self, String> {
         let addrs: Vec<SocketAddr> = addr
@@ -1285,6 +1388,19 @@ impl UdpChannel {
         Err(last)
     }
 
+    #[allow(dead_code)]
+    pub fn try_clone(&self) -> Result<Self, String> {
+        Ok(Self {
+            guard: self.guard.clone(),
+            remote: self.remote,
+            out_tx: self.out_tx.clone(),
+            in_rx: self.in_rx.clone(),
+            stats: self.stats.clone(),
+            idle_timeout: self.idle_timeout.clone(),
+        })
+    }
+
+    #[allow(dead_code)]
     pub fn peer_addr(&self) -> SocketAddr {
         self.remote
     }
@@ -1302,27 +1418,26 @@ impl UdpChannel {
         self.out_tx
             .send(OutCmd::Frame(payload.to_vec()))
             .map_err(|_| "udp channel closed".to_string())?;
-        self._mux.wake();
+        self.guard.mux.wake();
         Ok(())
     }
 
     pub fn read_frame(&mut self) -> Result<Vec<u8>, String> {
         let timeout = self.idle_timeout.lock().ok().and_then(|g| *g);
         let rx = self.in_rx.lock().map_err(|_| "udp recv lock poisoned".to_string())?;
-        let res = match timeout {
+        match timeout {
             Some(t) => rx
                 .recv_timeout(t)
                 .map_err(|e| format!("udp read frame: {e}"))?,
             None => rx
                 .recv()
                 .map_err(|_| "udp channel closed".to_string())?,
-        };
-        res
+        }
     }
 
     pub fn shutdown(&self) {
-        let _ = self.out_tx.send(OutCmd::Close);
-        self._mux.wake();
+        let _ = self.out_tx.send(OutCmd::Abort);
+        self.guard.mux.wake();
     }
 
     pub fn stats(&self) -> ChannelStats {
@@ -1335,13 +1450,7 @@ impl UdpChannel {
     }
 
     pub fn netem_stats(&self) -> NetemStats {
-        self._mux.netem_stats()
-    }
-}
-
-impl Drop for UdpChannel {
-    fn drop(&mut self) {
-        self.shutdown();
+        self.guard.mux.netem_stats()
     }
 }
 
@@ -1363,7 +1472,9 @@ fn mux_loop(
     let mut rv_keepalive: Option<RvKeepalive> = None;
     let mut buf = [0u8; MAX_DATAGRAM_BYTES];
 
-    while !stop.load(Ordering::Relaxed) {
+    let mut shutdown_deadline: Option<Instant> = None;
+
+    loop {
         let now = Instant::now();
         // 1. Drain control commands.
         while let Ok(cmd) = cmd_rx.try_recv() {
@@ -1443,17 +1554,14 @@ fn mux_loop(
             }
         }
 
-        // 2. Receive incoming datagrams (non-blocking burst after first blocking recv up to 4ms).
-        let mut first = true;
+        // 2. Receive incoming datagrams (one blocking recv up to 4ms, then non-blocking burst).
+        let mut switched_nb = false;
         loop {
-            if !first {
+            let recv_res = sock.recv_from(&mut buf);
+            if !switched_nb {
+                switched_nb = true;
                 let _ = sock.sock.set_nonblocking(true);
             }
-            let recv_res = sock.recv_from(&mut buf);
-            if !first {
-                let _ = sock.sock.set_nonblocking(false);
-            }
-            first = false;
             let (n, src) = match recv_res {
                 Ok(v) => v,
                 Err(_) => break,
@@ -1497,52 +1605,56 @@ fn mux_loop(
                     if let Some((hdr, payload)) = decode_chan_header(pkt) {
                         if let Some(peer) = peers.get_mut(&hdr.conn_id) {
                             peer.on_packet(hdr, payload, src, &mut sock, now);
-                        } else if hdr.kind == PKT_SYN && accepting {
-                            if let Some(mux_arc) = mux_weak.upgrade() {
-                                let (out_tx, out_rx) = mpsc::channel();
-                                let (in_tx, in_rx) = mpsc::channel();
-                                let stats = Arc::new(Mutex::new(ChannelStats::default()));
-                                let idle_timeout = Arc::new(Mutex::new(Some(DEFAULT_IDLE_TIMEOUT)));
-                                let mut peer = PeerState::new(
-                                    hdr.conn_id,
-                                    src,
-                                    true,
-                                    None,
-                                    None,
-                                    out_rx,
-                                    in_tx,
-                                    stats.clone(),
-                                    idle_timeout.clone(),
-                                );
-                                // Reply SYN_ACK immediately.
-                                let syn_ack = encode_chan_packet(
-                                    ChanHeader {
-                                        kind: PKT_SYN_ACK,
-                                        conn_id: hdr.conn_id,
-                                        seq: 0,
-                                        ack: 0,
-                                        ack_bits: 0,
-                                    },
-                                    &[],
-                                );
-                                let _ = sock.send_to(&syn_ack, src);
-                                peer.last_send = now;
-                                peers.insert(hdr.conn_id, peer);
-                                let ch = UdpChannel {
-                                    _mux: mux_arc,
-                                    remote: src,
-                                    out_tx,
-                                    in_rx: Arc::new(Mutex::new(in_rx)),
-                                    stats,
-                                    idle_timeout,
-                                };
-                                let _ = accept_tx.send(ch);
-                            }
+                        } else if hdr.kind == PKT_SYN
+                            && accepting
+                            && let Some(mux_arc) = mux_weak.upgrade()
+                        {
+                            let (out_tx, out_rx) = mpsc::channel();
+                            let (in_tx, in_rx) = mpsc::channel();
+                            let stats = Arc::new(Mutex::new(ChannelStats::default()));
+                            let idle_timeout = Arc::new(Mutex::new(Some(DEFAULT_IDLE_TIMEOUT)));
+                            let mut peer = PeerState::new(
+                                hdr.conn_id,
+                                src,
+                                true,
+                                None,
+                                None,
+                                out_rx,
+                                in_tx,
+                                stats.clone(),
+                                idle_timeout.clone(),
+                            );
+                            // Reply SYN_ACK immediately.
+                            let syn_ack = encode_chan_packet(
+                                ChanHeader {
+                                    kind: PKT_SYN_ACK,
+                                    conn_id: hdr.conn_id,
+                                    seq: 0,
+                                    ack: 0,
+                                    ack_bits: 0,
+                                },
+                                &[],
+                            );
+                            let _ = sock.send_to(&syn_ack, src);
+                            peer.last_send = now;
+                            peers.insert(hdr.conn_id, peer);
+                            let ch = UdpChannel::new(
+                                mux_arc,
+                                src,
+                                out_tx,
+                                in_rx,
+                                stats,
+                                idle_timeout,
+                            );
+                            let _ = accept_tx.send(ch);
                         }
                     }
                 }
                 _ => {}
             }
+        }
+        if switched_nb {
+            let _ = sock.sock.set_nonblocking(false);
         }
 
         // 3. Drive timers for active peers, punches, rendezvous registrations, and Netem queue.
@@ -1604,6 +1716,24 @@ fn mux_loop(
             let pkt = encode_rv_reg(ka.role, ka.token, &ka.code);
             let _ = sock.send_to(&pkt, ka.rv_addr);
             ka.last_send = now;
+        }
+
+        if stop.load(Ordering::Relaxed) {
+            let now = Instant::now();
+            let dl = *shutdown_deadline.get_or_insert(now + GRACEFUL_CLOSE_TIMEOUT);
+            let pending = !sock.delayed.is_empty()
+                || peers
+                    .values()
+                    .any(|p| p.established && (p.has_unsent_or_unacked() || p.ack_dirty));
+            if !pending || now >= dl {
+                for peer in peers.values_mut() {
+                    if peer.established && !peer.closed {
+                        peer.send_fin(&mut sock, now);
+                    }
+                }
+                sock.flush_due(now);
+                break;
+            }
         }
     }
 }
