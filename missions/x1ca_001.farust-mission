@@ -40,6 +40,8 @@ start 0 UEB1303 x1 at 64.5,944.5
 start 0 UEB1106 x1 at 60.5,946.5
 start 0 UEB1106 x1 at 50.5,940.5
 start 0 UEB0301 x1 at 99.5,967.5
+# T3 power for the LZ's mass fabricators (each UEB1303 drains 3500 E/s)
+start 0 UEB1301 x4 at 76.5,926.5
 start 0 UEB0202 x1 at 53.5,957.5
 start 0 UEB4301 x1 at 114.5,958.5 hp 75%
 start 0 UEB2204 x1 at 80.5,946.5
@@ -54,6 +56,7 @@ start 1 UEL0001 x1 at 140.5,115.5
 start 1 UEB4301 x1 at 132.5,101.5
 start 1 UEB4301 x1 at 122.5,111.5
 start 1 UEB1303 x2 at 166.5,49.5
+start 1 UEB1301 x3 at 150.5,62.5
 start 1 UEB2301 x3 at 160.5,82.5
 start 1 UEB2304 x2 at 112.5,72.5
 start 1 UEL0303 x5 at 153.5,98.5
@@ -100,7 +103,7 @@ start 3 UAL0202 x3 at 240.5,648.5
 
 # --- Act 2: Order Seabring Assault Base (M2_OrderBase_Area) & Commander Gari ---
 start 4 UAB0301 x1 at 327.5,406.5
-start 4 UAB0201 x1 at 333.5,340.5
+start 4 UAB0201 x1 at 340.5,400.5
 start 4 UAB1301 x1 at 320.5,418.5
 start 4 UAB4202 x1 at 315.5,405.5
 start 4 UAB2301 x2 at 305.5,395.5

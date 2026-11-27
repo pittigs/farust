@@ -912,7 +912,7 @@ pub fn ai_armies(m: &Mission, human_as: Option<&str>) -> Result<Vec<crate::skirm
         .collect()
 }
 
-/// `farust mission FILE [GAME_DIR] [--seed S] [--max-ticks N] [--human-ai DIFF] [--record OUT]`:
+/// `farust mission FILE [GAME_DIR] [--seed S] [--max-ticks N] [--human-ai DIFF] [--record OUT] [--trace MIN]`:
 /// runs a mission headless (the human army is idle unless `--human-ai` is given) and prints
 /// its messages, objectives, result and final hash.
 pub fn cmd_mission(args: &[String]) -> Result<(), String> {
@@ -954,13 +954,40 @@ pub fn cmd_mission(args: &[String]) -> Result<(), String> {
         m.triggers.len(),
         m.objectives.len()
     );
+    // `--trace MIN`: per-army status every MIN minutes (mission tuning).
+    let trace = flag("--trace").and_then(|s| s.parse::<u64>().ok()).filter(|m| *m > 0).map(|m| m * 60 * TICK_HZ);
     let mut said = 0;
+    let mut issued: BTreeMap<ArmyId, u64> = BTreeMap::new();
     while w.result().is_none() && w.tick() < max_ticks {
+        if let Some(every) = trace
+            && w.tick() % every == 0
+        {
+            let mut line = format!("[{:02}:00] trace", w.tick() / TICK_HZ / 60);
+            for a in w.armies() {
+                let (mobile, structs, value) = w.army_summary(a.id);
+                let acu = if w.commander_of(a.id).is_some() { "+acu" } else { "" };
+                line.push_str(&format!(
+                    " | A{} m{:.0} e{:.0}/{:.0} u{mobile} s{structs} v{value}{acu}{}",
+                    a.id,
+                    a.income_mass as f64 * 10.0 / crate::sim::SCALE as f64,
+                    a.income_energy as f64 * 10.0 / crate::sim::SCALE as f64,
+                    a.energy as f64 / crate::sim::SCALE as f64,
+                    if a.defeated { " DEAD" } else { "" }
+                ));
+            }
+            println!("{line}");
+            let cmds: Vec<String> = issued.iter().map(|(a, n)| format!("A{a}:{n}")).collect();
+            println!("          AI commands issued since the last trace: {}", cmds.join(" "));
+            issued.clear();
+        }
         let tick = w.tick();
         for ai in &mut ais {
             for cmd in ai.decide(&w) {
                 if let Some(r) = rec.as_mut() {
                     r.record(tick, ai.army, &cmd);
+                }
+                if trace.is_some() {
+                    *issued.entry(ai.army).or_default() += 1;
                 }
                 w.issue(ai.army, cmd);
             }
